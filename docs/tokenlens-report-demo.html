@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="data:,">
+  <title>TokenLens for Azure — Sample Report</title>
+  <script>
+    (() => {
+      const param = new URLSearchParams(window.location.search).get("scoutTheme");
+      const theme =
+        param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <style>
+    :root {
+      color-scheme: light;
+      --cp-bg: #f7f4ef;
+      --cp-bg-elevated: #fcfbf8;
+      --cp-surface: #ffffff;
+      --cp-surface-soft: #f5f5f5;
+      --cp-border: #dedede;
+      --cp-border-strong: #919191;
+      --cp-text: #242424;
+      --cp-text-muted: #5c5c5c;
+      --cp-text-soft: #6f6f6f;
+      --cp-accent: #b11f4b;
+      --cp-accent-hover: #9a1a41;
+      --cp-accent-soft: rgba(177, 31, 75, 0.08);
+      --cp-accent-fg: #ffffff;
+      --cp-success: #16a34a;
+      --cp-danger: #dc2626;
+      --cp-warning: #f59e0b;
+      --cp-link: #0078d4;
+      --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
+      --cp-overlay: rgba(255, 255, 255, 0.8);
+      --cp-panel: rgba(255, 255, 255, 0.86);
+      --cp-panel-strong: rgba(255, 255, 255, 0.96);
+      --cp-sheen: rgba(255, 255, 255, 0.55);
+      --cp-highlight: rgba(177, 31, 75, 0.12);
+    }
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --cp-bg: #3d3b3a;
+      --cp-bg-elevated: #343231;
+      --cp-surface: #292929;
+      --cp-surface-soft: #2e2e2e;
+      --cp-border: #474747;
+      --cp-border-strong: #5f5f5f;
+      --cp-text: #dedede;
+      --cp-text-muted: #919191;
+      --cp-text-soft: #b0b0b0;
+      --cp-accent: #fd8ea1;
+      --cp-accent-hover: #fb7b91;
+      --cp-accent-soft: rgba(253, 142, 161, 0.14);
+      --cp-accent-fg: #1a1a1a;
+      --cp-success: #4ade80;
+      --cp-danger: #f87171;
+      --cp-warning: #fbbf24;
+      --cp-link: #4da6ff;
+      --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+      --cp-overlay: rgba(41, 41, 41, 0.88);
+      --cp-panel: rgba(41, 41, 41, 0.72);
+      --cp-panel-strong: rgba(41, 41, 41, 0.96);
+      --cp-sheen: rgba(255, 255, 255, 0.04);
+      --cp-highlight: rgba(253, 142, 161, 0.12);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--cp-bg);
+      color: var(--cp-text);
+      font-family: "Segoe UI", Aptos, Calibri, -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+    button { font: inherit; }
+    .page { min-height: 100vh; }
+    .topbar {
+      height: 56px;
+      background: var(--cp-surface);
+      border-bottom: 1px solid var(--cp-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 32px;
+      position: sticky;
+      top: 0;
+      z-index: 20;
+    }
+    .brand, .top-actions, .status, .meta, .legend, .rule-id, .action-head {
+      display: flex;
+      align-items: center;
+    }
+    .brand { gap: 10px; font-weight: 700; letter-spacing: -0.01em; }
+    .brand-mark {
+      width: 28px;
+      height: 28px;
+      border: 2px solid var(--cp-accent);
+      border-radius: 50%;
+      position: relative;
+    }
+    .brand-mark::after {
+      content: "";
+      position: absolute;
+      width: 9px;
+      height: 2px;
+      background: var(--cp-accent);
+      right: -6px;
+      bottom: 2px;
+      transform: rotate(45deg);
+      transform-origin: left center;
+    }
+    .brand small { color: var(--cp-text-muted); font-weight: 500; }
+    .top-actions { gap: 12px; color: var(--cp-text-muted); font-size: 12px; }
+    .status { gap: 7px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--cp-success); }
+    .button {
+      border: 1px solid var(--cp-border);
+      background: var(--cp-surface);
+      color: var(--cp-text);
+      border-radius: 0.625rem;
+      padding: 7px 12px;
+      cursor: pointer;
+    }
+    .button:hover { border-color: var(--cp-border-strong); }
+    .button.primary {
+      background: var(--cp-accent);
+      color: var(--cp-accent-fg);
+      border-color: var(--cp-accent);
+    }
+    .report {
+      width: min(1340px, calc(100% - 48px));
+      margin: 28px auto 60px;
+    }
+    .hero {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 28px;
+      align-items: end;
+      margin-bottom: 22px;
+    }
+    .eyebrow {
+      color: var(--cp-accent);
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    h1 { font-size: 34px; line-height: 1.15; margin: 0 0 8px; letter-spacing: -0.035em; }
+    h2 { font-size: 18px; margin: 0; letter-spacing: -0.015em; }
+    h3 { font-size: 14px; margin: 0; }
+    p { margin: 0; }
+    .subtitle { color: var(--cp-text-muted); font-size: 15px; max-width: 760px; }
+    .meta { gap: 18px; color: var(--cp-text-muted); font-size: 12px; white-space: nowrap; }
+    .meta strong { color: var(--cp-text); display: block; font-size: 13px; margin-top: 2px; }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .card {
+      background: var(--cp-surface);
+      border: 1px solid var(--cp-border);
+      border-radius: 16px;
+    }
+    .metric { padding: 16px 18px; min-height: 110px; }
+    .metric-label {
+      color: var(--cp-text-muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+    .metric-value { font-size: 27px; line-height: 1; font-weight: 700; letter-spacing: -0.04em; }
+    .metric-note { color: var(--cp-text-muted); font-size: 11px; margin-top: 10px; }
+    .metric.emphasis { border-top: 3px solid var(--cp-accent); }
+    .metric.emphasis .metric-value { color: var(--cp-accent); }
+    .coverage {
+      padding: 14px 18px;
+      display: grid;
+      grid-template-columns: 185px 1fr 275px;
+      gap: 22px;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+    .coverage-title strong { display: block; font-size: 15px; }
+    .coverage-title span, .coverage-note { color: var(--cp-text-muted); font-size: 11px; }
+    .bar {
+      height: 10px;
+      background: var(--cp-surface-soft);
+      border: 1px solid var(--cp-border);
+      border-radius: 0.625rem;
+      overflow: hidden;
+    }
+    .bar > span { display: block; height: 100%; background: var(--cp-success); width: 87.5%; }
+    .coverage-note { text-align: right; }
+    .main-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.7fr) minmax(310px, 0.8fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .panel-head {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--cp-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .panel-head p { color: var(--cp-text-muted); font-size: 11px; margin-top: 3px; }
+    .legend { gap: 12px; color: var(--cp-text-muted); font-size: 11px; }
+    .legend span { display: flex; align-items: center; gap: 5px; }
+    .legend i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+    .legend .high { background: var(--cp-danger); }
+    .legend .medium { background: var(--cp-warning); }
+    .legend .low { background: var(--cp-link); }
+    .finding {
+      display: grid;
+      grid-template-columns: 86px minmax(220px, 1.2fr) minmax(180px, 0.75fr) 130px;
+      gap: 12px;
+      align-items: center;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--cp-border);
+    }
+    .finding:last-child { border-bottom: 0; }
+    .rule-id { gap: 8px; font-family: Consolas, "Courier New", Courier, monospace; font-weight: 700; }
+    .severity { width: 8px; height: 28px; border-radius: 0.625rem; }
+    .severity.high { background: var(--cp-danger); }
+    .severity.medium { background: var(--cp-warning); }
+    .severity.low { background: var(--cp-link); }
+    .finding-title { font-weight: 700; }
+    .finding-detail, .impact-label, .confidence { color: var(--cp-text-muted); font-size: 11px; }
+    .impact strong { display: block; font-size: 14px; }
+    .confidence { text-align: right; }
+    .confidence strong { color: var(--cp-text); display: block; font-size: 12px; }
+    .not-evaluated { background: var(--cp-surface-soft); }
+    .not-evaluated .severity { background: var(--cp-border-strong); }
+    .side { display: grid; gap: 16px; }
+    .action-list { padding: 4px 18px 10px; }
+    .action { padding: 14px 0; border-bottom: 1px solid var(--cp-border); }
+    .action:last-child { border-bottom: 0; }
+    .action-head { justify-content: space-between; gap: 12px; margin-bottom: 5px; }
+    .action-title { font-weight: 700; }
+    .tag {
+      border: 1px solid var(--cp-border);
+      border-radius: 0.625rem;
+      padding: 2px 7px;
+      color: var(--cp-text-muted);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+    .action p { color: var(--cp-text-muted); font-size: 11px; }
+    .action a { color: var(--cp-link); text-decoration: none; font-size: 11px; display: inline-block; margin-top: 7px; }
+    .savings { padding: 18px; }
+    .savings-number { font-size: 30px; font-weight: 700; color: var(--cp-accent); letter-spacing: -0.04em; }
+    .savings p { color: var(--cp-text-muted); font-size: 11px; margin-top: 6px; }
+    .range {
+      height: 12px;
+      background: var(--cp-surface-soft);
+      border: 1px solid var(--cp-border);
+      border-radius: 0.625rem;
+      margin: 16px 0 8px;
+      overflow: hidden;
+    }
+    .range span { display: block; width: 28%; min-width: 100px; height: 100%; background: var(--cp-accent); }
+    .range-labels { display: flex; justify-content: space-between; color: var(--cp-text-muted); font-size: 10px; }
+    .footer-note {
+      margin-top: 16px;
+      padding: 12px 16px;
+      color: var(--cp-text-muted);
+      font-size: 11px;
+      border-left: 3px solid var(--cp-border-strong);
+      background: var(--cp-surface);
+    }
+    @media (max-width: 1050px) {
+      .summary-grid { grid-template-columns: repeat(3, 1fr); }
+      .main-grid { grid-template-columns: 1fr; }
+      .coverage { grid-template-columns: 160px 1fr; }
+      .coverage-note { display: none; }
+    }
+    @media (max-width: 720px) {
+      .topbar { padding: 0 16px; }
+      .top-actions .status, .top-actions .button:first-of-type { display: none; }
+      .report { width: min(100% - 24px, 1340px); margin-top: 18px; }
+      .hero { grid-template-columns: 1fr; }
+      .meta { white-space: normal; }
+      .summary-grid { grid-template-columns: repeat(2, 1fr); }
+      .finding { grid-template-columns: 72px 1fr; }
+      .impact, .confidence { grid-column: 2; text-align: left; }
+      .coverage { grid-template-columns: 1fr; }
+    }
+    @media print {
+      .topbar, .button { display: none; }
+      .report { width: 100%; margin: 0; }
+      .card { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span>TokenLens <small>for Azure</small></span>
+      </div>
+      <div class="top-actions">
+        <span class="status"><span class="dot"></span>Analysis complete</span>
+        <button class="button" type="button" id="theme-toggle">Switch theme</button>
+        <button class="button primary" type="button" id="print-report">Save as PDF</button>
+      </div>
+    </header>
+
+    <main class="report">
+      <section class="hero">
+        <div>
+          <div class="eyebrow">Token efficiency assessment</div>
+          <h1>support-assistant / candidate</h1>
+          <p class="subtitle">Eight offline diagnostics evaluated request traces for avoidable token usage, operational risk, and Azure optimization opportunities.</p>
+        </div>
+        <div class="meta">
+          <div>Generated<strong>03 Sep 2026, 17:52</strong></div>
+          <div>Source<strong>requests.jsonl</strong></div>
+          <div>Mode<strong>Advisory</strong></div>
+        </div>
+      </section>
+
+      <section class="summary-grid" aria-label="Analysis summary">
+        <article class="card metric">
+          <div class="metric-label">Requests analyzed</div>
+          <div class="metric-value">12,480</div>
+          <div class="metric-note">11,906 successful · 574 retried</div>
+        </article>
+        <article class="card metric">
+          <div class="metric-label">Input tokens</div>
+          <div class="metric-value">38.2M</div>
+          <div class="metric-note">3,061 median per request</div>
+        </article>
+        <article class="card metric">
+          <div class="metric-label">Output tokens</div>
+          <div class="metric-value">4.7M</div>
+          <div class="metric-note">376 median per request</div>
+        </article>
+        <article class="card metric emphasis">
+          <div class="metric-label">Avoidable input</div>
+          <div class="metric-value">8.7–12.1M</div>
+          <div class="metric-note">23–32% estimated range</div>
+        </article>
+        <article class="card metric">
+          <div class="metric-label">Diagnostic result</div>
+          <div class="metric-value">6</div>
+          <div class="metric-note">2 high · 3 medium · 1 low</div>
+        </article>
+      </section>
+
+      <section class="card coverage" aria-label="Data quality">
+        <div class="coverage-title">
+          <strong>Data quality: good</strong>
+          <span>7 of 8 rules fully evaluated</span>
+        </div>
+        <div class="bar" aria-label="87.5 percent rule coverage"><span></span></div>
+        <div class="coverage-note">Retrieval metadata missing from 42% of requests; TL004 is not evaluated.</div>
+      </section>
+
+      <div class="main-grid">
+        <section class="card">
+          <div class="panel-head">
+            <div>
+              <h2>Findings</h2>
+              <p>Ordered by severity, impact, and confidence</p>
+            </div>
+            <div class="legend" aria-label="Severity legend">
+              <span><i class="high"></i>High</span>
+              <span><i class="medium"></i>Medium</span>
+              <span><i class="low"></i>Low</span>
+            </div>
+          </div>
+
+          <div class="finding">
+            <div class="rule-id"><span class="severity high"></span>TL001</div>
+            <div>
+              <div class="finding-title">Repeated system prefix</div>
+              <div class="finding-detail">8,103 requests repeat a 1,162-token stable prefix.</div>
+            </div>
+            <div class="impact"><strong>6.9–9.4M tokens</strong><span class="impact-label">estimated avoidable input</span></div>
+            <div class="confidence"><strong>High confidence</strong>exact token match</div>
+          </div>
+
+          <div class="finding">
+            <div class="rule-id"><span class="severity high"></span>TL005</div>
+            <div>
+              <div class="finding-title">Retry amplification</div>
+              <div class="finding-detail">574 retries resend an average of 4,820 input tokens.</div>
+            </div>
+            <div class="impact"><strong>2.1–2.8M tokens</strong><span class="impact-label">repeated across retries</span></div>
+            <div class="confidence"><strong>High confidence</strong>linked request IDs</div>
+          </div>
+
+          <div class="finding">
+            <div class="rule-id"><span class="severity medium"></span>TL003</div>
+            <div>
+              <div class="finding-title">Unused tool definitions</div>
+              <div class="finding-detail">14 tools are sent globally; 9 are used in fewer than 1% of requests.</div>
+            </div>
+            <div class="impact"><strong>1.2–1.9M tokens</strong><span class="impact-label">schema overhead</span></div>
+            <div class="confidence"><strong>High confidence</strong>observed tool calls</div>
+          </div>
+
+          <div class="finding">
+            <div class="rule-id"><span class="severity medium"></span>TL007</div>
+            <div>
+              <div class="finding-title">Semantic-cache opportunity</div>
+              <div class="finding-detail">1,284 requests form 96 repeated intent groups.</div>
+            </div>
+            <div class="impact"><strong>7–10% calls</strong><span class="impact-label">potentially reusable</span></div>
+            <div class="confidence"><strong>Medium confidence</strong>lexical clustering</div>
+          </div>
+
+          <div class="finding">
+            <div class="rule-id"><span class="severity medium"></span>TL006</div>
+            <div>
+              <div class="finding-title">Output budget over-allocation</div>
+              <div class="finding-detail">P99 output is 612 tokens while the configured limit is 4,096.</div>
+            </div>
+            <div class="impact"><strong>3,484 tokens</strong><span class="impact-label">unused headroom at P99</span></div>
+            <div class="confidence"><strong>High confidence</strong>12,480 responses</div>
+          </div>
+
+          <div class="finding">
+            <div class="rule-id"><span class="severity low"></span>TL008</div>
+            <div>
+              <div class="finding-title">Possible model over-sizing</div>
+              <div class="finding-detail">31% of traffic is bounded classification or extraction.</div>
+            </div>
+            <div class="impact"><strong>Evaluation needed</strong><span class="impact-label">quality must be benchmarked</span></div>
+            <div class="confidence"><strong>Low confidence</strong>task-shape heuristic</div>
+          </div>
+
+          <div class="finding not-evaluated">
+            <div class="rule-id"><span class="severity"></span>TL004</div>
+            <div>
+              <div class="finding-title">Retrieval redundancy</div>
+              <div class="finding-detail">Not evaluated: retrieved chunk text is missing from most records.</div>
+            </div>
+            <div class="impact"><strong>No estimate</strong><span class="impact-label">insufficient evidence</span></div>
+            <div class="confidence"><strong>Not evaluated</strong>add retrieved_chunks</div>
+          </div>
+        </section>
+
+        <aside class="side">
+          <section class="card savings">
+            <div class="metric-label">Estimated addressable range</div>
+            <div class="savings-number">23–32%</div>
+            <p>Share of input tokens associated with measured findings. Ranges overlap and are deduplicated before aggregation.</p>
+            <div class="range"><span></span></div>
+            <div class="range-labels"><span>Current 38.2M</span><span>Potential 26.1–29.5M</span></div>
+          </section>
+
+          <section class="card">
+            <div class="panel-head">
+              <div>
+                <h2>Azure actions</h2>
+                <p>Prioritized by evidence and implementation effort</p>
+              </div>
+            </div>
+            <div class="action-list">
+              <article class="action">
+                <div class="action-head">
+                  <span class="action-title">Stabilize the cached prefix</span>
+                  <span class="tag">High impact</span>
+                </div>
+                <p>Place reusable instructions first and preserve an identical prefix across requests.</p>
+                <a href="#prompt-cache">Azure OpenAI prompt caching →</a>
+              </article>
+              <article class="action">
+                <div class="action-head">
+                  <span class="action-title">Route tools by intent</span>
+                  <span class="tag">Low effort</span>
+                </div>
+                <p>Send only the tool definitions relevant to the selected route.</p>
+                <a href="#gateway">APIM AI gateway policies →</a>
+              </article>
+              <article class="action">
+                <div class="action-head">
+                  <span class="action-title">Evaluate semantic caching</span>
+                  <span class="tag">Guardrails</span>
+                </div>
+                <p>Partition entries by tenant and permissions; validate freshness and similarity thresholds.</p>
+                <a href="#semantic-cache">APIM semantic caching →</a>
+              </article>
+              <article class="action">
+                <div class="action-head">
+                  <span class="action-title">Benchmark model routing</span>
+                  <span class="tag">Evaluate</span>
+                </div>
+                <p>Use a golden set before routing bounded tasks to lower-cost models.</p>
+                <a href="#model-router">Microsoft Foundry Model Router →</a>
+              </article>
+            </div>
+          </section>
+        </aside>
+      </div>
+
+      <div class="footer-note">
+        Estimates describe addressable token volume, not guaranteed financial savings. Validate quality, safety, tenancy, and cache freshness before production changes. Raw prompt content is excluded from this report.
+      </div>
+    </main>
+  </div>
+
+  <script>
+    document.getElementById("theme-toggle").addEventListener("click", () => {
+      const current = document.documentElement.getAttribute("data-theme");
+      document.documentElement.setAttribute("data-theme", current === "dark" ? "light" : "dark");
+    });
+    document.getElementById("print-report").addEventListener("click", () => window.print());
+  </script>
+</body>
+</html>

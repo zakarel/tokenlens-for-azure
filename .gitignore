@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+.DS_Store
+tokenlens-report.html
+tokenlens.json
+tokenlens.sarif
+

@@ -1,0 +1,40 @@
+name: TokenLens for Azure
+description: Analyze OpenAI-compatible JSONL traces for avoidable token usage.
+inputs:
+  input:
+    description: Path to an OpenAI-compatible JSONL trace file.
+    required: true
+  baseline:
+    description: Optional baseline JSONL file for regression comparison.
+    required: false
+  format:
+    description: Report format: text, json, sarif, or html.
+    required: false
+    default: sarif
+  fail-on-regression:
+    description: Optional addressable-percentage regression threshold.
+    required: false
+  python-version:
+    description: Python version used by the action.
+    required: false
+    default: "3.12"
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+    - shell: bash
+      run: python -m pip install "${{ github.action_path }}"
+    - shell: bash
+      run: |
+        if [[ -n "${{ inputs.baseline }}" ]]; then
+          tokenlens-azure compare "${{ inputs.baseline }}" "${{ inputs.input }}" \
+            --format "${{ inputs.format }}" \
+            --output tokenlens.${{ inputs.format }} \
+            $([[ -n "${{ inputs.fail-on-regression }}" ]] && echo "--fail-on-regression ${{ inputs.fail-on-regression }}" || true)
+        else
+          tokenlens-azure analyze "${{ inputs.input }}" \
+            --format "${{ inputs.format }}" \
+            --output tokenlens.${{ inputs.format }}
+        fi
