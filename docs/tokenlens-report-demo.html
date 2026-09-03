@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="icon" href="data:,">
+  <link rel="icon" type="image/png" href="assets/tokenlens-icon.png">
   <title>TokenLens for Azure — Sample Report</title>
   <script>
     (() => {
@@ -96,23 +96,11 @@
       align-items: center;
     }
     .brand { gap: 10px; font-weight: 700; letter-spacing: -0.01em; }
-    .brand-mark {
+    .brand-logo {
       width: 28px;
       height: 28px;
-      border: 2px solid var(--cp-accent);
-      border-radius: 50%;
-      position: relative;
-    }
-    .brand-mark::after {
-      content: "";
-      position: absolute;
-      width: 9px;
-      height: 2px;
-      background: var(--cp-accent);
-      right: -6px;
-      bottom: 2px;
-      transform: rotate(45deg);
-      transform-origin: left center;
+      border-radius: 0.4rem;
+      object-fit: cover;
     }
     .brand small { color: var(--cp-text-muted); font-weight: 500; }
     .top-actions { gap: 12px; color: var(--cp-text-muted); font-size: 12px; }
@@ -308,7 +296,7 @@
   <div class="page">
     <header class="topbar">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true"></span>
+        <img class="brand-logo" src="assets/tokenlens-icon.png" alt="">
         <span>TokenLens <small>for Azure</small></span>
       </div>
       <div class="top-actions">

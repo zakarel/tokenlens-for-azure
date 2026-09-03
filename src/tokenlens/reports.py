@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import html
 import json
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -40,8 +42,14 @@ def _severity_class(finding: Finding) -> str:
     return finding.severity
 
 
+def _logo_data_uri() -> str:
+    logo = files("tokenlens").joinpath("assets/tokenlens-icon.png").read_bytes()
+    return "data:image/png;base64," + base64.b64encode(logo).decode("ascii")
+
+
 def report_html(report: AnalysisReport) -> str:
     summary = report.summary
+    logo_data_uri = _logo_data_uri()
     finding_rows = []
     for finding in report.findings:
         estimate = finding.estimated_savings
@@ -64,9 +72,9 @@ def report_html(report: AnalysisReport) -> str:
 <title>TokenLens for Azure — Report</title>
 <style>
 :root{{color-scheme:light;--bg:#f7f4ef;--surface:#fff;--text:#242424;--muted:#5c5c5c;--border:#dedede;--accent:#b11f4b;--success:#16a34a;--danger:#dc2626;--warning:#f59e0b;--link:#0078d4}}
-*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI",Arial,sans-serif}}main{{max-width:1220px;margin:34px auto;padding:0 22px}}header{{display:flex;justify-content:space-between;align-items:end;border-bottom:1px solid var(--border);padding-bottom:20px;margin-bottom:18px}}h1{{font-size:32px;letter-spacing:-.04em;margin:4px 0}}h2{{font-size:18px;margin:0}}p,small{{color:var(--muted)}}.eyebrow{{color:var(--accent);font-weight:700;font-size:11px;letter-spacing:.1em;text-transform:uppercase}}.meta{{text-align:right;font-size:12px}}.meta strong{{display:block;color:var(--text)}}.metrics{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:12px}}.card{{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px}}.label{{color:var(--muted);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}}.value{{font-size:25px;font-weight:700;margin-top:8px;letter-spacing:-.04em}}.accent{{color:var(--accent)}}.sub{{color:var(--muted);font-size:11px;margin-top:7px}}.grid{{display:grid;grid-template-columns:1.8fr 1fr;gap:14px;align-items:start}}.panel{{background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}}.panelhead{{padding:16px;border-bottom:1px solid var(--border)}}.finding{{display:grid;grid-template-columns:70px 1.2fr .8fr 1fr;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border);align-items:center}}.finding:last-child{{border:0}}.finding.high .rule{{border-left-color:var(--danger)}}.finding.medium .rule{{border-left-color:var(--warning)}}.finding.low .rule{{border-left-color:var(--link)}}.finding.info .rule{{border-left-color:var(--border)}}.rule{{font-family:Consolas,monospace;font-weight:700;border-left:6px solid;padding-left:8px}}small{{display:block;font-size:11px;margin-top:3px}}.impact{{font-weight:700}}.action{{font-size:12px}}.action strong{{color:var(--link)}}.note{{margin-top:14px;padding:12px 14px;border-left:3px solid var(--border);background:var(--surface);color:var(--muted);font-size:11px}}@media(max-width:900px){{.metrics{{grid-template-columns:repeat(3,1fr)}}.grid{{grid-template-columns:1fr}}}}@media(max-width:620px){{header{{display:block}}.meta{{text-align:left;margin-top:14px}}.metrics{{grid-template-columns:repeat(2,1fr)}}.finding{{grid-template-columns:65px 1fr}}.impact,.action{{grid-column:2}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI",Arial,sans-serif}}main{{max-width:1220px;margin:34px auto;padding:0 22px}}header{{display:flex;justify-content:space-between;align-items:end;border-bottom:1px solid var(--border);padding-bottom:20px;margin-bottom:18px}}.title{{display:flex;align-items:center;gap:14px}}.logo{{width:58px;height:58px;border-radius:12px;object-fit:cover}}h1{{font-size:32px;letter-spacing:-.04em;margin:4px 0}}h2{{font-size:18px;margin:0}}p,small{{color:var(--muted)}}.eyebrow{{color:var(--accent);font-weight:700;font-size:11px;letter-spacing:.1em;text-transform:uppercase}}.meta{{text-align:right;font-size:12px}}.meta strong{{display:block;color:var(--text)}}.metrics{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:12px}}.card{{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px}}.label{{color:var(--muted);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}}.value{{font-size:25px;font-weight:700;margin-top:8px;letter-spacing:-.04em}}.accent{{color:var(--accent)}}.sub{{color:var(--muted);font-size:11px;margin-top:7px}}.grid{{display:grid;grid-template-columns:1.8fr 1fr;gap:14px;align-items:start}}.panel{{background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}}.panelhead{{padding:16px;border-bottom:1px solid var(--border)}}.finding{{display:grid;grid-template-columns:70px 1.2fr .8fr 1fr;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border);align-items:center}}.finding:last-child{{border:0}}.finding.high .rule{{border-left-color:var(--danger)}}.finding.medium .rule{{border-left-color:var(--warning)}}.finding.low .rule{{border-left-color:var(--link)}}.finding.info .rule{{border-left-color:var(--border)}}.rule{{font-family:Consolas,monospace;font-weight:700;border-left:6px solid;padding-left:8px}}small{{display:block;font-size:11px;margin-top:3px}}.impact{{font-weight:700}}.action{{font-size:12px}}.action strong{{color:var(--link)}}.note{{margin-top:14px;padding:12px 14px;border-left:3px solid var(--border);background:var(--surface);color:var(--muted);font-size:11px}}@media(max-width:900px){{.metrics{{grid-template-columns:repeat(3,1fr)}}.grid{{grid-template-columns:1fr}}}}@media(max-width:620px){{header{{display:block}}.meta{{text-align:left;margin-top:14px}}.metrics{{grid-template-columns:repeat(2,1fr)}}.finding{{grid-template-columns:65px 1fr}}.impact,.action{{grid-column:2}}}}
 </style></head><body><main>
-<header><div><div class="eyebrow">Token efficiency assessment</div><h1>TokenLens for Azure</h1><p>{html.escape(report.source)} · advisory mode · offline analysis</p></div>
+<header><div class="title"><img class="logo" src="{logo_data_uri}" alt="TokenLens for Azure logo"><div><div class="eyebrow">Token efficiency assessment</div><h1>TokenLens for Azure</h1><p>{html.escape(report.source)} · advisory mode · offline analysis</p></div></div>
 <div class="meta">Generated<strong>{html.escape(report.generated_at)}</strong>Version<strong>{html.escape(report.version)}</strong></div></header>
 <section class="metrics"><div class="card"><div class="label">Requests</div><div class="value">{summary.requests_analyzed:,}</div><div class="sub">{summary.retries:,} retries</div></div>
 <div class="card"><div class="label">Input tokens</div><div class="value">{summary.input_tokens:,}</div><div class="sub">{summary.cached_tokens:,} cached</div></div>
@@ -84,4 +92,3 @@ def write_output(content: str, output: str | None) -> None:
         Path(output).write_text(content, encoding="utf-8")
     else:
         print(content, end="")
-

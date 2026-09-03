@@ -5,6 +5,7 @@ from typer.testing import CliRunner
 from tokenlens.analyzer import analyze
 from tokenlens.cli import app
 from tokenlens.ingest import iter_records
+from tokenlens.reports import report_html
 
 
 def record(**overrides):
@@ -69,3 +70,10 @@ def test_cli_writes_json(tmp_path):
     assert result.exit_code == 0, result.output
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["tool"] == "TokenLens for Azure"
+
+
+def test_html_report_embeds_logo():
+    records = [next(iter_records(__import__("io").StringIO(json.dumps(record()) + "\n")))]
+    rendered = report_html(analyze(records, "sample.jsonl"))
+    assert 'src="data:image/png;base64,' in rendered
+    assert 'alt="TokenLens for Azure logo"' in rendered

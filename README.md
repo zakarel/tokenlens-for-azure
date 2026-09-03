@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/tokenlens-logo-dark.png" alt="TokenLens for Azure logo" width="720">
+
 # TokenLens for Azure
 
 ### Lint LLM traces for avoidable token usage
