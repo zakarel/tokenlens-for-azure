@@ -40,7 +40,7 @@ def test_normalizes_openai_records():
     assert parsed.usage.output_tokens == 8
 
 
-def test_analyzer_reports_findings_and_missing_retrieval():
+def test_analyzer_reports_findings_without_missing_retrieval_finding():
     messages = [
         {"role": "system", "content": "You are a support assistant. " + "Follow policy A. " * 80},
         {"role": "user", "content": "Classify this request as billing or support."},
@@ -57,8 +57,10 @@ def test_analyzer_reports_findings_and_missing_retrieval():
     ]
     report = analyze(records, "sample.jsonl")
     ids = {finding.rule_id for finding in report.findings}
-    assert {"TL001", "TL003", "TL004", "TL006", "TL007", "TL008"} <= ids
-    assert report.summary.not_evaluated == 1
+    assert {"TL001", "TL003", "TL006", "TL007", "TL008"} <= ids
+    assert "TL004" not in ids
+    assert all(finding.title != "Not evaluated" for finding in report.findings)
+    assert all(finding.impact_min_percent is not None for finding in report.findings if finding.rule_id != "TL008")
     assert report.summary.addressable_max_tokens > 0
 
 
@@ -77,3 +79,9 @@ def test_html_report_embeds_logo():
     rendered = report_html(analyze(records, "sample.jsonl"))
     assert 'src="data:image/png;base64,' in rendered
     assert 'alt="TokenLens for Azure logo"' in rendered
+    header = rendered.split("<header>", 1)[1].split("</header>", 1)[0]
+    assert "<h1>" not in header
+    assert "Token efficiency assessment" not in header
+    assert "confidence" not in rendered.lower()
+    assert "Data quality" not in rendered
+    assert "tokenlens-for-azure · created by Tzahi Ariel" in rendered

@@ -32,9 +32,9 @@ TokenLens:
 
 - analyzes JSONL locally without calling an LLM;
 - evaluates eight token-efficiency diagnostics;
-- reports evidence, estimated savings ranges, and confidence;
+- reports evidence, estimated savings ranges, and impact percentages;
 - distinguishes measured findings from heuristic opportunities;
-- explicitly reports rules that could not be evaluated because telemetry is missing;
+- omits rules when the trace data cannot support a finding;
 - recommends concrete Azure actions;
 - emits terminal, JSON, SARIF, and self-contained HTML reports;
 - compares a candidate trace set with a baseline;
@@ -54,7 +54,7 @@ Normalize and redact
 Run eight offline diagnostics
           │
           ▼
-Estimate impact and confidence
+Estimate impact percentages
           │
           ▼
 Map findings to Azure actions
@@ -78,7 +78,8 @@ Every finding follows the same explainable contract:
     "min_tokens": 6900000,
     "max_tokens": 9400000
   },
-  "confidence": "high",
+  "impact_min_percent": 18.1,
+  "impact_max_percent": 24.7,
   "azure_recommendation": {
     "service": "Azure OpenAI",
     "capability": "Prompt caching"
@@ -86,19 +87,19 @@ Every finding follows the same explainable contract:
 }
 ```
 
-Overlapping opportunities are bounded before the aggregate range is reported. Missing data produces **not evaluated**, never a silent pass.
+Overlapping opportunities are bounded before the aggregate range is reported. Findings include an estimated impact percentage relative to the analyzed request volume.
 
 ## Example output
 
 <a href="docs/tokenlens-report-demo.html">
-  <img src="docs/tokenlens-report-preview.png" alt="TokenLens for Azure sample report showing metrics, data quality, findings, savings ranges, confidence, and Azure actions">
+  <img src="docs/tokenlens-report-preview.png" alt="TokenLens for Azure sample report showing metrics, impact percentages, findings, savings ranges, and Azure actions">
 </a>
 
 <p align="center">
   <em>Sample data · Click the image to open the complete self-contained report mock-up.</em>
 </p>
 
-The report puts the most actionable information first: total trace volume, addressable token range, data quality, severity-ranked findings, confidence, and prioritized Azure actions.
+The report puts the most actionable information first: total trace volume, addressable token range, impact-ranked findings, and prioritized Azure actions.
 
 ## Prerequisites
 
@@ -228,16 +229,16 @@ Standard OpenAI and Azure OpenAI request/response envelopes are normalized by th
 
 ## Eight diagnostics
 
-| Rule | Detects | Confidence |
-|---|---|:---:|
-| `TL001` | Repeated system prefixes and policy text | High |
-| `TL002` | Unbounded conversation-history growth | High |
-| `TL003` | Oversized or unused tool schemas | High |
-| `TL004` | Duplicate or overlapping retrieval context | Medium |
-| `TL005` | Retry amplification | High |
-| `TL006` | Excessive output allocation | High |
-| `TL007` | Semantic-cache opportunities | Medium |
-| `TL008` | Possible model over-sizing | Low–medium |
+| Rule | Detects |
+|---|---|
+| `TL001` | Repeated system prefixes and policy text |
+| `TL002` | Unbounded conversation-history growth |
+| `TL003` | Oversized or unused tool schemas |
+| `TL004` | Duplicate or overlapping retrieval context |
+| `TL005` | Retry amplification |
+| `TL006` | Excessive output allocation |
+| `TL007` | Semantic-cache opportunities |
+| `TL008` | Possible model over-sizing |
 
 `TL008` is intentionally advisory: it recommends evaluation with a quality baseline rather than blindly downgrading a model.
 

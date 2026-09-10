@@ -15,7 +15,7 @@ def analyze(records: list[TraceRecord], source: str) -> AnalysisReport:
     estimates = [
         finding.estimated_savings
         for finding in findings
-        if finding.evaluated and finding.estimated_savings.unit == "tokens"
+        if finding.estimated_savings.unit == "tokens"
     ]
     addressable_min = sum(estimate.min_tokens or 0 for estimate in estimates)
     addressable_max = sum(estimate.max_tokens or 0 for estimate in estimates)
@@ -27,8 +27,32 @@ def analyze(records: list[TraceRecord], source: str) -> AnalysisReport:
     medium = sum(finding.severity == "medium" for finding in findings)
     low = sum(finding.severity == "low" for finding in findings)
     info = sum(finding.severity == "info" for finding in findings)
-    not_evaluated = sum(not finding.evaluated for finding in findings)
     denominator = max(1, input_tokens)
+    request_denominator = max(1, len(records))
+    findings = [
+        finding.model_copy(
+            update={
+                "impact_min_percent": min(100.0, round(
+                    (finding.estimated_savings.min_tokens or 0)
+                    / (denominator if finding.estimated_savings.unit == "tokens" else request_denominator)
+                    * 100,
+                    1,
+                ))
+                if finding.estimated_savings.min_tokens is not None
+                else None,
+                "impact_max_percent": min(100.0, round(
+                    (finding.estimated_savings.max_tokens or finding.estimated_savings.min_tokens or 0)
+                    / (denominator if finding.estimated_savings.unit == "tokens" else request_denominator)
+                    * 100,
+                    1,
+                ))
+                if finding.estimated_savings.max_tokens is not None
+                or finding.estimated_savings.min_tokens is not None
+                else None,
+            }
+        )
+        for finding in findings
+    ]
     summary = AnalysisSummary(
         requests_analyzed=len(records),
         input_tokens=input_tokens,
@@ -40,7 +64,6 @@ def analyze(records: list[TraceRecord], source: str) -> AnalysisReport:
         medium_findings=medium,
         low_findings=low,
         info_findings=info,
-        not_evaluated=not_evaluated,
         addressable_min_tokens=addressable_min,
         addressable_max_tokens=addressable_max,
         addressable_min_percent=round(addressable_min / denominator * 100, 1),

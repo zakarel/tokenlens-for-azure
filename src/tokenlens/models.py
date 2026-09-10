@@ -51,8 +51,9 @@ class Finding(BaseModel):
     detail: str
     evidence: dict[str, Any] = Field(default_factory=dict)
     estimated_savings: Estimate = Field(default_factory=Estimate)
-    confidence: Literal["high", "medium", "low", "not_evaluated"]
-    evaluated: bool = True
+    confidence: Literal["high", "medium", "low"]
+    impact_min_percent: float | None = Field(default=None, ge=0, le=100)
+    impact_max_percent: float | None = Field(default=None, ge=0, le=100)
     azure_recommendation: AzureRecommendation
 
 
@@ -67,7 +68,6 @@ class AnalysisSummary(BaseModel):
     medium_findings: int
     low_findings: int
     info_findings: int
-    not_evaluated: int
     addressable_min_tokens: int
     addressable_max_tokens: int
     addressable_min_percent: float
@@ -82,4 +82,3 @@ class AnalysisReport(BaseModel):
     summary: AnalysisSummary
     findings: list[Finding]
     rules: list[dict[str, Any]]
-

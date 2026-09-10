@@ -47,17 +47,23 @@ def _render(report, output_format: str) -> str:
             impact = "No estimate"
         else:
             impact = f"{estimate.min_tokens:,}–{estimate.max_tokens:,} tokens"
+        if finding.impact_min_percent is None:
+            impact_percent = "Impact requires quality validation"
+        elif finding.impact_min_percent == finding.impact_max_percent:
+            impact_percent = f"{finding.impact_min_percent:.1f}%"
+        else:
+            impact_percent = f"{finding.impact_min_percent:.1f}–{finding.impact_max_percent:.1f}%"
         lines.extend(
             [
                 f"{finding.severity.upper():<6} {finding.rule_id}  {finding.title}",
                 f"       {finding.detail}",
-                f"       Impact: {impact} · Confidence: {finding.confidence}",
+                f"       Impact: {impact_percent} ({impact})",
                 f"       Azure action: {finding.azure_recommendation.action}",
                 "",
             ]
         )
     lines.append(
-        f"{len(report.rules)} rules processed · {summary.findings} findings · {summary.not_evaluated} not evaluated · advisory result"
+        f"{len(report.rules)} rules processed · {summary.findings} findings · advisory result"
     )
     return "\n".join(lines) + "\n"
 

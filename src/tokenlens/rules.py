@@ -35,7 +35,6 @@ def _finding(
     service: str,
     capability: str,
     action: str,
-    evaluated: bool = True,
 ) -> Finding:
     return Finding(
         rule_id=rule_id,
@@ -45,7 +44,6 @@ def _finding(
         evidence=evidence,
         estimated_savings=estimate,
         confidence=confidence,
-        evaluated=evaluated,
         azure_recommendation=AzureRecommendation(
             service=service, capability=capability, action=action
         ),
@@ -160,19 +158,7 @@ def _words(value: str) -> set[str]:
 def _retrieval(records: list[TraceRecord]) -> Finding | None:
     with_chunks = [record for record in records if record.retrieved_chunks]
     if len(with_chunks) < 2:
-        return _finding(
-            "TL004",
-            "info",
-            "Retrieval redundancy",
-            "Not evaluated: retrieved chunk text is missing from most records.",
-            {"records_with_retrieval": len(with_chunks), "records_analyzed": len(records)},
-            Estimate(unit="none", note="Add retrieved_chunks to evaluate overlap."),
-            "not_evaluated",
-            "Azure AI Search",
-            "Hybrid retrieval and semantic reranking",
-            "Log retrieved chunks so overlap and reranking quality can be measured.",
-            evaluated=False,
-        )
+        return None
     duplicate_tokens = 0
     comparisons = 0
     for record in with_chunks:
