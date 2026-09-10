@@ -8,7 +8,7 @@
 
 TokenLens is an offline Python CLI and GitHub Action that analyzes OpenAI-compatible JSONL traces, identifies token waste, and maps findings to practical Azure optimizations.
 
-[![Status](https://img.shields.io/badge/status-pre--alpha-7A5AF8?style=flat-square)](#project-status)
+[![Status](https://img.shields.io/badge/status-pre--alpha-7A5AF8?style=flat-square)](#what-is-tokenlens)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](#prerequisites)
 [![Offline](https://img.shields.io/badge/analysis-100%25_offline-107C10?style=flat-square)](#privacy-and-security)
 [![Azure-first](https://img.shields.io/badge/Azure-first-0078D4?style=flat-square&logo=microsoftazure&logoColor=white)](#azure-first-portable-core)
@@ -87,16 +87,16 @@ Every finding follows the same explainable contract:
 }
 ```
 
-Overlapping opportunities are bounded before the aggregate range is reported. Findings include an estimated impact percentage relative to the analyzed request volume.
+Overlapping opportunities are bounded before the aggregate range is reported. Findings include an estimated impact percentage relative to the analyzed token or request volume.
 
 ## Example output
 
-<a href="docs/tokenlens-report-demo.html">
+<a href="docs/tokenlens-report-preview.png">
   <img src="docs/tokenlens-report-preview.png" alt="TokenLens for Azure sample report showing metrics, impact percentages, findings, savings ranges, and Azure actions">
 </a>
 
 <p align="center">
-  <em>Sample data · Click the image to open the complete self-contained report mock-up.</em>
+  <em>Sample data · Click the image to open the enlarged preview.</em>
 </p>
 
 The report puts the most actionable information first: total trace volume, addressable token range, impact-ranked findings, and prioritized Azure actions.
@@ -326,46 +326,6 @@ ci:
 - Public tests use synthetic, privacy-safe traces.
 
 TokenLens is safe to bring to the data—not another service that asks developers to upload it.
-
-## Architecture
-
-```text
-src/tokenlens/
-├── cli.py
-├── config.py
-├── ingest/
-├── models/
-├── rules/
-├── estimation/
-├── recommendations/
-└── reports/
-```
-
-The core is a streaming JSONL importer, normalized trace model, plugin-style rule engine, impact estimator, recommendation pack, and multiple report renderers.
-
-## Roadmap
-
-### v0.1
-
-- [x] Offline JSONL importer
-- [x] Eight diagnostic contracts
-- [x] Terminal, JSON, SARIF, and HTML report formats
-- [x] Advisory baseline comparison
-- [x] Azure remediation pack
-- [x] GitHub Action scaffold
-
-### Later
-
-- [ ] APIM and Application Insights import adapters
-- [ ] Provider recommendation packs
-- [ ] User-supplied pricing catalogs
-- [ ] Custom diagnostic plugins
-- [ ] Trend reports across releases
-- [ ] Optional Azure OpenAI-assisted analysis, disabled by default
-
-## Project status
-
-TokenLens for Azure is an early community project and is **not an official Microsoft product**. APIs, rule thresholds, and package names may change before v0.1.
 
 ## License
 
