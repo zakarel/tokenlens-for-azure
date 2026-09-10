@@ -5,40 +5,32 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="icon" type="image/png" href="assets/tokenlens-icon.png">
   <title>TokenLens for Azure — Sample Report</title>
-  <script>
-    (() => {
-      const param = new URLSearchParams(window.location.search).get("scoutTheme");
-      const theme =
-        param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-      document.documentElement.setAttribute("data-theme", theme);
-    })();
-  </script>
   <style>
     :root {
-      color-scheme: light;
-      --cp-bg: #f7f4ef;
-      --cp-bg-elevated: #fcfbf8;
-      --cp-surface: #ffffff;
-      --cp-surface-soft: #f5f5f5;
-      --cp-border: #dedede;
-      --cp-border-strong: #919191;
-      --cp-text: #242424;
-      --cp-text-muted: #5c5c5c;
-      --cp-text-soft: #6f6f6f;
-      --cp-accent: #b11f4b;
-      --cp-accent-hover: #9a1a41;
-      --cp-accent-soft: rgba(177, 31, 75, 0.08);
-      --cp-accent-fg: #ffffff;
-      --cp-success: #16a34a;
-      --cp-danger: #dc2626;
-      --cp-warning: #f59e0b;
-      --cp-link: #0078d4;
-      --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
-      --cp-overlay: rgba(255, 255, 255, 0.8);
-      --cp-panel: rgba(255, 255, 255, 0.86);
-      --cp-panel-strong: rgba(255, 255, 255, 0.96);
-      --cp-sheen: rgba(255, 255, 255, 0.55);
-      --cp-highlight: rgba(177, 31, 75, 0.12);
+      color-scheme: dark;
+      --cp-bg: #11213b;
+      --cp-bg-elevated: #172a49;
+      --cp-surface: #1b3153;
+      --cp-surface-soft: #223b61;
+      --cp-border: #35527a;
+      --cp-border-strong: #55749f;
+      --cp-text: #f3f7ff;
+      --cp-text-muted: #b5c5dc;
+      --cp-text-soft: #d2deee;
+      --cp-accent: #73c7ff;
+      --cp-accent-hover: #9bd9ff;
+      --cp-accent-soft: rgba(115, 199, 255, 0.14);
+      --cp-accent-fg: #10213a;
+      --cp-success: #57d68b;
+      --cp-danger: #ff7b8e;
+      --cp-warning: #ffc857;
+      --cp-link: #8ad2ff;
+      --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+      --cp-overlay: rgba(17, 33, 59, 0.88);
+      --cp-panel: rgba(27, 49, 83, 0.9);
+      --cp-panel-strong: rgba(27, 49, 83, 0.98);
+      --cp-sheen: rgba(255, 255, 255, 0.04);
+      --cp-highlight: rgba(115, 199, 255, 0.14);
     }
     html[data-theme="dark"] {
       color-scheme: dark;
@@ -81,7 +73,7 @@
     .page { min-height: 100vh; }
     .topbar {
       height: 56px;
-      background: var(--cp-surface);
+      background: var(--cp-bg);
       border-bottom: 1px solid var(--cp-border);
       display: flex;
       align-items: center;
@@ -305,7 +297,6 @@
       </div>
       <div class="top-actions">
         <span class="status"><span class="dot"></span>Analysis complete</span>
-        <button class="button" type="button" id="theme-toggle">Switch theme</button>
         <button class="button primary" type="button" id="print-report">Save as PDF</button>
       </div>
     </header>
@@ -467,23 +458,40 @@
                 <p>Use a golden set before routing bounded tasks to lower-cost models.</p>
                 <a href="#model-router">Microsoft Foundry Model Router →</a>
               </article>
+              <article class="action">
+                <div class="action-head">
+                  <span class="action-title">Bound conversation history</span>
+                  <span class="tag">Medium impact</span>
+                </div>
+                <p>Summarize durable state and send only task-relevant turns to the model.</p>
+                <a href="#context-reduction">Context reduction guidance →</a>
+              </article>
+              <article class="action">
+                <div class="action-head">
+                  <span class="action-title">Set output ceilings by route</span>
+                  <span class="tag">Low effort</span>
+                </div>
+                <p>Use measured response distributions to set safe, route-specific output limits.</p>
+                <a href="#output-controls">Azure OpenAI output controls →</a>
+              </article>
+              <article class="action">
+                <div class="action-head">
+                  <span class="action-title">Instrument workload boundaries</span>
+                  <span class="tag">Visibility</span>
+                </div>
+                <p>Track tenant, workload, latency, and token usage consistently across routes.</p>
+                <a href="#observability">Application Insights and Azure Monitor →</a>
+              </article>
             </div>
           </section>
         </aside>
       </div>
 
-      <div class="footer-note">
-        Estimates describe addressable token volume, not guaranteed financial savings. Validate quality, safety, tenancy, and cache freshness before production changes. Raw prompt content is excluded from this report.
-      </div>
       <div class="watermark">tokenlens-for-azure · created by Tzahi Ariel</div>
     </main>
   </div>
 
   <script>
-    document.getElementById("theme-toggle").addEventListener("click", () => {
-      const current = document.documentElement.getAttribute("data-theme");
-      document.documentElement.setAttribute("data-theme", current === "dark" ? "light" : "dark");
-    });
     document.getElementById("print-report").addEventListener("click", () => window.print());
   </script>
 </body>

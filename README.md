@@ -91,8 +91,8 @@ Overlapping opportunities are bounded before the aggregate range is reported. Fi
 
 ## Example output
 
-<a href="docs/tokenlens-report-preview-v2.png">
-  <img src="docs/tokenlens-report-preview-v2.png" alt="TokenLens for Azure sample report showing metrics, impact percentages, findings, savings ranges, and Azure actions">
+<a href="docs/tokenlens-report-preview-v3.png">
+  <img src="docs/tokenlens-report-preview-v3.png" alt="TokenLens for Azure sample report showing metrics, impact percentages, findings, savings ranges, and Azure actions">
 </a>
 
 <p align="center">
