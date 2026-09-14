@@ -372,38 +372,6 @@ ci:
   advisory: true
   fail_on_regression_percent: null
 ```
-
-## Privacy and security
-
-- Analysis runs locally or on the CI runner.
-- Analysis makes no network calls and requires no API key. Capture is an
-  explicit Entra-authenticated opt-in.
-- No model inspects, rewrites, or summarizes prompts.
-- Raw prompt content is omitted from reports by default.
-- Tenant and workload boundaries are respected during cache analysis.
-- Public tests use synthetic, privacy-safe traces.
-- Keep raw traces outside Git (the `init-foundry` directory ignores JSONL),
-  redact or hash tenant identifiers, set trace/report retention and restrictive
-  file permissions, and never collect secrets, access tokens, or unnecessary
-  prompt content.
-
-TokenLens is safe to bring to the data—not another service that asks developers to upload it.
-
-## Troubleshooting
-
-- Run commands from the repository directory; quote paths containing spaces.
-- If `python` is unavailable, use `python3` (macOS/Linux) or `py` (PowerShell).
-- No activation is needed. For zsh, the optional activation command is
-  `. .venv/bin/activate`.
-- Use `az login` and verify the Entra inference role if capture cannot
-  authenticate. Check the endpoint format and exact deployment name.
-- Constructing a client is intentionally quiet; output appears only after a
-  request is sent.
-- macOS `open` can be silent. Verify the absolute `report-path` printed by the
-  CLI or pass `--open`.
-- A small trace set may legitimately produce few findings; collect
-  representative traffic rather than synthetic calls to every deployment.
-
 ## License
 
 TokenLens for Azure is released under the [MIT License](LICENSE).
@@ -412,6 +380,5 @@ TokenLens for Azure is released under the [MIT License](LICENSE).
 
 <div align="center">
 
-**Spend tokens on answers—not repetition.**
 
 </div>
