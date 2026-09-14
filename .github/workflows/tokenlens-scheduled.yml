@@ -1,0 +1,37 @@
+name: TokenLens scheduled report
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      trace-path:
+        description: "Private runner path to JSONL traces"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    # Production traces stay on a private runner; the scheduled job uploads reports only.
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --quiet .
+      - name: Generate report
+        env:
+          TOKENLENS_TRACE_INPUT: ${{ inputs.trace-path || vars.TOKENLENS_TRACE_INPUT }}
+        run: |
+          test -n "${TOKENLENS_TRACE_INPUT}"
+          tokenlens-azure analyze "${TOKENLENS_TRACE_INPUT}" --format html --output-dir reports
+          tokenlens-azure analyze "${TOKENLENS_TRACE_INPUT}" --format json --output-dir reports
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tokenlens-report-${{ github.run_number }}
+          path: reports/tokenlens-report-*
+          retention-days: 7
