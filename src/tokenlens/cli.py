@@ -14,6 +14,7 @@ import typer
 from .analyzer import analyze
 from .ingest import InputError, load_records_many
 from .output import choose_output
+from .presentation import impact_category, is_material, materiality_config
 from .reports import report_html, report_json, report_sarif, write_output
 
 app = typer.Typer(help="Offline LLM token-efficiency diagnostics with Azure-first guidance.")
@@ -70,6 +71,8 @@ def _render(report, output_format: str) -> str:
         lines.extend(
             [
                 f"{finding.severity.upper():<6} {finding.rule_id}  {finding.title}",
+                f"       Materiality: {impact_category(finding)}"
+                + ("" if is_material(finding, materiality_config(report)) else " · Additional opportunity"),
                 f"       {finding.detail}",
                 f"       Impact: {impact_percent} ({impact})",
                 f"       Azure action: {finding.azure_recommendation.action}",
@@ -124,9 +127,9 @@ def analyze_command(
     """Analyze one or more OpenAI-compatible JSONL traces."""
     _validate_format(output_format)
     try:
-        _load_config(config)
+        settings = _load_config(config)
         records, source = load_records_many(input_paths)
-        report = analyze(records, source)
+        report = analyze(records, source, report_config=settings.get("report"))
         _write_report(
             _render(report, output_format),
             output,

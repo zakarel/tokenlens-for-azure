@@ -1,0 +1,22 @@
+version: 1
+
+report:
+  overview_min_impact_percent: 1.0
+  overview_min_impact_tokens: 100000
+  overview_max_findings: 3
+
+analysis:
+  tokenizer: auto
+  redact_content: true
+
+rules:
+  TL001:
+    enabled: true
+  TL004:
+    enabled: true
+  TL008:
+    enabled: true
+
+ci:
+  advisory: true
+  fail_on_regression_percent: null
