@@ -85,6 +85,7 @@ class AnalysisSummary(BaseModel):
 class DeploymentSummary(AnalysisSummary):
     deployment_name: str
     model_name: str
+    canonical_model_key: str = "unknown"
     provider: str = "unknown"
     resource_name: str | None = None
     project_name: str | None = None
@@ -106,3 +107,4 @@ class AnalysisReport(BaseModel):
     findings: list[Finding]
     deployments: list[DeploymentAnalysis] = Field(default_factory=list)
     rules: list[dict[str, Any]]
+    report_metadata: dict[str, Any] = Field(default_factory=dict)

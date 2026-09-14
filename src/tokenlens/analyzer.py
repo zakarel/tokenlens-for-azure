@@ -15,6 +15,13 @@ from .models import (
 from .rules import RULES, run_rules
 
 
+DEFAULT_REPORT_CONFIG = {
+    "overview_min_impact_percent": 1.0,
+    "overview_min_impact_tokens": 100000,
+    "overview_max_findings": 3,
+}
+
+
 def _impact(findings: list[Finding], input_tokens: int, request_count: int) -> tuple[int, int]:
     estimates = [finding.estimated_savings for finding in findings if finding.estimated_savings.unit == "tokens"]
     minimum = min(sum(estimate.min_tokens or 0 for estimate in estimates), input_tokens)
@@ -57,6 +64,7 @@ def _summary(
     deployment_name: str | None = None,
     model_name: str | None = None,
     provider: str = "unknown",
+    canonical_model_key: str = "unknown",
     resource_name: str | None = None,
     project_name: str | None = None,
     total_requests: int | None = None,
@@ -102,6 +110,7 @@ def _summary(
         **common,
         deployment_name=deployment_name,
         model_name=model_name or "unknown",
+        canonical_model_key=canonical_model_key,
         provider=provider,
         resource_name=resource_name,
         project_name=project_name,
@@ -125,9 +134,13 @@ def analyze(
     source: str,
     *,
     generated_at: str | None = None,
+    report_config: dict[str, object] | None = None,
 ) -> AnalysisReport:
     """Analyze all records once and expose the same rule engine per deployment."""
     overall_findings = _with_impact(run_rules(records), sum(r.usage.input_tokens for r in records), len(records))
+    applied_report_config = DEFAULT_REPORT_CONFIG | {
+        key: value for key, value in (report_config or {}).items() if key in DEFAULT_REPORT_CONFIG
+    }
     summary = _summary(records, overall_findings)
     total_requests = len(records)
     total_tokens = summary.total_tokens
@@ -153,6 +166,7 @@ def analyze(
                     findings,
                     deployment_name=name,
                     model_name=first.model_name,
+                    canonical_model_key=first.model_name.casefold().strip(),
                     provider=first.provider,
                     resource_name=first.resource_name,
                     project_name=first.project_name,
@@ -170,4 +184,5 @@ def analyze(
         findings=_sorted_findings(overall_findings),
         deployments=deployments,
         rules=RULES,
+        report_metadata={"materiality": applied_report_config},
     )

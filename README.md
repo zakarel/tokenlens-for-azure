@@ -91,15 +91,28 @@ Overlapping opportunities are bounded before the aggregate range is reported. Fi
 
 ## Example output
 
-<a href="docs/tokenlens-report-preview-v5.png">
-  <img src="docs/tokenlens-report-preview-v5.png" alt="TokenLens for Azure sample report showing a 7,548-request multi-deployment portfolio, impact percentages, findings, and Azure actions">
+**Overview**
+
+<a href="docs/tokenlens-report-overview-20260914.png">
+  <img src="docs/tokenlens-report-overview-20260914.png" alt="TokenLens for Azure synthetic report Overview showing portfolio usage, material findings, and Azure actions">
 </a>
 
-<p align="center">
-  <em>Sample data · Click the image to open the enlarged preview.</em>
-</p>
+**Usage analytics**
 
-The report puts the most actionable information first: total trace volume, deployment-level usage, addressable token range, impact-ranked findings, and prioritized Azure actions. The checked-in portfolio example represents 7,548 requests across four deployments.
+<a href="docs/tokenlens-report-usage-20260914.png">
+  <img src="docs/tokenlens-report-usage-20260914.png" alt="TokenLens for Azure synthetic report Usage analytics showing model token-share donut and stacked deployment token chart">
+</a>
+
+<p align="center"><em>Synthetic data · Click either image to open the enlarged view.</em></p>
+
+The report has two views:
+
+- **Overview** is a no-scroll executive one-pager that prioritises material findings and the first Azure actions.
+- **Usage analytics** keeps lower-impact opportunities discoverable and provides model/deployment tables plus accessible charts ([open the live tab](docs/tokenlens-report-demo.html#usage)).
+
+The checked-in example is synthetic and contains exactly **7,548 requests** across four deployments using
+`Claude-opus-5`, `gpt-5.6-luna`, `claude-opus-5`, and `claude-fable-5.1`.
+Overview materiality uses both percentage and absolute token impact; Usage analytics retains lower-impact findings rather than deleting them.
 
 ## Prerequisites
 
