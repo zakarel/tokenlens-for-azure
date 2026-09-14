@@ -91,15 +91,15 @@ Overlapping opportunities are bounded before the aggregate range is reported. Fi
 
 ## Example output
 
-<a href="docs/tokenlens-report-preview-v4.png">
-  <img src="docs/tokenlens-report-preview-v4.png" alt="TokenLens for Azure sample report showing metrics, impact percentages, findings, savings ranges, and Azure actions">
+<a href="docs/tokenlens-report-preview-v5.png">
+  <img src="docs/tokenlens-report-preview-v5.png" alt="TokenLens for Azure sample report showing a 7,548-request multi-deployment portfolio, impact percentages, findings, and Azure actions">
 </a>
 
 <p align="center">
   <em>Sample data · Click the image to open the enlarged preview.</em>
 </p>
 
-The report puts the most actionable information first: total trace volume, addressable token range, impact-ranked findings, and prioritized Azure actions.
+The report puts the most actionable information first: total trace volume, deployment-level usage, addressable token range, impact-ranked findings, and prioritized Azure actions. The checked-in portfolio example represents 7,548 requests across four deployments.
 
 ## Prerequisites
 
