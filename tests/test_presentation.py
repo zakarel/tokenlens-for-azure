@@ -117,7 +117,7 @@ def test_synthetic_fixture_has_requested_totals():
         "reasoning-prod": 3220,
         "general-prod": 2160,
         "reasoning-batch": 1680,
-        "creative-prod": 488,
+        "security-prod": 488,
     }
 
 

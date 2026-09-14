@@ -157,15 +157,15 @@ def analyze_command(
     try:
         settings = _load_config(config)
         aliases = settings.get("task_aliases") if isinstance(settings.get("task_aliases"), dict) else None
+        pricing = settings.get("pricing", {}) if isinstance(settings.get("pricing", {}), dict) else {}
+        customer = PricingCatalog.model_validate(pricing["customer_catalog"]) if pricing.get("customer_catalog") else None
+        reference = (
+            PricingCatalog.model_validate(pricing["reference_catalog"])
+            if pricing.get("reference_catalog")
+            else load_bundled_reference_catalog() if pricing.get("use_reference_catalog", True) else None
+        )
         events, event_source = load_task_events_many(input_paths, aliases=aliases)
         if events:
-            pricing = settings.get("pricing", {}) if isinstance(settings.get("pricing", {}), dict) else {}
-            customer = PricingCatalog.model_validate(pricing["customer_catalog"]) if pricing.get("customer_catalog") else None
-            reference = (
-                PricingCatalog.model_validate(pricing["reference_catalog"])
-                if pricing.get("reference_catalog")
-                else load_bundled_reference_catalog() if pricing.get("use_reference_catalog", False) else None
-            )
             report = analyze_task_events(
                 events,
                 event_source,
@@ -176,7 +176,14 @@ def analyze_command(
             )
         else:
             records, source = load_records_many(input_paths)
-            report = analyze(records, source, report_config=settings.get("report"))
+            report = analyze(
+                records,
+                source,
+                report_config=settings.get("report"),
+                customer_catalog=customer,
+                reference_catalog=reference,
+                use_bundled_reference=pricing.get("use_reference_catalog", True),
+            )
         _write_report(
             _render(report, output_format),
             output,
@@ -341,14 +348,20 @@ def _guided_setup() -> None:
     )
     use_reference = typer.confirm("Use bundled dated reference prices when customer prices do not resolve?", default=True)
     open_report = typer.confirm("Open the generated HTML report?", default=True)
+    reference = load_bundled_reference_catalog() if use_reference else None
     # The wizard intentionally asks no cleanup, threshold, or identity questions.
     try:
         events, source = load_task_events_many([selected])
         if events:
-            report = analyze_task_events(events, source)
+            report = analyze_task_events(events, source, reference_catalog=reference)
         else:
             records, source = load_records_many([selected])
-            report = analyze(records, source)
+            report = analyze(
+                records,
+                source,
+                reference_catalog=reference,
+                use_bundled_reference=False,
+            )
         output_dir = Path("tokenlens-reports")
         output_dir.mkdir(parents=True, exist_ok=True)
         destination = output_dir / "tokenlens-report-latest.html"

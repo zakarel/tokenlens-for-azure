@@ -94,11 +94,16 @@ def test_combined_report_keeps_brand_tabs_and_usage_charts():
 
     rendered = report_html(report.model_copy(update={"task_economics": TaskEconomicsReport()}))
     assert 'alt="TokenLens for Azure logo"' in rendered
-    assert rendered.count('<button class="tab"') == 3
+    assert rendered.count('<button class="tab"') == 4
     assert "Overview</button>" in rendered
-    assert "Task economics</button>" in rendered
+    assert "Cost analysis</button>" in rendered
     assert "Usage &amp; diagnostics</button>" in rendered
+    assert "PTU advisor</button>" in rendered
     assert "Token share by model" in rendered
     assert "Token usage by deployment" in rendered
     assert 'class="donut' in rendered
     assert 'class="columns' in rendered
+    assert "Task economics</button>" not in rendered
+    assert 'style="fill:none;stroke:#73c7ff;stroke-width:28"' in rendered
+    assert "Model summary" in rendered
+    assert rendered.index("Model summary") < rendered.index("All findings")

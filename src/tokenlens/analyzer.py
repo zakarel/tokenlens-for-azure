@@ -14,7 +14,9 @@ from .models import (
     Finding,
     TraceRecord,
 )
-from .pricing import PricingCatalog
+from .pricing import PricingCatalog, PricingResolution, canonical_model_name, resolve_trace_cost
+from .ptu import analyze_ptu
+from .reference import load_bundled_reference_catalog
 from .tasks import reconstruct_tasks
 from .rules import RULES, run_rules
 
@@ -24,6 +26,86 @@ DEFAULT_REPORT_CONFIG = {
     "overview_min_impact_tokens": 100000,
     "overview_max_findings": 3,
 }
+
+
+def _parse_when(value: str | None) -> datetime:
+    if value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        except ValueError:
+            pass
+    return datetime.now(UTC)
+
+
+def _common_value(resolutions: list[PricingResolution], field: str):
+    values = {getattr(item, field) for item in resolutions if getattr(item, field) is not None}
+    return values.pop() if len(values) == 1 else None
+
+
+def _cost_summary(
+    records: list[TraceRecord],
+    *,
+    when: datetime,
+    customer_catalog: PricingCatalog | None,
+    reference_catalog: PricingCatalog | None,
+    required_currency: str,
+) -> dict[str, object]:
+    resolutions = [
+        resolve_trace_cost(
+            record,
+            when=_parse_when(record.timestamp) if record.timestamp else when,
+            customer_catalog=customer_catalog,
+            reference_catalog=reference_catalog,
+            required_currency=required_currency,
+        )
+        for record in records
+    ]
+    resolved = [item for item in resolutions if item.resolved and item.cost_usd is not None]
+    resolved_tokens = sum(
+        record.usage.input_tokens + record.usage.output_tokens
+        for record, resolution in zip(records, resolutions)
+        if resolution.resolved
+    )
+    total_tokens = sum(record.usage.input_tokens + record.usage.output_tokens for record in records)
+    all_components = bool(resolved) and all(
+        item.fresh_input_cost_usd is not None
+        and item.cached_input_cost_usd is not None
+        and item.output_cost_usd is not None
+        for item in resolved
+    )
+    sources = {item.source for item in resolved}
+    catalogs = {item.catalog_name for item in resolved if item.catalog_name}
+    effective_dates = {item.effective_from.isoformat() for item in resolved if item.effective_from}
+    return {
+        "estimated_cost_usd": sum(item.cost_usd or 0 for item in resolved) if resolved else None,
+        "fresh_input_cost_usd": (
+            sum(item.fresh_input_cost_usd or 0 for item in resolved) if all_components else None
+        ),
+        "cached_input_cost_usd": (
+            sum(item.cached_input_cost_usd or 0 for item in resolved) if all_components else None
+        ),
+        "output_cost_usd": (
+            sum(item.output_cost_usd or 0 for item in resolved) if all_components else None
+        ),
+        "pricing_coverage_requests_percent": round(len(resolved) / max(1, len(records)) * 100, 1),
+        "pricing_coverage_tokens_percent": round(
+            resolved_tokens
+            / max(1, total_tokens)
+            * 100,
+            1,
+        ),
+        "pricing_complete": len(resolved) == len(records) and resolved_tokens == total_tokens,
+        "pricing_currency": required_currency,
+        "pricing_source": sources.pop() if len(sources) == 1 else "mixed" if sources else "unresolved",
+        "pricing_catalog_name": catalogs.pop() if len(catalogs) == 1 else "mixed" if catalogs else None,
+        "pricing_effective_from": (
+            effective_dates.pop() if len(effective_dates) == 1 else "mixed" if effective_dates else None
+        ),
+        "input_price_per_million": _common_value(resolved, "input_per_million"),
+        "cached_input_price_per_million": _common_value(resolved, "cached_input_per_million"),
+        "output_price_per_million": _common_value(resolved, "output_per_million"),
+    }
 
 
 def _impact(findings: list[Finding], input_tokens: int, request_count: int) -> tuple[int, int]:
@@ -85,6 +167,10 @@ def _summary(
     project_name: str | None = None,
     total_requests: int | None = None,
     total_tokens: int | None = None,
+    pricing_when: datetime,
+    customer_catalog: PricingCatalog | None,
+    reference_catalog: PricingCatalog | None,
+    pricing_currency: str,
 ) -> AnalysisSummary | DeploymentSummary:
     input_tokens = sum(record.usage.input_tokens for record in records)
     output_tokens = sum(record.usage.output_tokens for record in records)
@@ -119,6 +205,28 @@ def _summary(
             else None
         ),
     }
+    pricing = _cost_summary(
+        records,
+        when=pricing_when,
+        customer_catalog=customer_catalog,
+        reference_catalog=reference_catalog,
+        required_currency=pricing_currency,
+    )
+    common.update(
+        {
+            key: pricing[key]
+            for key in (
+                "estimated_cost_usd",
+                "fresh_input_cost_usd",
+                "cached_input_cost_usd",
+                "output_cost_usd",
+                "pricing_coverage_requests_percent",
+                "pricing_coverage_tokens_percent",
+                "pricing_complete",
+                "pricing_currency",
+            )
+        }
+    )
     if deployment_name is None:
         return AnalysisSummary(**common)
     request_total = total_requests or 0
@@ -129,10 +237,17 @@ def _summary(
         model_name=model_name or "unknown",
         canonical_model_key=canonical_model_key,
         provider=provider,
+        deployment_mode=records[0].deployment_mode if records else "unknown",
         resource_name=resource_name,
         project_name=project_name,
         request_share_percent=round(len(records) / max(1, request_total) * 100, 1),
         token_share_percent=round((input_tokens + output_tokens) / max(1, token_total) * 100, 1),
+        pricing_source=str(pricing["pricing_source"]),
+        pricing_catalog_name=pricing["pricing_catalog_name"],
+        pricing_effective_from=pricing["pricing_effective_from"],
+        input_price_per_million=pricing["input_price_per_million"],
+        cached_input_price_per_million=pricing["cached_input_price_per_million"],
+        output_price_per_million=pricing["output_price_per_million"],
     )
 
 
@@ -152,20 +267,52 @@ def analyze(
     *,
     generated_at: str | None = None,
     report_config: dict[str, object] | None = None,
+    customer_catalog: PricingCatalog | None = None,
+    reference_catalog: PricingCatalog | None = None,
+    use_bundled_reference: bool = True,
 ) -> AnalysisReport:
     """Analyze all records once and expose the same rule engine per deployment."""
     overall_findings = _with_impact(run_rules(records), sum(r.usage.input_tokens for r in records), len(records))
     applied_report_config = DEFAULT_REPORT_CONFIG | {
         key: value for key, value in (report_config or {}).items() if key in DEFAULT_REPORT_CONFIG
     }
-    summary = _summary(records, overall_findings)
+    generated = generated_at or datetime.now(UTC).isoformat()
+    pricing_when = _parse_when(generated)
+    if reference_catalog is None and use_bundled_reference:
+        reference_catalog = load_bundled_reference_catalog()
+    pricing_currency = (
+        "USD"
+        if any(record.observed_cost_usd is not None for record in records)
+        else customer_catalog.currency.upper()
+        if customer_catalog is not None
+        else reference_catalog.currency.upper()
+        if reference_catalog is not None
+        else "USD"
+    )
+    summary = _summary(
+        records,
+        overall_findings,
+        pricing_when=pricing_when,
+        customer_catalog=customer_catalog,
+        reference_catalog=reference_catalog,
+        pricing_currency=pricing_currency,
+    )
     total_requests = len(records)
     total_tokens = summary.total_tokens
-    grouped: dict[str, list[TraceRecord]] = {}
+    grouped: dict[tuple[str, str, str, str, str], list[TraceRecord]] = {}
     for record in records:
-        grouped.setdefault(record.deployment_name or "unknown", []).append(record)
+        grouped.setdefault(
+            (
+                record.resource_name or "",
+                record.project_name or "",
+                record.deployment_name or "unknown",
+                record.model_name or "unknown",
+                record.deployment_mode or "unknown",
+            ),
+            [],
+        ).append(record)
     deployments: list[DeploymentAnalysis] = []
-    for name, deployment_records in sorted(
+    for (_resource, _project, name, model_name, _mode), deployment_records in sorted(
         grouped.items(),
         key=lambda item: sum(r.usage.input_tokens + r.usage.output_tokens for r in item[1]),
         reverse=True,
@@ -182,20 +329,24 @@ def analyze(
                     deployment_records,
                     findings,
                     deployment_name=name,
-                    model_name=first.model_name,
-                    canonical_model_key=first.model_name.casefold().strip(),
+                    model_name=model_name,
+                    canonical_model_key=canonical_model_name(model_name),
                     provider=first.provider,
                     resource_name=first.resource_name,
                     project_name=first.project_name,
                     total_requests=total_requests,
                     total_tokens=total_tokens,
+                    pricing_when=pricing_when,
+                    customer_catalog=customer_catalog,
+                    reference_catalog=reference_catalog,
+                    pricing_currency=pricing_currency,
                 ),
                 findings=_sorted_findings(findings),
             )
         )
-    return AnalysisReport(
+    report = AnalysisReport(
         version=__version__,
-        generated_at=generated_at or datetime.now(UTC).isoformat(),
+        generated_at=generated,
         source=source,
         summary=summary,
         findings=_sorted_findings(overall_findings),
@@ -205,8 +356,26 @@ def analyze(
             "materiality": applied_report_config,
             "scenario_aggregation": "not_combined_due_to_overlap",
             "scenarios": [scenario.model_dump(mode="json") for scenario in build_savings_scenarios(findings=overall_findings)],
+            "pricing": {
+                "currency": summary.pricing_currency,
+                "catalog_name": reference_catalog.catalog_name if reference_catalog else None,
+                "customer_catalog_name": customer_catalog.catalog_name if customer_catalog else None,
+                "source_url": reference_catalog.source_url if reference_catalog else None,
+                "retrieved_at": (
+                    reference_catalog.retrieved_at.isoformat()
+                    if reference_catalog and reference_catalog.retrieved_at
+                    else None
+                ),
+                "coverage_requests_percent": summary.pricing_coverage_requests_percent,
+                "coverage_tokens_percent": summary.pricing_coverage_tokens_percent,
+                "estimate_only": True,
+                "pricing_basis": reference_catalog.pricing_basis if reference_catalog else None,
+                "currency_policy": "single_currency_no_conversion",
+            },
         },
     )
+    report.ptu_analysis = analyze_ptu(records, deployments)
+    return report
 
 
 def analyze_task_events(

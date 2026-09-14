@@ -103,6 +103,58 @@ def test_pricing_precedence_and_formula():
     assert observed.source == "observed" and observed.cost_usd == 0.9
 
 
+def test_task_economics_never_sums_non_usd_catalog_prices():
+    euro_event = model("m1", "task", cost=None).model_copy(
+        update={"model_name": "euro-model", "step_index": 1}
+    )
+    usd_event = model("m2", "task", cost=None).model_copy(
+        update={
+            "model_name": "usd-model",
+            "step_index": 2,
+            "timestamp": BASE + timedelta(milliseconds=1),
+        }
+    )
+    customer = PricingCatalog(
+        currency="EUR",
+        catalog_name="euro-customer",
+        prices=[
+            PriceEntry(
+                provider="synthetic",
+                model="euro-model",
+                region="global",
+                effective_from=date(2026, 1, 1),
+                input_per_million=1,
+                cached_input_per_million=1,
+                output_per_million=1,
+            )
+        ],
+    )
+    reference = PricingCatalog(
+        currency="USD",
+        catalog_name="usd-reference",
+        prices=[
+            PriceEntry(
+                provider="synthetic",
+                model="usd-model",
+                region="global",
+                effective_from=date(2026, 1, 1),
+                input_per_million=2,
+                cached_input_per_million=2,
+                output_per_million=2,
+            )
+        ],
+    )
+    report = analyze_task_events(
+        [euro_event, usd_event, result("r1", "task", "solved")],
+        "fixture",
+        customer_catalog=customer,
+        reference_catalog=reference,
+    )
+    assert report.pricing.resolved_billable_events == 1
+    assert report.pricing.unresolved_billable_events == 1
+    assert report.task_types[0].cost_per_solved_task_usd is None
+
+
 def test_partial_unresolved_trajectory_has_no_monetary_average():
     events = [model("m1", "task", cost=None), result("r1", "task", "solved")]
     cohort = calculate_task_economics(reconstruct_tasks(events)).task_types[0]

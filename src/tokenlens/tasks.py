@@ -138,6 +138,7 @@ def reconstruct_tasks(
     *,
     customer_catalog=None,
     reference_catalog=None,
+    required_currency: str = "USD",
 ) -> list[TaskTrajectory]:
     """Reconstruct tasks independent of file order and late review arrival."""
     stream = _as_events(events)
@@ -174,6 +175,7 @@ def reconstruct_tasks(
                             event,
                             customer_catalog=customer_catalog,
                             reference_catalog=reference_catalog,
+                            required_currency=required_currency,
                         ),
                     )
                 )
