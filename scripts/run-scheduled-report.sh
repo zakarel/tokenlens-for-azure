@@ -16,6 +16,8 @@ if [[ ! -e "${TRACE_INPUT}" ]]; then
 fi
 
 echo "Analyzing configured traces: ${TRACE_INPUT}"
+# Pass a directory/glob containing rotated event streams so late task-result
+# and human-review events can be joined without uploading raw traces.
 "${PYTHON}" analyze "${TRACE_INPUT}" --format html --output-dir "${REPORT_DIR}" --quiet
 "${PYTHON}" analyze "${TRACE_INPUT}" --format json --output-dir "${REPORT_DIR}" --quiet
 latest="$(find "${REPORT_DIR}" -maxdepth 1 -type f -name 'tokenlens-report-*.html' -print | sort | tail -n 1)"

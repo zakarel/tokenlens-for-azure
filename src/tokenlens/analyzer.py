@@ -4,6 +4,8 @@ from datetime import UTC, datetime
 from statistics import mean
 
 from . import __version__
+from .economics import TaskEconomicsReport, build_savings_scenarios, calculate_task_economics
+from .events import TaskEvent
 from .models import (
     AnalysisReport,
     AnalysisSummary,
@@ -12,6 +14,8 @@ from .models import (
     Finding,
     TraceRecord,
 )
+from .pricing import PricingCatalog
+from .tasks import reconstruct_tasks
 from .rules import RULES, run_rules
 
 
@@ -24,8 +28,20 @@ DEFAULT_REPORT_CONFIG = {
 
 def _impact(findings: list[Finding], input_tokens: int, request_count: int) -> tuple[int, int]:
     estimates = [finding.estimated_savings for finding in findings if finding.estimated_savings.unit == "tokens"]
-    minimum = min(sum(estimate.min_tokens or 0 for estimate in estimates), input_tokens)
-    maximum = min(max(sum(estimate.max_tokens or 0 for estimate in estimates), minimum), input_tokens)
+    # Independent findings overlap (for example, cached prefixes and repeated
+    # context). Never add them into a portfolio total; expose the largest
+    # individual opportunity until a sequential replay exists.
+    best = max(
+        estimates,
+        key=lambda estimate: estimate.max_tokens if estimate.max_tokens is not None else estimate.min_tokens or 0,
+        default=None,
+    )
+    minimum = min((best.min_tokens if best and best.min_tokens is not None else 0), input_tokens)
+    maximum = min(
+        (best.max_tokens if best and best.max_tokens is not None else minimum),
+        input_tokens,
+    )
+    maximum = max(minimum, maximum)
     return minimum, maximum
 
 
@@ -95,6 +111,7 @@ def _summary(
         "addressable_max_tokens": maximum,
         "addressable_min_percent": round(minimum / denominator * 100, 1),
         "addressable_max_percent": round(maximum / denominator * 100, 1),
+        "addressable_aggregation": "largest_individual_opportunity",
         "average_tokens_per_request": round((input_tokens + output_tokens) / max(1, len(records)), 1),
         "average_latency_ms": (
             round(mean([record.latency_ms for record in records if record.latency_ms is not None]), 1)
@@ -184,5 +201,35 @@ def analyze(
         findings=_sorted_findings(overall_findings),
         deployments=deployments,
         rules=RULES,
-        report_metadata={"materiality": applied_report_config},
+        report_metadata={
+            "materiality": applied_report_config,
+            "scenario_aggregation": "not_combined_due_to_overlap",
+            "scenarios": [scenario.model_dump(mode="json") for scenario in build_savings_scenarios(findings=overall_findings)],
+        },
     )
+
+
+def analyze_task_events(
+    events: list[TaskEvent | dict[str, object]],
+    source: str,
+    *,
+    generated_at: str | None = None,
+    customer_catalog: PricingCatalog | None = None,
+    reference_catalog: PricingCatalog | None = None,
+    provisional_closed_tasks: int = 30,
+    ranked_closed_tasks: int = 100,
+) -> TaskEconomicsReport:
+    """Analyze explicit v2 task events without retaining raw identifiers."""
+    trajectories = reconstruct_tasks(
+        events,
+        customer_catalog=customer_catalog,
+        reference_catalog=reference_catalog,
+    )
+    report = calculate_task_economics(
+        trajectories,
+        provisional_closed_tasks=provisional_closed_tasks,
+        ranked_closed_tasks=ranked_closed_tasks,
+    )
+    report.report_period["source"] = "stdin" if source == "stdin" else "task-event-stream"
+    report.report_period["generated_at"] = generated_at or datetime.now(UTC).isoformat()
+    return report

@@ -1,0 +1,14 @@
+currency: USD
+catalog_name: bundled-reference-synthetic
+source_url: bundled-reference
+retrieved_at: 2026-09-01
+prices:
+  - provider: synthetic
+    model: reference-example-model
+    service_tier: standard
+    region: global
+    effective_from: 2026-01-01
+    input_per_million: 1.0
+    cached_input_per_million: 0.1
+    cache_write_per_million: 1.25
+    output_per_million: 4.0
