@@ -19,6 +19,11 @@ class TraceRecord(BaseModel):
     timestamp: str | None = None
     request_id: str | None = None
     model: str = "unknown"
+    deployment_name: str = "unknown"
+    model_name: str = "unknown"
+    provider: str = "unknown"
+    resource_name: str | None = None
+    project_name: str | None = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
     tools: list[dict[str, Any]] = Field(default_factory=list)
     max_output_tokens: int | None = Field(default=None, ge=0)
@@ -62,6 +67,7 @@ class AnalysisSummary(BaseModel):
     input_tokens: int
     output_tokens: int
     cached_tokens: int
+    total_tokens: int = 0
     retries: int
     findings: int
     high_findings: int
@@ -72,6 +78,23 @@ class AnalysisSummary(BaseModel):
     addressable_max_tokens: int
     addressable_min_percent: float
     addressable_max_percent: float
+    average_tokens_per_request: float = 0
+    average_latency_ms: float | None = None
+
+
+class DeploymentSummary(AnalysisSummary):
+    deployment_name: str
+    model_name: str
+    provider: str = "unknown"
+    resource_name: str | None = None
+    project_name: str | None = None
+    request_share_percent: float = 0
+    token_share_percent: float = 0
+
+
+class DeploymentAnalysis(BaseModel):
+    summary: DeploymentSummary
+    findings: list[Finding]
 
 
 class AnalysisReport(BaseModel):
@@ -81,4 +104,5 @@ class AnalysisReport(BaseModel):
     source: str
     summary: AnalysisSummary
     findings: list[Finding]
+    deployments: list[DeploymentAnalysis] = Field(default_factory=list)
     rules: list[dict[str, Any]]

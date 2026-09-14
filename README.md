@@ -91,8 +91,8 @@ Overlapping opportunities are bounded before the aggregate range is reported. Fi
 
 ## Example output
 
-<a href="docs/tokenlens-report-preview-v3.png">
-  <img src="docs/tokenlens-report-preview-v3.png" alt="TokenLens for Azure sample report showing metrics, impact percentages, findings, savings ranges, and Azure actions">
+<a href="docs/tokenlens-report-preview-v4.png">
+  <img src="docs/tokenlens-report-preview-v4.png" alt="TokenLens for Azure sample report showing metrics, impact percentages, findings, savings ranges, and Azure actions">
 </a>
 
 <p align="center">
@@ -136,10 +136,23 @@ python -m pip install git+https://github.com/zakarel/tokenlens-for-azure.git
 ```bash
 git clone https://github.com/zakarel/tokenlens-for-azure.git
 cd tokenlens-for-azure
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-python -m pip install -e ".[dev]"
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/tokenlens-azure --help
 ```
+
+No shell activation is required. On Windows PowerShell, use:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\tokenlens-azure.exe --help
+```
+
+For Foundry capture, install the optional dependencies with
+`.venv/bin/python -m pip install -e ".[foundry]"`. Activating with
+`. .venv/bin/activate` (POSIX) or `.venv\Scripts\Activate.ps1` (PowerShell) is
+an optional convenience only.
 
 The package will be published to PyPI after the v0.1 interface stabilizes.
 
@@ -148,15 +161,17 @@ The package will be published to PyPI after the v0.1 interface stabilizes.
 ### Analyze a trace file
 
 ```bash
-tokenlens-azure analyze requests.jsonl
+.venv/bin/tokenlens-azure analyze requests.jsonl
 ```
 
 The command is advisory and exits successfully while reporting findings.
+Pass multiple JSONL files, a directory, or a glob to analyze every observed
+deployment: `.venv/bin/tokenlens-azure analyze "traces/*.jsonl"`.
 
 ### Generate a JSON report
 
 ```bash
-tokenlens-azure analyze requests.jsonl \
+.venv/bin/tokenlens-azure analyze requests.jsonl \
   --format json \
   --output tokenlens.json
 ```
@@ -174,8 +189,41 @@ tokenlens-azure analyze requests.jsonl \
 ```bash
 tokenlens-azure analyze requests.jsonl \
   --format html \
-  --output tokenlens-report.html
+  --output-dir reports \
+  --open
 ```
+
+When `--output` is omitted, HTML, JSON, and SARIF reports use a UTC filename
+such as `tokenlens-report-20260914-082311Z.html`; collisions receive `-2`,
+`-3`, and so on. Text remains on stdout. Use `--output` when a script needs a
+stable path.
+
+### First-run Foundry capture (Entra ID)
+
+TokenLens analysis is offline. Capture is an explicit, separate step using the
+Entra ID credential chain—no API key is required:
+
+```bash
+az login
+.venv/bin/tokenlens-azure doctor
+.venv/bin/tokenlens-azure init-foundry
+export AZURE_OPENAI_ENDPOINT="https://YOUR-RESOURCE.openai.azure.com/"
+.venv/bin/python examples/capture_foundry.py \
+  --deployment YOUR_DEPLOYMENT \
+  --prompt "Classify this support request as billing or support."
+.venv/bin/tokenlens-azure analyze foundry-traces --format html --open
+```
+
+The capture example performs one real request only when a deployment and
+prompt are supplied, records the deployment and returned model separately, and
+never writes credentials or bearer tokens. Your Entra identity needs an Azure
+OpenAI/Foundry inference role on the resource. API-key authentication is not
+the primary onboarding path and is intentionally not shown here.
+
+`doctor` checks Python, write permissions, optional packages, endpoint
+configuration, and the `DefaultAzureCredential` chain without exposing
+secrets. `init-foundry` creates a private `foundry-traces/` directory and a
+copy of the capture example.
 
 ### Compare a candidate with a baseline
 
@@ -258,6 +306,9 @@ The Azure mapping addresses the same optimization problem; it does not imply fea
 
 ## GitHub Actions
 
+The checked-in composite action returns a `report-path` output and uses a
+timestamped report filename:
+
 ```yaml
 name: Token efficiency
 
@@ -272,20 +323,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install -e .
-      - run: |
-          tokenlens-azure compare \
-            test-data/baseline.jsonl \
-            test-data/requests.jsonl \
-            --format sarif \
-            --output tokenlens.sarif \
-            --fail-on-regression 10
+      - uses: ./
+        id: tokenlens
+        with:
+          input: test-data/requests.jsonl
+          format: sarif
+          fail-on-regression: "10"
       - uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: tokenlens.sarif
+          sarif_file: ${{ steps.tokenlens.outputs.report-path }}
 ```
 
 Existing inefficiencies stay in the baseline; pull requests surface newly introduced waste.
+
+For scheduled reporting, see `.github/workflows/tokenlens-scheduled.yml`. It is
+designed for a private/self-hosted runner where `TOKENLENS_TRACE_INPUT` points
+to an explicit secure source; only short-retention HTML/JSON artifacts are
+uploaded, never raw traces. Locally, use `scripts/run-scheduled-report.sh`
+with `TOKENLENS_TRACE_INPUT` and `TOKENLENS_REPORT_DIR`. macOS `launchd`,
+Linux `cron`, and Windows Task Scheduler can invoke that wrapper without
+activating a virtual environment. The wrapper never uploads or emails reports.
 
 ## Configuration
 
@@ -319,13 +376,33 @@ ci:
 ## Privacy and security
 
 - Analysis runs locally or on the CI runner.
-- Version 0.1 makes no network calls and requires no API key.
+- Analysis makes no network calls and requires no API key. Capture is an
+  explicit Entra-authenticated opt-in.
 - No model inspects, rewrites, or summarizes prompts.
 - Raw prompt content is omitted from reports by default.
 - Tenant and workload boundaries are respected during cache analysis.
 - Public tests use synthetic, privacy-safe traces.
+- Keep raw traces outside Git (the `init-foundry` directory ignores JSONL),
+  redact or hash tenant identifiers, set trace/report retention and restrictive
+  file permissions, and never collect secrets, access tokens, or unnecessary
+  prompt content.
 
 TokenLens is safe to bring to the data—not another service that asks developers to upload it.
+
+## Troubleshooting
+
+- Run commands from the repository directory; quote paths containing spaces.
+- If `python` is unavailable, use `python3` (macOS/Linux) or `py` (PowerShell).
+- No activation is needed. For zsh, the optional activation command is
+  `. .venv/bin/activate`.
+- Use `az login` and verify the Entra inference role if capture cannot
+  authenticate. Check the endpoint format and exact deployment name.
+- Constructing a client is intentionally quiet; output appears only after a
+  request is sent.
+- macOS `open` can be silent. Verify the absolute `report-path` printed by the
+  CLI or pass `--open`.
+- A small trace set may legitimately produce few findings; collect
+  representative traffic rather than synthetic calls to every deployment.
 
 ## License
 
