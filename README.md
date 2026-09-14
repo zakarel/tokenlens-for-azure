@@ -95,20 +95,20 @@ independent estimates into a misleading aggregate (for example, `100%–100%`).
 
 **Overview**
 
-<a href="docs/assets/tokenlens-report-overview-20260914-v2.png">
-  <img src="docs/assets/tokenlens-report-overview-20260914-v2.png" alt="TokenLens for Azure synthetic report Overview showing consumption and independent optimisation scenarios">
+<a href="docs/assets/tokenlens-report-overview-20260914-v3.png">
+  <img src="docs/assets/tokenlens-report-overview-20260914-v3.png" alt="TokenLens for Azure synthetic report Overview showing consumption and independent optimisation scenarios">
 </a>
 
 **Task economics**
 
-<a href="docs/assets/tokenlens-report-task-economics-20260914-v2.png">
-  <img src="docs/assets/tokenlens-report-task-economics-20260914-v2.png" alt="TokenLens for Azure synthetic Task economics report showing cost per solved task and execution strategy comparison">
+<a href="docs/assets/tokenlens-report-task-economics-20260914-v3.png">
+  <img src="docs/assets/tokenlens-report-task-economics-20260914-v3.png" alt="TokenLens for Azure synthetic Task economics report showing cost per solved task and execution strategy comparison">
 </a>
 
 **Usage &amp; diagnostics**
 
-<a href="docs/assets/tokenlens-report-usage-20260914-v2.png">
-  <img src="docs/assets/tokenlens-report-usage-20260914-v2.png" alt="TokenLens for Azure synthetic Usage and diagnostics report showing offline request diagnostics fallback">
+<a href="docs/assets/tokenlens-report-usage-20260914-v3.png">
+  <img src="docs/assets/tokenlens-report-usage-20260914-v3.png" alt="TokenLens for Azure synthetic Usage and diagnostics report showing offline request diagnostics fallback">
 </a>
 
 <p align="center"><em>Deterministic synthetic data · Click any image to open the enlarged PNG.</em></p>
