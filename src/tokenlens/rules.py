@@ -50,6 +50,51 @@ def _finding(
     )
 
 
+def _fingerprint_prefix(records: list[TraceRecord]) -> Finding | None:
+    """Detect repeated system prefixes from HMAC fingerprints and token counts.
+
+    Contentless telemetry carries a keyed fingerprint of the system prompt and
+    its token count, which is enough to prove repetition without ever storing
+    the prompt itself.
+    """
+    groups: dict[str, list[int]] = defaultdict(list)
+    tokens: dict[str, int] = {}
+    for index, record in enumerate(records):
+        metadata = record.metadata or {}
+        fingerprint = (metadata.get("fingerprints") or {}).get("system_prompt")
+        prefix_tokens = (metadata.get("content_features") or {}).get("system_prompt_tokens")
+        if not fingerprint or not prefix_tokens:
+            continue
+        groups[str(fingerprint)].append(index)
+        tokens[str(fingerprint)] = int(prefix_tokens)
+    if not groups:
+        return None
+    fingerprint, indexes = max(groups.items(), key=lambda item: len(item[1]))
+    if len(indexes) < 2:
+        return None
+    prefix_tokens = tokens[fingerprint]
+    repeated = prefix_tokens * (len(indexes) - 1)
+    if repeated < 100:
+        return None
+    return _finding(
+        "TL001",
+        "high",
+        "Repeated system prefix",
+        f"{len(indexes):,} requests repeat a {prefix_tokens:,}-token stable prefix (matched by keyed fingerprint).",
+        {
+            "affected_requests": len(indexes),
+            "prefix_tokens": prefix_tokens,
+            "repeated_tokens": repeated,
+            "evidence_source": "hmac_fingerprint",
+        },
+        Estimate(min_tokens=math.floor(repeated * 0.72), max_tokens=repeated, note="Stable prefix repetition; actual savings depend on cache eligibility."),
+        "high",
+        "Azure OpenAI",
+        "Prompt caching",
+        "Preserve a stable prompt prefix and measure cache-read coverage.",
+    )
+
+
 def _prefix(records: list[TraceRecord]) -> Finding | None:
     groups: dict[str, list[int]] = defaultdict(list)
     for index, record in enumerate(records):
@@ -61,7 +106,7 @@ def _prefix(records: list[TraceRecord]) -> Finding | None:
         if system:
             groups[system].append(index)
     if not groups:
-        return None
+        return _fingerprint_prefix(records)
     prefix, indexes = max(groups.items(), key=lambda item: len(item[1]))
     if len(indexes) < 2:
         return None
@@ -310,10 +355,54 @@ def _model_size(records: list[TraceRecord]) -> Finding | None:
     )
 
 
+#: Diagnostics that cannot run without either request content or the
+#: corresponding contentless measurement. Missing telemetry is reported as
+#: "not evaluated"; it is never treated as evidence of efficiency.
+_CONTENT_DEPENDENT = (
+    ("TL001", "Repeated system prefix", "a system-prompt fingerprint and token count"),
+    ("TL002", "Conversation-history growth", "per-request message content or message-count features"),
+    ("TL003", "Unused tool definitions", "tool definitions or tool-schema token counts"),
+    ("TL004", "Retrieval redundancy", "retrieved context or retrieval token counts"),
+    ("TL007", "Semantic-cache opportunity", "request content for equivalence comparison"),
+)
+
+
+def _unevaluated(records: list[TraceRecord], evaluated: set[str]) -> list[Finding]:
+    """Report content-dependent diagnostics that had no telemetry to evaluate."""
+    if not records:
+        return []
+    has_content = any(record.messages or record.tools or record.retrieved_chunks for record in records)
+    if has_content:
+        return []
+    findings = []
+    for rule_id, title, requirement in _CONTENT_DEPENDENT:
+        if rule_id in evaluated:
+            continue
+        findings.append(
+            _finding(
+                rule_id,
+                "info",
+                f"{title}: not evaluated",
+                (
+                    f"This trace set contains contentless telemetry, so {title.casefold()} could not be evaluated. "
+                    f"It requires {requirement}. Absence of a finding here is not evidence that the workload is efficient."
+                ),
+                {"evaluation_status": "not_evaluated", "missing_telemetry": requirement},
+                Estimate(unit="none", note="Not evaluated: required telemetry is absent."),
+                "low",
+                "Application instrumentation",
+                "Contentless request features",
+                "Enable TokenLens content features and fingerprints, or supply request-level traces, to evaluate this diagnostic.",
+            )
+        )
+    return findings
+
+
 def run_rules(records: list[TraceRecord]) -> list[Finding]:
     findings: list[Finding] = []
     for rule in (_prefix, _history, _tools, _retrieval, _retry, _output_budget, _cache, _model_size):
         finding = rule(records)
         if finding:
             findings.append(finding)
+    findings.extend(_unevaluated(records, {item.rule_id for item in findings}))
     return findings

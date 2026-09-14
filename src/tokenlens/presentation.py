@@ -30,6 +30,7 @@ class ModelRollup:
     addressable_max_tokens: int
     token_share_percent: float
     deployment_mode: str
+    service_tier: str
     estimated_cost_usd: float | None
     pricing_currency: str
     pricing_coverage_requests_percent: float
@@ -37,6 +38,13 @@ class ModelRollup:
     cached_input_price_per_million: float | None
     output_price_per_million: float | None
     pricing_source: str
+    pricing_billing_basis: str | None
+    pricing_publisher: str | None
+    pricing_confidence: str | None
+    unresolved_requests: int
+    unresolved_tokens: int
+    unresolved_reasons: list[str]
+    suggested_override_keys: list[str]
 
 
 @dataclass(frozen=True)
@@ -57,6 +65,7 @@ class DeploymentRollup:
     token_share_percent: float
     average_tokens_per_request: float
     deployment_mode: str
+    service_tier: str
     estimated_cost_usd: float | None
     pricing_currency: str
     pricing_coverage_requests_percent: float
@@ -64,6 +73,13 @@ class DeploymentRollup:
     cached_input_price_per_million: float | None
     output_price_per_million: float | None
     pricing_source: str
+    pricing_billing_basis: str | None
+    pricing_publisher: str | None
+    pricing_confidence: str | None
+    unresolved_requests: int
+    unresolved_tokens: int
+    unresolved_reasons: list[str]
+    suggested_override_keys: list[str]
 
 
 def materiality_config(report: AnalysisReport) -> MaterialityConfig:
@@ -164,6 +180,7 @@ def _deployment_rollup(deployment: DeploymentAnalysis, portfolio_total: int) -> 
         token_share_percent=round(summary.total_tokens / max(1, portfolio_total) * 100, 1),
         average_tokens_per_request=summary.average_tokens_per_request,
         deployment_mode=summary.deployment_mode,
+        service_tier=summary.service_tier,
         estimated_cost_usd=summary.estimated_cost_usd,
         pricing_currency=summary.pricing_currency,
         pricing_coverage_requests_percent=summary.pricing_coverage_requests_percent,
@@ -171,6 +188,13 @@ def _deployment_rollup(deployment: DeploymentAnalysis, portfolio_total: int) -> 
         cached_input_price_per_million=summary.cached_input_price_per_million,
         output_price_per_million=summary.output_price_per_million,
         pricing_source=summary.pricing_source,
+        pricing_billing_basis=summary.pricing_billing_basis,
+        pricing_publisher=summary.pricing_publisher,
+        pricing_confidence=summary.pricing_confidence,
+        unresolved_requests=summary.unresolved_requests,
+        unresolved_tokens=summary.unresolved_tokens,
+        unresolved_reasons=list(summary.unresolved_reasons),
+        suggested_override_keys=list(summary.suggested_override_keys),
     )
 
 
@@ -192,6 +216,7 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
             {
                 "model_name": item.model_name,
                 "deployment_mode": item.deployment_mode,
+                "service_tier": item.service_tier,
                 "requests": 0,
                 "input_tokens": 0,
                 "output_tokens": 0,
@@ -207,6 +232,13 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
                 "cached_input_price_per_million": item.cached_input_price_per_million,
                 "output_price_per_million": item.output_price_per_million,
                 "pricing_source": item.pricing_source,
+                "pricing_billing_basis": item.pricing_billing_basis,
+                "pricing_publisher": item.pricing_publisher,
+                "pricing_confidence": item.pricing_confidence,
+                "unresolved_requests": 0,
+                "unresolved_tokens": 0,
+                "unresolved_reasons": set(),
+                "suggested_override_keys": set(),
             },
         )
         for key in (
@@ -218,8 +250,19 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
             "retries",
             "addressable_min_tokens",
             "addressable_max_tokens",
+            "unresolved_requests",
+            "unresolved_tokens",
         ):
             current[key] = int(current[key]) + int(getattr(item, key))
+        current["unresolved_reasons"] = set(current["unresolved_reasons"]) | set(item.unresolved_reasons)
+        current["suggested_override_keys"] = set(current["suggested_override_keys"]) | set(item.suggested_override_keys)
+        for field in ("service_tier", "pricing_billing_basis", "pricing_publisher", "pricing_confidence"):
+            existing = current[field]
+            incoming = getattr(item, field)
+            if existing is None:
+                current[field] = incoming
+            elif incoming is not None and existing != incoming:
+                current[field] = "mixed"
         if item.estimated_cost_usd is not None:
             current["estimated_cost_usd"] = float(current["estimated_cost_usd"]) + item.estimated_cost_usd
             current["priced_requests"] = int(current["priced_requests"]) + round(
@@ -231,6 +274,7 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
                 canonical_model_key=key[0],
                 model_name=str(values["model_name"]),
                 deployment_mode=str(values["deployment_mode"]),
+                service_tier=str(values["service_tier"]),
                 token_share_percent=round(int(values["total_tokens"]) / max(1, total) * 100, 1),
                 estimated_cost_usd=(
                     float(values["estimated_cost_usd"]) if int(values["priced_requests"]) else None
@@ -243,6 +287,11 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
                 cached_input_price_per_million=values["cached_input_price_per_million"],
                 output_price_per_million=values["output_price_per_million"],
                 pricing_source=str(values["pricing_source"]),
+                pricing_billing_basis=values["pricing_billing_basis"],  # type: ignore[arg-type]
+                pricing_publisher=values["pricing_publisher"],  # type: ignore[arg-type]
+                pricing_confidence=values["pricing_confidence"],  # type: ignore[arg-type]
+                unresolved_reasons=sorted(values["unresolved_reasons"]),  # type: ignore[arg-type]
+                suggested_override_keys=sorted(values["suggested_override_keys"]),  # type: ignore[arg-type]
                 **{name: int(values[name]) for name in (
                     "requests",
                     "input_tokens",
@@ -252,6 +301,8 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
                     "retries",
                     "addressable_min_tokens",
                     "addressable_max_tokens",
+                    "unresolved_requests",
+                    "unresolved_tokens",
                 )},
             )
             for key, values in grouped.items()
