@@ -22,6 +22,8 @@ class TraceRecord(BaseModel):
     deployment_name: str = "unknown"
     model_name: str = "unknown"
     provider: str = "unknown"
+    service_tier: str = "standard"
+    deployment_mode: str = "unknown"
     resource_name: str | None = None
     project_name: str | None = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
@@ -31,6 +33,7 @@ class TraceRecord(BaseModel):
     latency_ms: float | None = Field(default=None, ge=0)
     status_code: int | None = None
     retry_of: str | None = None
+    observed_cost_usd: float | None = Field(default=None, ge=0)
     retrieved_chunks: list[Any] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     response: dict[str, Any] | None = None
@@ -81,6 +84,14 @@ class AnalysisSummary(BaseModel):
     addressable_aggregation: Literal["largest_individual_opportunity", "not_combined_due_to_overlap"] = "largest_individual_opportunity"
     average_tokens_per_request: float = 0
     average_latency_ms: float | None = None
+    estimated_cost_usd: float | None = Field(default=None, ge=0)
+    fresh_input_cost_usd: float | None = Field(default=None, ge=0)
+    cached_input_cost_usd: float | None = Field(default=None, ge=0)
+    output_cost_usd: float | None = Field(default=None, ge=0)
+    pricing_coverage_requests_percent: float = Field(default=0, ge=0, le=100)
+    pricing_coverage_tokens_percent: float = Field(default=0, ge=0, le=100)
+    pricing_complete: bool = False
+    pricing_currency: str = "USD"
 
 
 class DeploymentSummary(AnalysisSummary):
@@ -88,10 +99,17 @@ class DeploymentSummary(AnalysisSummary):
     model_name: str
     canonical_model_key: str = "unknown"
     provider: str = "unknown"
+    deployment_mode: str = "unknown"
     resource_name: str | None = None
     project_name: str | None = None
     request_share_percent: float = 0
     token_share_percent: float = 0
+    pricing_source: str = "unresolved"
+    pricing_catalog_name: str | None = None
+    pricing_effective_from: str | None = None
+    input_price_per_million: float | None = Field(default=None, ge=0)
+    cached_input_price_per_million: float | None = Field(default=None, ge=0)
+    output_price_per_million: float | None = Field(default=None, ge=0)
 
 
 class DeploymentAnalysis(BaseModel):
@@ -110,3 +128,4 @@ class AnalysisReport(BaseModel):
     rules: list[dict[str, Any]]
     report_metadata: dict[str, Any] = Field(default_factory=dict)
     task_economics: Any | None = None
+    ptu_analysis: Any | None = None

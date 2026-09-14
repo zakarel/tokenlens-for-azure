@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from tokenlens.analyzer import analyze
@@ -11,7 +12,7 @@ from tokenlens.analyzer import analyze_task_events
 from tokenlens.economics import SavingsScenario
 from tokenlens.ingest import load_records_many
 from tokenlens.pricing import PriceEntry, PricingCatalog
-from tokenlens.reports import report_html
+from tokenlens.reports import report_html, task_economics_html
 from tokenlens.events import HumanReviewEvent, ModelCallEvent, TaskResultEvent
 
 
@@ -19,10 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 fixture = ROOT / "examples" / "multi-deployment-portfolio.jsonl"
 
 DEMO_DEPLOYMENTS = (
-    ("reasoning-prod", "Claude-opus-5", 3220, 640, 112, "reasoning"),
-    ("general-prod", "gpt-5.6-luna", 2160, 420, 72, "general"),
-    ("reasoning-batch", "claude-opus-5", 1680, 520, 88, "batch"),
-    ("creative-prod", "claude-fable-5.1", 488, 300, 180, "creative"),
+    ("reasoning-prod", "MAI-Thinking-1", 3220, 640, 112, "reasoning", "global", True),
+    ("general-prod", "Phi-4-mini", 2160, 420, 72, "general", "global", False),
+    ("reasoning-batch", "gpt-4.1", 1680, 520, 88, "batch", "global", True),
+    ("security-prod", "MAI-Cyber-1 Flash", 488, 300, 180, "security", "global", True),
 )
 
 
@@ -30,27 +31,40 @@ def write_fixture() -> None:
     """Create deterministic, clearly synthetic records without storing customer text."""
     with fixture.open("w", encoding="utf-8") as output:
         sequence = 0
-        for deployment, model, count, input_tokens, output_tokens, workload in DEMO_DEPLOYMENTS:
+        for deployment, model, count, input_tokens, output_tokens, workload, mode, cache_supported in DEMO_DEPLOYMENTS:
+            start = datetime(2026, 9, 14, tzinfo=UTC)
+            bucket_count = 864 if model == "gpt-4.1" else 288
+            if model == "gpt-4.1":
+                start = datetime(2026, 9, 11, tzinfo=UTC)
             for index in range(count):
                 sequence += 1
                 messages = [{"role": "user", "content": f"Process synthetic {workload} task {index % 97:02d}."}]
                 if sequence <= 6000:
                     messages.insert(0, {"role": "system", "content": "Synthetic task."})
                 payload = {
-                    "timestamp": f"2026-09-03T12:{sequence // 60:02d}:{sequence % 60:02d}Z",
+                    "timestamp": (start + timedelta(minutes=5 * (index % bucket_count), seconds=index // bucket_count)).isoformat(),
                     "request_id": f"demo-{sequence:05d}",
                     "deployment_name": deployment,
                     "model_name": model,
                     "model": deployment,
                     "provider": "azure_foundry",
+                    "deployment_mode": mode,
                     "messages": messages,
                     "tools": [],
                     "max_output_tokens": 2048 if workload == "creative" else 4096,
                     "usage": {
                         "input_tokens": input_tokens + (index % 7),
                         "output_tokens": output_tokens + (index % 5),
-                        "cached_tokens": (input_tokens // 4) if index % 3 == 0 else 0,
+                        "cached_tokens": (input_tokens // 4) if cache_supported and index % 3 == 0 else 0,
                     },
+                    "latency_ms": (
+                        6200 + index % 900
+                        if model == "gpt-4.1"
+                        else 2400 + index % 400
+                        if model == "MAI-Thinking-1"
+                        else 900 + index % 200
+                    ),
+                    "status_code": 429 if model == "gpt-4.1" and index % 16 == 0 else 200,
                     "metadata": {"tenant": "tenant-demo-001", "workload": f"workload-{workload}"},
                 }
                 output.write(json.dumps(payload, separators=(",", ":")) + "\n")
@@ -239,15 +253,30 @@ def write_task_fixture() -> list[dict]:
 
 write_fixture()
 records, _ = load_records_many([str(fixture)])
+request_customer_catalog = PricingCatalog(
+    catalog_name="synthetic-customer-override",
+    prices=[
+        PriceEntry(
+            provider="azure_foundry",
+            model="gpt-4.1",
+            region="global",
+            effective_from="2026-01-01",
+            input_per_million=2.0,
+            cached_input_per_million=0.5,
+            output_per_million=8.0,
+        ),
+    ],
+)
 report = analyze(
     records,
     "examples/multi-deployment-portfolio.jsonl",
-    generated_at="2026-09-03T12:10:00+00:00",
+    generated_at="2026-09-14T23:59:00+00:00",
     report_config={
         "overview_min_impact_percent": 1.0,
         "overview_min_impact_tokens": 100000,
         "overview_max_findings": 3,
     },
+    customer_catalog=request_customer_catalog,
 )
 events = write_task_fixture()
 customer_catalog = PricingCatalog(
@@ -279,8 +308,5 @@ task_report = task_report.model_copy(
 )
 combined = report.model_copy(update={"task_economics": task_report})
 (ROOT / "docs" / "tokenlens-report-demo.html").write_text(report_html(combined), encoding="utf-8")
-(ROOT / "docs" / "tokenlens-task-economics-demo.html").write_text(
-    report_html(combined),
-    encoding="utf-8",
-)
+(ROOT / "docs" / "tokenlens-task-economics-demo.html").write_text(task_economics_html(task_report), encoding="utf-8")
 print(f"Generated {ROOT / 'docs' / 'tokenlens-report-demo.html'} from {len(records):,} synthetic requests and {len(events):,} synthetic task events")

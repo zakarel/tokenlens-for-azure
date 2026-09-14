@@ -29,6 +29,14 @@ class ModelRollup:
     addressable_min_tokens: int
     addressable_max_tokens: int
     token_share_percent: float
+    deployment_mode: str
+    estimated_cost_usd: float | None
+    pricing_currency: str
+    pricing_coverage_requests_percent: float
+    input_price_per_million: float | None
+    cached_input_price_per_million: float | None
+    output_price_per_million: float | None
+    pricing_source: str
 
 
 @dataclass(frozen=True)
@@ -36,6 +44,8 @@ class DeploymentRollup:
     deployment_name: str
     model_name: str
     canonical_model_key: str
+    resource_name: str | None
+    project_name: str | None
     requests: int
     input_tokens: int
     output_tokens: int
@@ -46,6 +56,14 @@ class DeploymentRollup:
     addressable_max_tokens: int
     token_share_percent: float
     average_tokens_per_request: float
+    deployment_mode: str
+    estimated_cost_usd: float | None
+    pricing_currency: str
+    pricing_coverage_requests_percent: float
+    input_price_per_million: float | None
+    cached_input_price_per_million: float | None
+    output_price_per_million: float | None
+    pricing_source: str
 
 
 def materiality_config(report: AnalysisReport) -> MaterialityConfig:
@@ -133,6 +151,8 @@ def _deployment_rollup(deployment: DeploymentAnalysis, portfolio_total: int) -> 
         deployment_name=summary.deployment_name,
         model_name=summary.model_name,
         canonical_model_key=summary.canonical_model_key,
+        resource_name=summary.resource_name,
+        project_name=summary.project_name,
         requests=summary.requests_analyzed,
         input_tokens=summary.input_tokens,
         output_tokens=summary.output_tokens,
@@ -143,6 +163,14 @@ def _deployment_rollup(deployment: DeploymentAnalysis, portfolio_total: int) -> 
         addressable_max_tokens=summary.addressable_max_tokens,
         token_share_percent=round(summary.total_tokens / max(1, portfolio_total) * 100, 1),
         average_tokens_per_request=summary.average_tokens_per_request,
+        deployment_mode=summary.deployment_mode,
+        estimated_cost_usd=summary.estimated_cost_usd,
+        pricing_currency=summary.pricing_currency,
+        pricing_coverage_requests_percent=summary.pricing_coverage_requests_percent,
+        input_price_per_million=summary.input_price_per_million,
+        cached_input_price_per_million=summary.cached_input_price_per_million,
+        output_price_per_million=summary.output_price_per_million,
+        pricing_source=summary.pricing_source,
     )
 
 
@@ -156,13 +184,14 @@ def deployment_rollups(report: AnalysisReport) -> list[DeploymentRollup]:
 
 def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
     total = report.summary.total_tokens
-    grouped: OrderedDict[str, dict[str, object]] = OrderedDict()
+    grouped: OrderedDict[tuple[str, str, str], dict[str, object]] = OrderedDict()
     for deployment in report.deployments:
         item = _deployment_rollup(deployment, total)
         current = grouped.setdefault(
-            item.canonical_model_key,
+            (item.canonical_model_key, item.deployment_mode.casefold(), item.pricing_currency.casefold()),
             {
                 "model_name": item.model_name,
+                "deployment_mode": item.deployment_mode,
                 "requests": 0,
                 "input_tokens": 0,
                 "output_tokens": 0,
@@ -171,6 +200,13 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
                 "retries": 0,
                 "addressable_min_tokens": 0,
                 "addressable_max_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "pricing_currency": item.pricing_currency,
+                "priced_requests": 0,
+                "input_price_per_million": item.input_price_per_million,
+                "cached_input_price_per_million": item.cached_input_price_per_million,
+                "output_price_per_million": item.output_price_per_million,
+                "pricing_source": item.pricing_source,
             },
         )
         for key in (
@@ -184,12 +220,29 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
             "addressable_max_tokens",
         ):
             current[key] = int(current[key]) + int(getattr(item, key))
+        if item.estimated_cost_usd is not None:
+            current["estimated_cost_usd"] = float(current["estimated_cost_usd"]) + item.estimated_cost_usd
+            current["priced_requests"] = int(current["priced_requests"]) + round(
+                item.requests * item.pricing_coverage_requests_percent / 100
+            )
     return sorted(
         [
             ModelRollup(
-                canonical_model_key=key,
+                canonical_model_key=key[0],
                 model_name=str(values["model_name"]),
+                deployment_mode=str(values["deployment_mode"]),
                 token_share_percent=round(int(values["total_tokens"]) / max(1, total) * 100, 1),
+                estimated_cost_usd=(
+                    float(values["estimated_cost_usd"]) if int(values["priced_requests"]) else None
+                ),
+                pricing_currency=str(values["pricing_currency"]),
+                pricing_coverage_requests_percent=round(
+                    int(values["priced_requests"]) / max(1, int(values["requests"])) * 100, 1
+                ),
+                input_price_per_million=values["input_price_per_million"],
+                cached_input_price_per_million=values["cached_input_price_per_million"],
+                output_price_per_million=values["output_price_per_million"],
+                pricing_source=str(values["pricing_source"]),
                 **{name: int(values[name]) for name in (
                     "requests",
                     "input_tokens",
