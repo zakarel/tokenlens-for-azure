@@ -85,3 +85,20 @@ def test_html_report_embeds_logo():
     assert "confidence" not in rendered.lower()
     assert "Data quality" not in rendered
     assert "tokenlens-for-azure · created by Tzahi Ariel" in rendered
+
+
+def test_combined_report_keeps_brand_tabs_and_usage_charts():
+    records = [next(iter_records(__import__("io").StringIO(json.dumps(record()) + "\n")))]
+    report = analyze(records, "sample.jsonl")
+    from tokenlens.economics import TaskEconomicsReport
+
+    rendered = report_html(report.model_copy(update={"task_economics": TaskEconomicsReport()}))
+    assert 'alt="TokenLens for Azure logo"' in rendered
+    assert rendered.count('<button class="tab"') == 3
+    assert "Overview</button>" in rendered
+    assert "Task economics</button>" in rendered
+    assert "Usage &amp; diagnostics</button>" in rendered
+    assert "Token share by model" in rendered
+    assert "Token usage by deployment" in rendered
+    assert 'class="donut' in rendered
+    assert 'class="columns' in rendered
