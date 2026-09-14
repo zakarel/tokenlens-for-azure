@@ -14,13 +14,24 @@ import typer
 from .analyzer import analyze, analyze_task_events
 from .economics import TaskEconomicsReport
 from .ingest import InputError, load_records_many, load_task_events_many
-from .output import choose_output, economics_text
+from .output import choose_output, economics_text, pricing_audit_text
 from .pricing import PricingCatalog
 from .reference import load_bundled_reference_catalog
 from .presentation import impact_category, is_material, materiality_config
 from .reports import report_html, report_json, report_sarif, write_output
+from .telemetry import TelemetryConfig, TelemetryWriter
 
-app = typer.Typer(help="Offline LLM token-efficiency diagnostics with Azure-first guidance.", invoke_without_command=True)
+app = typer.Typer(
+    help=(
+        "Offline LLM token-efficiency diagnostics with Azure-first guidance.\n\n"
+        "Three collection paths:\n"
+        "  1. Smoke test one deployment       tokenlens-azure smoke-test-foundry\n"
+        "  2. Collect application telemetry   instrument once with tokenlens.integrations, then analyze\n"
+        "  3. Collect Azure Monitor metrics   tokenlens-azure collect-foundry-metrics\n\n"
+        "Collection commands contact Azure explicitly. Analysis is always offline."
+    ),
+    invoke_without_command=True,
+)
 
 
 @app.callback()
@@ -32,6 +43,18 @@ def _entry(ctx: typer.Context) -> None:
         typer.echo(ctx.get_help())
         return
     _guided_setup()
+
+
+def _has_package(name: str) -> bool:
+    """Safely probe an optional dependency without importing it.
+
+    ``find_spec`` raises when a parent package is absent, so a dotted name like
+    ``opentelemetry.sdk`` must be probed defensively.
+    """
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def _load_config(path: str | None) -> dict:
@@ -198,6 +221,42 @@ def analyze_command(
         raise typer.BadParameter(str(exc)) from exc
 
 
+@app.command("pricing-audit")
+def pricing_audit(
+    input_paths: list[str] = typer.Argument(..., metavar="INPUT", help="JSONL path, directory, glob, or - for stdin."),
+    config: str | None = typer.Option(None, "--config", help="Path to .tokenlens.yml."),
+    output: str | None = typer.Option(None, "--output", "-o", help="Write to this exact file instead of stdout."),
+) -> None:
+    """Report pricing coverage and unresolved reasons per model without any network access.
+
+    Prints unique returned model IDs, deployment mode, service tier, request
+    and token coverage, the selected catalog/source, the unresolved reason per
+    model, and a suggested local override key. It never prints endpoints,
+    resource IDs, tenant values, request IDs, or prompt/response content.
+    """
+    try:
+        settings = _load_config(config)
+        pricing = settings.get("pricing", {}) if isinstance(settings.get("pricing", {}), dict) else {}
+        customer = PricingCatalog.model_validate(pricing["customer_catalog"]) if pricing.get("customer_catalog") else None
+        reference = (
+            PricingCatalog.model_validate(pricing["reference_catalog"])
+            if pricing.get("reference_catalog")
+            else load_bundled_reference_catalog() if pricing.get("use_reference_catalog", True) else None
+        )
+        records, source = load_records_many(input_paths)
+        report = analyze(
+            records,
+            source,
+            report_config=settings.get("report"),
+            customer_catalog=customer,
+            reference_catalog=reference,
+            use_bundled_reference=pricing.get("use_reference_catalog", True),
+        )
+    except (InputError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    write_output(pricing_audit_text(report), output)
+
+
 @app.command()
 def compare(
     baseline: str = typer.Argument(..., help="Baseline JSONL path."),
@@ -242,15 +301,52 @@ def compare(
 
 @app.command()
 def doctor() -> None:
-    """Check local Python, permissions, optional Foundry packages, and Entra configuration."""
+    """Check local readiness for offline analysis, instrumentation, and collection.
+
+    This command never makes an inference call and never prints token material.
+    """
     typer.echo(f"python={sys.version.split()[0]}")
     typer.echo(f"python-supported={'yes' if sys.version_info >= (3, 11) else 'no'}")
     typer.echo(f"cwd-writable={'yes' if os.access('.', os.W_OK) else 'no'}")
-    for package in ("openai", "azure.identity"):
-        typer.echo(f"{package}={'installed' if importlib.util.find_spec(package) else 'missing (optional)'}")
+    typer.echo("offline-analyzer=ready")
+    extras = {
+        "sdk-instrumentation (tokenlens-azure[foundry])": ("openai",),
+        "claude-instrumentation (anthropic)": ("anthropic",),
+        "opentelemetry (tokenlens-azure[otel])": ("opentelemetry.sdk",),
+        "foundry-monitor (tokenlens-azure[foundry-monitor])": (
+            "azure.identity",
+            "azure.monitor.querymetrics",
+            "azure.mgmt.cognitiveservices",
+        ),
+        "app-insights-collector (tokenlens-azure[foundry-monitor])": ("azure.monitor.query",),
+    }
+    for label, packages in extras.items():
+        missing = [name for name in packages if not _has_package(name)]
+        typer.echo(f"{label}={'ready' if not missing else 'missing: ' + ', '.join(missing)}")
     env_present = any(os.getenv(name) for name in ("AZURE_OPENAI_ENDPOINT", "FOUNDRY_ENDPOINT", "AZURE_AI_PROJECT_ENDPOINT"))
     typer.echo(f"foundry-endpoint={'configured' if env_present else 'not configured'}")
-    if importlib.util.find_spec("azure.identity"):
+    typer.echo(f"azure-subscription-env={'configured' if os.getenv('AZURE_SUBSCRIPTION_ID') else 'not configured'}")
+    typer.echo(f"fingerprint-key={'configured' if os.getenv('TOKENLENS_FINGERPRINT_KEY') else 'not configured (fingerprints disabled)'}")
+    settings = {}
+    config_path = Path(".tokenlens.yml")
+    if config_path.is_file():
+        try:
+            settings = _load_config(None)
+            typer.echo("configuration=valid")
+        except (ValueError, OSError) as exc:
+            typer.echo(f"configuration=invalid ({type(exc).__name__})")
+    else:
+        typer.echo("configuration=not found (run tokenlens-azure connect-foundry)")
+    try:
+        telemetry = TelemetryConfig.from_mapping(settings.get("telemetry") if isinstance(settings, dict) else None)
+        directory = telemetry.output_dir
+        writable = os.access(directory, os.W_OK) if directory.exists() else os.access(directory.parent if str(directory.parent) else ".", os.W_OK)
+        typer.echo(f"telemetry-output-dir={directory} ({'writable' if writable else 'not writable'})")
+        typer.echo(f"telemetry-rotation=max {telemetry.max_mb} MB · retention {telemetry.retention_days} day(s)")
+        typer.echo(f"telemetry-content-capture={'disabled' if not telemetry.content_capture else 'enabled'}")
+    except ValueError as exc:
+        typer.echo(f"telemetry-config=invalid ({exc})")
+    if _has_package("azure.identity"):
         try:
             from azure.identity import DefaultAzureCredential
 
@@ -259,7 +355,430 @@ def doctor() -> None:
         except Exception:
             typer.echo("entra-credential=not available; run az login and verify your role")
     else:
-        typer.echo("entra-credential=install tokenlens-azure[foundry]")
+        typer.echo("entra-credential=install tokenlens-azure[foundry-monitor]")
+
+
+@app.command("import-otel")
+def import_otel(
+    input_path: str = typer.Argument(..., metavar="INPUT", help="OTLP/JSON, JSON array, or JSONL span export."),
+    output_dir: str = typer.Option("tokenlens-traces", "--output-dir", help="Private directory for canonical JSONL."),
+    max_spans: int = typer.Option(1_000_000, "--max-spans", help="Bounded import limit."),
+    quiet: bool = typer.Option(False, "--quiet", help="Suppress status output."),
+) -> None:
+    """Import GenAI OpenTelemetry spans into canonical, contentless telemetry.
+
+    This command is offline: it reads a local export only. Content-bearing span
+    attributes are counted and discarded, never written.
+    """
+    from .telemetry.otel import OtelImportError, import_file, write_import
+
+    try:
+        result = import_file(input_path, max_spans=max_spans)
+    except OtelImportError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    writer = TelemetryWriter(TelemetryConfig.from_env(output_dir=Path(output_dir)))
+    written = write_import(result, writer)
+    if quiet:
+        return
+    for key, value in result.summary().items():
+        typer.echo(f"{key}={value}")
+    typer.echo(f"records-written={written}")
+    typer.echo(f"records-already-present={writer.skipped_duplicates}")
+    typer.echo(f"output-dir={Path(output_dir).resolve()}")
+    typer.echo(f"dropped-events={writer.dropped_events}")
+
+
+@app.command("import")
+def import_generic(
+    input_path: str = typer.Argument(..., metavar="INPUT", help="Existing JSONL or JSON array log export."),
+    mapping_path: str = typer.Option(..., "--mapping", help="Declarative YAML mapping file (see examples/generic-log-mapping-example.yml)."),
+    output_dir: str = typer.Option("tokenlens-traces", "--output-dir", help="Private directory for canonical JSONL."),
+    max_rows: int = typer.Option(1_000_000, "--max-rows", help="Bounded import limit."),
+    quiet: bool = typer.Option(False, "--quiet", help="Suppress status output."),
+) -> None:
+    """Import existing JSONL logs using a declarative YAML field mapping.
+
+    Offline and safe by construction: the mapping file is parsed with
+    ``yaml.safe_load`` only (no code execution), and it can only target
+    TokenLens's contentless schema fields, so it has nowhere to put prompt,
+    response, tool, or credential content even if a source path pointed at
+    one. A source path that looks like content or a credential is rejected
+    before any row is read.
+    """
+    from .telemetry.generic_import import GenericImportError, MappingError, import_file, write_import
+
+    try:
+        result = import_file(input_path, mapping_path, max_rows=max_rows)
+    except (GenericImportError, MappingError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    writer = TelemetryWriter(TelemetryConfig.from_env(output_dir=Path(output_dir)))
+    written = write_import(result, writer)
+    if quiet:
+        return
+    for key, value in result.summary().items():
+        typer.echo(f"{key}={value}")
+    typer.echo(f"records-written={written}")
+    typer.echo(f"records-already-present={writer.skipped_duplicates}")
+    typer.echo(f"output-dir={Path(output_dir).resolve()}")
+    typer.echo(f"dropped-events={writer.dropped_events}")
+
+
+@app.command("import-app-insights")
+def import_app_insights(
+    input_path: str = typer.Argument(..., metavar="INPUT", help="Application Insights/Log Analytics export or query result (JSON or JSONL)."),
+    output_dir: str = typer.Option("tokenlens-traces", "--output-dir", help="Private directory for canonical JSONL."),
+    max_rows: int = typer.Option(1_000_000, "--max-rows", help="Bounded import limit."),
+    quiet: bool = typer.Option(False, "--quiet", help="Suppress status output."),
+) -> None:
+    """Import an already-exported Application Insights/Log Analytics result.
+
+    Offline: reads a local export only. Both the Logs query-result shape
+    (``{"tables": [...]}}``) and the flat continuous-export shape are
+    supported. This reuses the OpenTelemetry GenAI mapper, so the same
+    attribute allow list and content rejection apply as ``import-otel``.
+    """
+    from .telemetry.appinsights import import_file
+    from .telemetry.otel import OtelImportError, write_import
+
+    try:
+        result = import_file(input_path, max_rows=max_rows)
+    except OtelImportError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    writer = TelemetryWriter(TelemetryConfig.from_env(output_dir=Path(output_dir)))
+    written = write_import(result, writer)
+    if quiet:
+        return
+    for key, value in result.summary().items():
+        typer.echo(f"{key}={value}")
+    typer.echo(f"records-written={written}")
+    typer.echo(f"records-already-present={writer.skipped_duplicates}")
+    typer.echo(f"output-dir={Path(output_dir).resolve()}")
+    typer.echo(f"dropped-events={writer.dropped_events}")
+
+
+@app.command("collect-app-insights")
+def collect_app_insights(
+    workspace_id: str = typer.Option(..., "--workspace-id", help="Log Analytics workspace ID linked to the Application Insights resource."),
+    days: int = typer.Option(14, "--days", help="Lookback window in days."),
+    output_dir: str = typer.Option("tokenlens-traces", "--output-dir", help="Private directory for canonical JSONL."),
+    quiet: bool = typer.Option(False, "--quiet", help="Suppress status output."),
+) -> None:
+    """Query Application Insights GenAI traces and import them offline.
+
+    This command contacts Azure Monitor Logs — it is the only Application
+    Insights path that does. It runs one fixed, reviewable KQL query that
+    selects GenAI usage dimensions only (never a request/response body
+    column) and maps results with the same OpenTelemetry-reusing import path
+    as ``import-app-insights``. Install the optional dependency with
+    ``pip install 'tokenlens-azure[foundry-monitor]'``.
+    """
+    from .foundry.appinsights_client import AppInsightsLogsClient, tables_from_response, timespan_for_days
+    from .foundry.monitor import CollectorError
+    from .telemetry.appinsights import import_export
+    from .telemetry.otel import write_import
+
+    typer.echo("network=this command contacts Azure Monitor Logs")
+    try:
+        client = AppInsightsLogsClient.create()
+        response = client.query_genai_traces(workspace_id, days=days, timespan=timespan_for_days(days))
+    except CollectorError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    payload = tables_from_response(response)
+    result = import_export(payload)
+    writer = TelemetryWriter(TelemetryConfig.from_env(output_dir=Path(output_dir)))
+    written = write_import(result, writer)
+    if quiet:
+        return
+    for key, value in result.summary().items():
+        typer.echo(f"{key}={value}")
+    typer.echo(f"records-written={written}")
+    typer.echo(f"records-already-present={writer.skipped_duplicates}")
+    typer.echo(f"output-dir={Path(output_dir).resolve()}")
+    typer.echo(f"dropped-events={writer.dropped_events}")
+
+
+def _foundry_clients(subscription_id: str):
+    from .foundry.azure_clients import AzureMonitorMetricsClient, AzureResourceClient
+    from .foundry.monitor import CollectorError
+
+    try:
+        return AzureResourceClient.create(subscription_id), AzureMonitorMetricsClient.create()
+    except CollectorError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _resolved_subscription(explicit: str | None, settings: dict) -> str:
+    foundry = settings.get("foundry", {}) if isinstance(settings.get("foundry", {}), dict) else {}
+    env_name = str(foundry.get("subscription_id_env") or "AZURE_SUBSCRIPTION_ID")
+    subscription = explicit or os.getenv(env_name)
+    if not subscription:
+        raise typer.BadParameter(
+            f"No subscription selected. Pass --subscription or set {env_name}. "
+            "TokenLens never scans every accessible subscription."
+        )
+    return subscription
+
+
+@app.command("list-foundry-resources")
+def list_foundry_resources(
+    subscription: str | None = typer.Option(None, "--subscription", help="Explicit subscription ID."),
+    resource_group: str | None = typer.Option(None, "--resource-group", help="Limit discovery to one resource group."),
+    config: str | None = typer.Option(None, "--config", help="Path to .tokenlens.yml."),
+) -> None:
+    """List Foundry/Azure OpenAI accounts in one explicitly selected subscription.
+
+    This command contacts Azure using your existing `az login` credential.
+    """
+    settings = _load_config(config)
+    subscription_id = _resolved_subscription(subscription, settings)
+    typer.echo("azure-access=this command queries Azure Resource Manager")
+    resources, _ = _foundry_clients(subscription_id)
+    for account in resources.list_accounts(subscription_id, resource_group):
+        typer.echo(f"account={account['name']} resource-group={account['resource_group']} kind={account['kind']}")
+
+
+@app.command("list-foundry-deployments")
+def list_foundry_deployments(
+    resource_group: str = typer.Option(..., "--resource-group", help="Resource group of the account."),
+    account: str = typer.Option(..., "--account", help="Foundry/Azure OpenAI account name."),
+    subscription: str | None = typer.Option(None, "--subscription", help="Explicit subscription ID."),
+    config: str | None = typer.Option(None, "--config", help="Path to .tokenlens.yml."),
+) -> None:
+    """List deployments for one account. This command contacts Azure."""
+    settings = _load_config(config)
+    subscription_id = _resolved_subscription(subscription, settings)
+    typer.echo("azure-access=this command queries Azure Resource Manager")
+    resources, _ = _foundry_clients(subscription_id)
+    for deployment in resources.list_deployments(subscription_id, resource_group, account):
+        typer.echo(
+            f"deployment={deployment['name']} model={deployment['model']} "
+            f"version={deployment['model_version']} sku={deployment['sku']}"
+        )
+
+
+@app.command("collect-foundry-metrics")
+def collect_foundry_metrics(
+    resource_group: str | None = typer.Option(None, "--resource-group", help="Resource group of the account."),
+    account: str | None = typer.Option(None, "--account", help="Foundry/Azure OpenAI account name."),
+    subscription: str | None = typer.Option(None, "--subscription", help="Explicit subscription ID."),
+    days: int = typer.Option(14, "--days", help="Lookback window in days."),
+    granularity: str = typer.Option("5m", "--granularity", help="Bucket size; only 5m is supported."),
+    deployment: list[str] = typer.Option([], "--deployment", help="Restrict collection to these deployments."),
+    deployment_mode: str = typer.Option(
+        "unknown",
+        "--deployment-mode",
+        help=(
+            "Global or Regional, applied to every collected deployment. Unknown stays "
+            "unknown; PTU sizing requires an explicit mode."
+        ),
+    ),
+    family: str = typer.Option("azure_openai", "--family", help="azure_openai, claude_foundry, or partner_model."),
+    output_dir: str = typer.Option("local-traces/foundry-metrics", "--output-dir", help="Private directory for aggregate JSONL."),
+    config: str | None = typer.Option(None, "--config", help="Path to .tokenlens.yml."),
+    quiet: bool = typer.Option(False, "--quiet", help="Suppress status output."),
+) -> None:
+    """Collect five-minute Azure Monitor aggregates for PTU analysis.
+
+    This command contacts Azure Monitor. It collects aggregate counters only:
+    no request bodies, prompts, responses, user IDs, IP addresses, or headers.
+    """
+    from .foundry.monitor import CollectionWindow, CollectorError, collect_metrics
+
+    if granularity != "5m":
+        raise typer.BadParameter("only 5m granularity is supported")
+    if deployment_mode.casefold() not in {"global", "regional", "unknown"}:
+        raise typer.BadParameter("deployment mode must be global, regional, or unknown")
+    settings = _load_config(config)
+    foundry = settings.get("foundry", {}) if isinstance(settings.get("foundry", {}), dict) else {}
+    monitor_settings = settings.get("monitor", {}) if isinstance(settings.get("monitor", {}), dict) else {}
+    resource_group = resource_group or foundry.get("resource_group")
+    account = account or foundry.get("account")
+    if not resource_group or not account:
+        raise typer.BadParameter(
+            "A resource group and account are required. Pass --resource-group/--account or run connect-foundry."
+        )
+    deployments = list(deployment) or [str(item) for item in (foundry.get("deployments") or [])]
+    subscription_id = _resolved_subscription(subscription, settings)
+    lookback = days or int(monitor_settings.get("lookback_days", 14))
+    typer.echo("azure-access=this command queries Azure Monitor metrics")
+    resources, metrics_client = _foundry_clients(subscription_id)
+    from .foundry.monitor import resource_uri
+
+    uri = resource_uri(subscription_id, resource_group, account)
+    try:
+        available = list(resources.list_metric_definitions(uri))
+        result = collect_metrics(
+            metrics_client=metrics_client,
+            subscription_id=subscription_id,
+            resource_group=resource_group,
+            account=account,
+            window=CollectionWindow.for_days(lookback),
+            available_metrics=available,
+            deployments=deployments or None,
+            family=family,
+            # The confirmed mode applies to every collected deployment, including
+            # an unrestricted collection where the deployment names are only
+            # discovered from the returned metric dimensions.
+            deployment_modes={name: deployment_mode for name in deployments} if deployments else None,
+            default_deployment_mode=deployment_mode,
+        )
+    except CollectorError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    writer = TelemetryWriter(
+        TelemetryConfig.from_env(output_dir=Path(output_dir)),
+    )
+    written = writer.write_all(result.records)
+    if quiet:
+        return
+    for key, value in result.summary().items():
+        typer.echo(f"{key}={value}")
+    typer.echo(f"records-written={written}")
+    typer.echo(f"records-already-present={writer.skipped_duplicates}")
+    typer.echo(f"output-dir={Path(output_dir).resolve()}")
+    typer.echo(f"next: tokenlens-azure analyze {output_dir} --format html --open")
+
+
+@app.command("connect-foundry")
+def connect_foundry(
+    resource_group: str | None = typer.Option(None, "--resource-group", help="Resource group to record in the config."),
+    account: str | None = typer.Option(None, "--account", help="Foundry/Azure OpenAI account to record in the config."),
+    deployment: list[str] = typer.Option([], "--deployment", help="Deployments to collect."),
+    output_dir: str = typer.Option("tokenlens-traces", "--output-dir", help="Private directory for request telemetry."),
+    lookback_days: int = typer.Option(14, "--lookback-days", help="Default Azure Monitor lookback."),
+    noninteractive: bool = typer.Option(False, "--noninteractive", help="Never prompt; fail on ambiguity."),
+) -> None:
+    """Create a credential-free local setup for collection.
+
+    Nothing here contacts Azure and no credential, token, key, or connection
+    string is ever written. `az login` remains an environment prerequisite.
+    """
+    interactive = not noninteractive and sys.stdin.isatty() and sys.stdout.isatty()
+    missing = [
+        name
+        for name in ("azure.identity", "azure.monitor.querymetrics", "azure.mgmt.cognitiveservices")
+        if not _has_package(name)
+    ]
+    typer.echo(
+        "collector-extras=" + ("ready" if not missing else "missing: " + ", ".join(missing))
+    )
+    if interactive and not resource_group:
+        resource_group = typer.prompt("Resource group", default="", show_default=False) or None
+    if interactive and not account:
+        account = typer.prompt("Foundry account", default="", show_default=False) or None
+    deployments = list(deployment)
+    if interactive and not deployments:
+        answer = typer.prompt("Deployments (comma separated)", default="", show_default=False)
+        deployments = [item.strip() for item in answer.split(",") if item.strip()]
+    if noninteractive and not (resource_group and account):
+        raise typer.BadParameter("Noninteractive setup requires --resource-group and --account.")
+
+    telemetry_dir = Path(output_dir)
+    telemetry_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (telemetry_dir / ".gitignore").write_text("*\n", encoding="utf-8")
+    metrics_dir = Path("local-traces/foundry-metrics")
+    metrics_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (metrics_dir / ".gitignore").write_text("*\n", encoding="utf-8")
+
+    import yaml
+
+    existing = {}
+    target = Path(".tokenlens.yml")
+    if target.is_file():
+        existing = _load_config(str(target)) or {}
+    existing.setdefault("version", 1)
+    existing["telemetry"] = {
+        "output_dir": str(telemetry_dir),
+        "content_capture": False,
+        "rotation": {"max_mb": 50, "retention_days": 30},
+        "fingerprints": {"enabled": True, "key_env": "TOKENLENS_FINGERPRINT_KEY"},
+    }
+    existing["foundry"] = {
+        "subscription_id_env": "AZURE_SUBSCRIPTION_ID",
+        **({"resource_group": resource_group} if resource_group else {}),
+        **({"account": account} if account else {}),
+        **({"deployments": deployments} if deployments else {}),
+    }
+    existing["monitor"] = {"lookback_days": lookback_days, "granularity_minutes": 5}
+    target.write_text(yaml.safe_dump(existing, sort_keys=False), encoding="utf-8")
+    typer.echo(f"configuration={target.resolve()}")
+    typer.echo(f"telemetry-dir={telemetry_dir.resolve()}")
+    typer.echo(f"metrics-dir={metrics_dir.resolve()}")
+    typer.echo("credentials-stored=none")
+    if resource_group and account:
+        typer.echo(
+            "next: tokenlens-azure collect-foundry-metrics "
+            f"--resource-group {resource_group} --account {account} --days {lookback_days}"
+        )
+    else:
+        typer.echo("next: tokenlens-azure list-foundry-resources --subscription <subscription-id>")
+
+
+@app.command("smoke-test-foundry")
+def smoke_test_foundry(
+    deployment: str = typer.Option(..., "--deployment", help="Deployment name to call exactly once."),
+    prompt: str = typer.Option("Reply with the single word: ok.", "--prompt", help="Prompt for the single test call."),
+    api: str = typer.Option("openai", "--api", help="openai (Chat Completions/Responses) or anthropic (Messages)."),
+    output_dir: str = typer.Option("foundry-traces", "--output-dir", help="Private directory for the captured record."),
+    max_output_tokens: int = typer.Option(64, "--max-output-tokens", help="Bound on the single response."),
+    yes: bool = typer.Option(False, "--yes", help="Skip the billable-request confirmation."),
+) -> None:
+    """Make exactly one billable request to verify connectivity and normalization.
+
+    This is a manual smoke test, not production instrumentation. Applications
+    should instrument their client once with `tokenlens.integrations` instead of
+    running a command per prompt.
+    """
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    typer.echo("billable=this command makes exactly one billable model request")
+    if interactive and not yes and not typer.confirm("Send one billable request now?", default=False):
+        typer.echo("cancelled=no request was made")
+        return
+    writer = TelemetryWriter(TelemetryConfig.from_env(output_dir=Path(output_dir)))
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("FOUNDRY_ENDPOINT") or os.getenv("AZURE_AI_PROJECT_ENDPOINT")
+    if not endpoint:
+        raise typer.BadParameter("Set AZURE_OPENAI_ENDPOINT or FOUNDRY_ENDPOINT before smoke testing.")
+    if api == "anthropic":
+        if not _has_package("anthropic"):
+            raise typer.BadParameter("Install the anthropic package to smoke test a Claude deployment.")
+        from anthropic import AnthropicFoundry  # type: ignore[attr-defined]
+
+        from .integrations.anthropic_foundry import instrument_anthropic_foundry
+
+        client = instrument_anthropic_foundry(AnthropicFoundry(base_url=endpoint), writer=writer)
+        client.messages.create(
+            model=deployment,
+            max_tokens=max_output_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    elif api == "openai":
+        if not _has_package("openai") or not _has_package("azure.identity"):
+            raise typer.BadParameter("Install tokenlens-azure[foundry] to smoke test an Azure OpenAI deployment.")
+        from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+        from openai import AzureOpenAI
+
+        from .integrations.openai import instrument_openai
+
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
+        )
+        client = instrument_openai(
+            AzureOpenAI(
+                azure_endpoint=endpoint,
+                azure_ad_token_provider=token_provider,
+                api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
+            ),
+            writer=writer,
+        )
+        client.chat.completions.create(
+            model=deployment,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_output_tokens,
+        )
+    else:
+        raise typer.BadParameter("api must be openai or anthropic")
+    typer.echo(f"trace-file={writer.current_path().resolve()}")
+    typer.echo(f"records-written={writer.written_events} dropped={writer.dropped_events}")
+    typer.echo("note=one call per deployment cannot support PTU analysis; collect Azure Monitor metrics for that")
 
 
 @app.command("init-foundry")

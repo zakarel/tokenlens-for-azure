@@ -1,0 +1,71 @@
+# Example declarative mapping for `tokenlens-azure import`.
+#
+# This file is parsed with `yaml.safe_load` only: it can never execute code,
+# call a function, or construct anything beyond plain strings, numbers,
+# lists, and mappings. Every value under `fields` is a dotted path into one
+# already-parsed JSON log line — there is no expression language, so there is
+# nothing to inject.
+#
+# Destinations are restricted to TokenLens's contentless schema fields
+# (see src/tokenlens/telemetry/schema.py). There is no destination for a
+# prompt, response, message, tool argument, or credential, so a mapping
+# cannot smuggle content through even if a source path pointed at one. As a
+# second safeguard, any source path whose final segment looks like content
+# or a credential (prompt, message, content, authorization, api_key, ...) is
+# rejected before a single row is imported.
+#
+# Usage:
+#   tokenlens-azure import app-logs.jsonl --mapping generic-log-mapping-example.yml
+#
+# `app-logs.jsonl` is your own existing log, one JSON object per line, such
+# as:
+#   {"ts": "2026-09-01T12:00:00Z", "provider": "azure_foundry",
+#    "deployment": "support-prod", "model": "gpt-4.1", "mode": "global",
+#    "usage": {"prompt_tokens": 420, "completion_tokens": 96},
+#    "latency_ms": 812, "status": 200}
+
+version: 1
+
+fields:
+  # Required: every row must resolve (or default) these four fields.
+  timestamp: ts
+  provider: provider
+  deployment_name: deployment
+  model_name: model
+
+  # Optional scalar fields.
+  service_tier: tier
+  deployment_mode: mode
+  api: api
+  workload: workload_label
+  latency_ms: latency_ms
+  status_code: status
+  # Value must already be one of TokenLens's canonical categories
+  # (rate_limited, authentication, authorization, bad_request, not_found,
+  # content_filtered, timeout, connection, server_error, cancelled,
+  # unknown); anything else is dropped rather than guessed.
+  error_category: error_category
+
+  # Optional token-usage counters, each a dotted path.
+  usage:
+    input_tokens: usage.prompt_tokens
+    output_tokens: usage.completion_tokens
+    cached_tokens: usage.cached_tokens
+    reasoning_tokens: usage.reasoning_tokens
+    cache_write_tokens: usage.cache_write_tokens
+
+  # Optional, analyst-chosen labels. Never Azure resource/tenant identifiers.
+  scope:
+    resource_name: resource
+    project_name: project
+    workload: workload_label
+    environment: environment
+
+# Applied when a field has no source path, or the path does not resolve for
+# a given row (for example, a log format with a single deployment_mode).
+defaults:
+  deployment_mode: unknown
+  service_tier: standard
+
+# One of: auto, iso8601, epoch_seconds, epoch_millis.
+timestamp_format: auto

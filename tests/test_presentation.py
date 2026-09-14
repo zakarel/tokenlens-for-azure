@@ -102,9 +102,12 @@ def test_generated_report_has_two_accessible_chart_views_and_metadata():
     assert 'Token share by model' in html
     assert 'Token usage by deployment' in html
     assert "overview_min_impact_tokens" in payload["report_metadata"]["materiality"]
-    assert "confidence" not in html.lower()
-    assert "Data quality" not in html
-    assert "Not evaluated" not in html
+    # Scoped to the executive views: the PTU Advisor tab carries its own
+    # documented evidence-confidence and data-quality sections.
+    executive_views = html.split("<body>", 1)[1].split('<section class="tab-panel ptu"', 1)[0]
+    assert "confidence" not in executive_views.lower()
+    assert "Data quality" not in executive_views
+    assert "Not evaluated" not in executive_views
 
 
 def test_synthetic_fixture_has_requested_totals():
