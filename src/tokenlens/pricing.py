@@ -19,10 +19,51 @@ def canonical_model_name(value: str) -> str:
     return normalized
 
 
+BillingBasis = Literal[
+    "token_rate",
+    "claude_ccu_equivalent",
+    "marketplace_partner_token_rate",
+    "observed_cost",
+]
+
+# Best-effort publisher inference for canonical model names TokenLens has not
+# been given an explicit catalog entry for. This never changes pricing
+# resolution (no family fallback); it only classifies which purchasing
+# programs (for example Azure PTU) plausibly apply to the underlying model.
+_PUBLISHER_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("claude-", "anthropic"),
+    ("ministral-", "mistral"),
+    ("mistral-", "mistral"),
+    ("llama-", "meta"),
+    ("meta-llama", "meta"),
+    ("deepseek-", "deepseek"),
+    ("gemini-", "google"),
+    ("gemma-", "google"),
+    ("cohere-", "cohere"),
+    ("command-", "cohere"),
+    ("gpt-", "microsoft"),
+    ("o1", "microsoft"),
+    ("o3-", "microsoft"),
+    ("o4-", "microsoft"),
+    ("phi-", "microsoft"),
+    ("mai-", "microsoft"),
+)
+
+
+def infer_publisher(model_name: str) -> str | None:
+    """Infer a model's publisher from its canonical name for display and PTU eligibility only."""
+    canonical = canonical_model_name(model_name)
+    for prefix, publisher in _PUBLISHER_PREFIXES:
+        if canonical.startswith(prefix):
+            return publisher
+    return None
+
+
 class PriceEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: str
+    publisher: str = ""
     model: str
     aliases: list[str] = Field(default_factory=list)
     service_tier: str = "standard"
@@ -31,6 +72,10 @@ class PriceEntry(BaseModel):
     effective_to: date | None = None
     context_length_min: int | None = Field(default=None, ge=0)
     context_length_max: int | None = Field(default=None, ge=0)
+    billing_basis: BillingBasis = "token_rate"
+    confidence: Literal["verified", "customer_override"] = "verified"
+    source_url: str | None = None
+    note: str | None = None
     input_per_million: float = Field(ge=0)
     cached_input_per_million: float | None = Field(default=None, ge=0)
     cache_write_per_million: float = Field(default=0, ge=0)
@@ -104,6 +149,10 @@ class PricingResolution(BaseModel):
     effective_from: date | None = None
     currency: str = "USD"
     pricing_basis: Literal["effective_period", "analysis_date_snapshot"] | None = None
+    billing_basis: BillingBasis | None = None
+    publisher: str | None = None
+    confidence: Literal["verified", "customer_override", "observed"] | None = None
+    note: str | None = None
     input_per_million: float | None = None
     cached_input_per_million: float | None = None
     output_per_million: float | None = None
@@ -111,6 +160,7 @@ class PricingResolution(BaseModel):
     cached_input_cost_usd: float | None = None
     output_cost_usd: float | None = None
     unresolved_reason: str | None = None
+    suggested_override_key: str | None = None
 
 
 def _calculated_usage_cost(usage: Usage | object, price: PriceEntry) -> tuple[float, float, float, float] | None:
@@ -145,6 +195,8 @@ def _resolved_catalog_cost(
             source="unresolved",
             currency=catalog.currency,
             catalog_name=catalog.catalog_name,
+            billing_basis=price.billing_basis,
+            publisher=price.publisher or None,
             unresolved_reason="cached-input-rate-unavailable",
         )
     total, fresh, cached, output = calculated
@@ -156,6 +208,10 @@ def _resolved_catalog_cost(
         effective_from=price.effective_from,
         currency=catalog.currency,
         pricing_basis=catalog.pricing_basis,
+        billing_basis=price.billing_basis,
+        publisher=price.publisher or None,
+        confidence=price.confidence,
+        note=price.note,
         input_per_million=price.input_per_million,
         cached_input_per_million=price.cached_input_per_million,
         output_per_million=price.output_per_million,
@@ -185,6 +241,9 @@ def resolve_event_cost(
             cost_usd=event.observed_cost_usd,
             source="observed",
             currency="USD",
+            billing_basis="observed_cost",
+            confidence="observed",
+            publisher=infer_publisher(event.model_name) if isinstance(event, ModelCallEvent) else None,
         )
     if isinstance(event, ToolStepEvent):
         return PricingResolution(resolved=False, source="unresolved", currency="USD")
@@ -205,7 +264,9 @@ def resolve_event_cost(
         resolved=False,
         source="unresolved",
         currency="USD",
+        publisher=infer_publisher(event.model_name),
         unresolved_reason="no-exact-model-mode-price",
+        suggested_override_key=canonical_model_name(event.model_name),
     )
 
 
@@ -231,6 +292,9 @@ def resolve_trace_cost(
             cost_usd=record.observed_cost_usd,
             source="observed",
             currency="USD",
+            billing_basis="observed_cost",
+            confidence="observed",
+            publisher=infer_publisher(record.model_name),
         )
 
     class RequestPriceTarget:
@@ -273,7 +337,9 @@ def resolve_trace_cost(
         resolved=False,
         source="unresolved",
         currency=required_currency or "USD",
+        publisher=infer_publisher(record.model_name),
         unresolved_reason=reason,
+        suggested_override_key=canonical_model_name(record.model_name),
     )
 
 

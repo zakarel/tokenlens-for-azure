@@ -1,0 +1,74 @@
+<!--
+  TokenLens APIM AI Gateway policy example (metadata only).
+
+  This file is documentation, not something tokenlens-azure applies to your
+  API automatically. Copy the fragment you need into your own API or
+  operation policy in Azure API Management, point the metric namespace /
+  Event Hub / Log Analytics destination at your own resources, and validate
+  it against your APIM tier's supported policy set before use.
+
+  WARNING: APIM's AI Gateway policy surface differs by API type, backend
+  model API, and APIM SKU/version. `azure-openai-emit-token-metric` is
+  documented for Azure OpenAI / Azure AI Foundry OpenAI-compatible backends.
+  A newer, provider-agnostic `llm-emit-token-metric` policy exists for some
+  APIM tiers and covers additional GenAI backends; check current Azure API
+  Management documentation for the policy names, availability, and required
+  API type ("Azure OpenAI Service" vs. "LLM API") in your tier before relying
+  on this example, and confirm the fallback `emit-metric` block still applies
+  to backends (for example Claude on Foundry) that do not expose a
+  token-metric policy at all.
+
+  What this policy intentionally does, and does not do:
+  - Emits deployment/model identity (via APIM's own request routing
+    context), token usage, latency, and HTTP status as metadata: Azure
+    Monitor custom metrics and/or dimensions on those metrics.
+  - Never reads or logs the request or response payload. No expression below
+    accesses the request or response body object at all.
+  - Never logs an API key, subscription key, bearer token, or any other
+    request/response header value.
+  - Uses only documented, built-in Azure API Management policy elements
+    (`azure-openai-emit-token-metric`, `emit-metric`) rather than a
+    TokenLens-specific wire format, so the emitted metrics land in the
+    Azure Monitor namespace/workspace you already use for the rest of your
+    APIM instance.
+-->
+<policies>
+    <inbound>
+        <base />
+        <!-- Local-only timer for the latency fallback below. Never sent
+             anywhere by itself; it exists only to measure elapsed time. -->
+        <set-variable name="tokenlens-start-utc" value="@(DateTime.UtcNow)" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+
+        <!-- Preferred for Azure OpenAI / Azure AI Foundry OpenAI-compatible
+             backends: Azure's own documented token-metric policy. It reads
+             usage counters from the response internally and emits them as
+             Azure Monitor custom metrics; this policy file never accesses
+             the response body directly. -->
+        <azure-openai-emit-token-metric namespace="TokenLens">
+            <dimension name="API" value="@(context.Api.Name)" />
+            <dimension name="Operation" value="@(context.Operation.Name)" />
+            <dimension name="Deployment" value="@(context.Request.MatchedParameters.GetValueOrDefault(&quot;deployment-id&quot;, &quot;unknown&quot;))" />
+        </azure-openai-emit-token-metric>
+
+        <!-- Portable fallback for any GenAI backend, including ones without
+             a dedicated token-metric policy (for example Claude on
+             Foundry): request latency and HTTP status only. No body access
+             at all, so it is safe regardless of the backend's response
+             schema. -->
+        <emit-metric name="TokenLensRequestLatencyMs" namespace="TokenLens" value="@(((DateTime)DateTime.UtcNow - (DateTime)context.Variables[&quot;tokenlens-start-utc&quot;]).TotalMilliseconds)">
+            <dimension name="API" value="@(context.Api.Name)" />
+            <dimension name="Operation" value="@(context.Operation.Name)" />
+            <dimension name="Deployment" value="@(context.Request.MatchedParameters.GetValueOrDefault(&quot;deployment-id&quot;, &quot;unknown&quot;))" />
+            <dimension name="StatusCode" value="@(context.Response.StatusCode.ToString())" />
+        </emit-metric>
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

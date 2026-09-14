@@ -92,6 +92,15 @@ class AnalysisSummary(BaseModel):
     pricing_coverage_tokens_percent: float = Field(default=0, ge=0, le=100)
     pricing_complete: bool = False
     pricing_currency: str = "USD"
+    service_tier: str = "standard"
+    pricing_billing_basis: str | None = None
+    pricing_publisher: str | None = None
+    pricing_confidence: str | None = None
+    pricing_source: str = "unresolved"
+    unresolved_requests: int = Field(default=0, ge=0)
+    unresolved_tokens: int = Field(default=0, ge=0)
+    unresolved_reasons: list[str] = Field(default_factory=list)
+    suggested_override_keys: list[str] = Field(default_factory=list)
 
 
 class DeploymentSummary(AnalysisSummary):
@@ -104,7 +113,6 @@ class DeploymentSummary(AnalysisSummary):
     project_name: str | None = None
     request_share_percent: float = 0
     token_share_percent: float = 0
-    pricing_source: str = "unresolved"
     pricing_catalog_name: str | None = None
     pricing_effective_from: str | None = None
     input_price_per_million: float | None = Field(default=None, ge=0)

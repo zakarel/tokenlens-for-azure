@@ -9,7 +9,15 @@ from pathlib import Path
 
 from .models import AnalysisReport, DeploymentAnalysis, Finding
 from .economics import TaskEconomicsReport
-from .ptu import PtuPortfolioAssessment
+from .ptu import ELIGIBILITY_STATUS_LABELS, PtuCostCurve, PtuDeploymentAssessment, PtuPortfolioAssessment, PtuThroughputSeries
+from .ptu_report import (
+    PTU_DASHBOARD_CSS,
+    PTU_DASHBOARD_JS,
+    deployment_slugs,
+    money,
+    render_deployment,
+    selector,
+)
 from .presentation import (
     additional_opportunities,
     chart_label,
@@ -268,42 +276,135 @@ def _analytics_deployment_sections(report: AnalysisReport) -> str:
 
 
 def _money(value: float | None, *, currency: str = "USD", precision: int = 4) -> str:
-    if value is None:
-        return "Pricing unavailable"
-    prefix = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency.upper(), f"{currency.upper()} ")
-    return f"{prefix}{value:,.{precision}f}"
+    return money(value, currency, precision=precision, unavailable="Pricing unavailable")
 
 
 def _rate(value: float | None, *, currency: str = "USD") -> str:
     return "N/A" if value is None else _money(value, currency=currency, precision=3)
 
 
+_BILLING_BASIS_LABELS = {
+    "token_rate": "Azure token rate",
+    "claude_ccu_equivalent": "CCU-equivalent estimate",
+    "marketplace_partner_token_rate": "Marketplace partner rate",
+    "observed_cost": "Observed cost",
+    "mixed": "Mixed",
+}
+
+_UNRESOLVED_REASON_LABELS = {
+    "no-exact-model-mode-price": "No exact model/mode price in any catalog",
+    "cached-input-rate-unavailable": "Cached input observed but no cached rate is priced",
+    "currency-conversion-required": "Requires currency conversion (not performed)",
+}
+
+_PRICING_SOURCE_LABELS = {
+    "reference": "Public snapshot",
+    "customer": "Customer override",
+    "observed": "Observed cost",
+    "mixed": "Mixed",
+    "unresolved": "Unresolved",
+}
+
+
+def _billing_basis_label(value: str | None) -> str:
+    if not value:
+        return "Unresolved"
+    return _BILLING_BASIS_LABELS.get(value, value.replace("_", " ").title())
+
+
+def _unresolved_reason_label(value: str) -> str:
+    return _UNRESOLVED_REASON_LABELS.get(value, value.replace("-", " ").capitalize())
+
+
+def _pricing_source_label(value: str) -> str:
+    return _PRICING_SOURCE_LABELS.get(value, value.replace("_", " ").title())
+
+
+def _status_badge(item) -> str:
+    if item.estimated_cost_usd is not None and item.unresolved_requests == 0:
+        return f"{_escape(_pricing_source_label(item.pricing_source))}"
+    if item.estimated_cost_usd is not None:
+        return f"{_escape(_pricing_source_label(item.pricing_source))} · {item.unresolved_requests:,} unresolved"
+    reasons = ", ".join(_unresolved_reason_label(r) for r in item.unresolved_reasons) or "no exact model/mode price"
+    return f"Unresolved · {_escape(reasons)}"
+
+
+def _cost_composition(report: AnalysisReport) -> str:
+    summary = report.summary
+    if summary.estimated_cost_usd is None:
+        reasons = ", ".join(_unresolved_reason_label(r) for r in summary.unresolved_reasons) or "no exact model/mode price"
+        overrides = ", ".join(summary.suggested_override_keys)
+        return (
+            '<div class="cost-empty"><strong>No priced components yet</strong>'
+            f'<span>{summary.unresolved_requests:,} requests / {summary.unresolved_tokens:,} tokens are unresolved · {_escape(reasons)}</span>'
+            f'<span>Token volume and request counts remain visible below even though no rate resolved.</span>'
+            f'<a href="#cost" data-tab-link="cost">Run <code>tokenlens-azure pricing-audit</code>{f" (suggested keys: {_escape(overrides)})" if overrides else ""} or add a customer catalog override</a></div>'
+        )
+    components = [
+        ("Fresh input", summary.fresh_input_cost_usd, "var(--accent)"),
+        ("Cached input", summary.cached_input_cost_usd, "var(--amber)"),
+        ("Output", summary.output_cost_usd, "var(--green)"),
+    ]
+    priced = [(label, value, color) for label, value, color in components if value is not None]
+    max_component = max((value for _, value, _ in priced), default=0) or 1
+    rows = [
+        f'<div class="cost-bar"><span>{_escape(label)}</span><div class="cost-track"><i style="width:{value / max_component * 100:.1f}%;background:{color}"></i></div><strong>{_escape(_money(value, currency=summary.pricing_currency))}</strong></div>'
+        for label, value, color in priced
+    ]
+    if not rows:
+        rows = [
+            f'<div class="cost-bar"><span>Analyzed cost</span><div class="cost-track"><i style="width:100%;background:var(--accent)"></i></div>'
+            f'<strong>{_escape(_money(summary.estimated_cost_usd, currency=summary.pricing_currency))}</strong></div>'
+        ]
+    if summary.unresolved_tokens:
+        excluded_share = summary.unresolved_tokens / max(1, summary.total_tokens) * 100
+        rows.append(
+            '<div class="cost-bar partial"><span>Unresolved (excluded)</span>'
+            f'<div class="cost-track"><i class="excluded" style="width:{excluded_share:.1f}%"></i></div>'
+            f'<strong>{summary.unresolved_tokens:,} tokens</strong></div>'
+        )
+    return "".join(rows)
+
+
+def _unresolved_models_section(report: AnalysisReport) -> str:
+    models = [item for item in model_rollups(report) if item.unresolved_requests]
+    if not models:
+        return ""
+    rows = "".join(
+        f'<div class="unresolved-row"><div><strong>{_escape(item.model_name)}</strong>'
+        f'<span>{_escape(item.deployment_mode.title())} · {item.unresolved_requests:,} of {item.requests:,} requests</span></div>'
+        f'<div><strong>{item.unresolved_tokens:,} tokens excluded</strong>'
+        f'<span>{_escape(", ".join(_unresolved_reason_label(r) for r in item.unresolved_reasons) or "no exact model/mode price")}</span></div>'
+        f'<div><strong>Suggested override key</strong><span><code>{_escape(", ".join(item.suggested_override_keys) or item.canonical_model_key)}</code></span></div></div>'
+        for item in models
+    )
+    return f"""<section class="panel table-panel"><h2>Unresolved models</h2>
+      <p>Run <code>tokenlens-azure pricing-audit INPUT</code> for the same detail without generating a report, or add each key below to a customer catalog (see <code>examples/customer-pricing-overrides-example.yml</code>).</p>
+      <div class="unresolved-list">{rows}</div></section>"""
+
+
 def _cost_analysis_panel(report: AnalysisReport) -> str:
+    summary = report.summary
     models = model_rollups(report)
     deployments = deployment_rollups(report)
     priced_models = [item for item in models if item.estimated_cost_usd is not None]
     top_model = max(priced_models, key=lambda item: item.estimated_cost_usd or 0, default=None)
-    components = [
-        ("Fresh input", report.summary.fresh_input_cost_usd, "var(--accent)"),
-        ("Cached input", report.summary.cached_input_cost_usd, "var(--amber)"),
-        ("Output", report.summary.output_cost_usd, "var(--green)"),
-    ]
-    max_component = max((value or 0 for _, value, _ in components), default=1) or 1
-    composition = "".join(
-        f'<div class="cost-bar"><span>{_escape(label)}</span><div class="cost-track"><i style="width:{(value or 0) / max_component * 100:.1f}%;background:{color}"></i></div><strong>{_escape(_money(value, currency=report.summary.pricing_currency))}</strong></div>'
-        for label, value, color in components
-    )
+    composition = _cost_composition(report)
     model_rows = "".join(
         f"<tr><th scope=\"row\">{_escape(item.model_name)}</th><td>{_escape(item.deployment_mode.title())}</td>"
-        f"<td>{item.requests:,}</td><td>{item.total_tokens:,}</td><td>{_rate(item.input_price_per_million, currency=item.pricing_currency)} / "
+        f"<td>{item.requests:,}</td><td>{item.total_tokens:,}</td><td>{_escape(_billing_basis_label(item.pricing_billing_basis))}</td>"
+        f"<td>{_rate(item.input_price_per_million, currency=item.pricing_currency)} / "
         f"{_rate(item.cached_input_price_per_million, currency=item.pricing_currency)} / {_rate(item.output_price_per_million, currency=item.pricing_currency)}</td>"
-        f"<td>{_money(item.estimated_cost_usd, currency=item.pricing_currency)}</td><td>{item.pricing_coverage_requests_percent:.1f}%</td></tr>"
+        f"<td>{_money(item.estimated_cost_usd, currency=item.pricing_currency)}</td><td>{item.pricing_coverage_requests_percent:.1f}%</td>"
+        f"<td>{_status_badge(item)}</td></tr>"
         for item in models
     )
     deployment_rows = "".join(
         f"<tr><th scope=\"row\">{_escape(item.deployment_name)}</th><td>{_escape(item.model_name)}</td>"
         f"<td>{_escape(item.deployment_mode.title())}</td><td>{item.total_tokens:,}</td>"
-        f"<td>{_money(item.estimated_cost_usd, currency=item.pricing_currency)}</td><td>{item.pricing_coverage_requests_percent:.1f}%</td></tr>"
+        f"<td>{_escape(_billing_basis_label(item.pricing_billing_basis))}</td>"
+        f"<td>{_money(item.estimated_cost_usd, currency=item.pricing_currency)}</td><td>{item.pricing_coverage_requests_percent:.1f}%</td>"
+        f"<td>{_status_badge(item)}</td></tr>"
         for item in deployments
     )
     pricing = report.report_metadata.get("pricing", {})
@@ -319,54 +420,213 @@ def _cost_analysis_panel(report: AnalysisReport) -> str:
         if customer_catalog
         else ""
     )
+    cost_sub = (
+        f"{summary.pricing_coverage_tokens_percent:.1f}% of tokens priced"
+        if summary.estimated_cost_usd is not None
+        else "0% priced · see pricing-audit below"
+    )
+    basis_label = _pricing_source_label(summary.pricing_source) if summary.estimated_cost_usd is not None else "Unresolved"
+    unresolved_sub = (
+        f"{summary.unresolved_tokens:,} tokens · {summary.unresolved_requests:,} requests"
+        if summary.unresolved_requests
+        else "None · fully priced"
+    )
     return f"""<section class="metrics cost-metrics">
-      <div class="card"><div class="label">Analyzed cost</div><div class="value">{_money(report.summary.estimated_cost_usd, currency=report.summary.pricing_currency)}</div><div class="sub">Covered requests only</div></div>
-      <div class="card"><div class="label">Pricing coverage</div><div class="value">{report.summary.pricing_coverage_requests_percent:.1f}%</div><div class="sub">{report.summary.pricing_coverage_tokens_percent:.1f}% of tokens</div></div>
-      <div class="card"><div class="label">Priced models</div><div class="value">{len(priced_models):,} / {len(models):,}</div><div class="sub">Exact model + mode match</div></div>
+      <div class="card"><div class="label">Estimated cost</div><div class="value">{_money(summary.estimated_cost_usd, currency=summary.pricing_currency)}</div><div class="sub">{cost_sub}</div></div>
+      <div class="card"><div class="label">Pricing coverage</div><div class="value">{summary.pricing_coverage_requests_percent:.1f}%</div><div class="sub">{summary.pricing_coverage_tokens_percent:.1f}% of tokens · requests above</div></div>
+      <div class="card"><div class="label">Estimate basis</div><div class="value cost-name">{_escape(basis_label)}</div><div class="sub">{_escape(summary.pricing_billing_basis and _billing_basis_label(summary.pricing_billing_basis) or "N/A")}</div></div>
+      <div class="card"><div class="label">Unresolved spend</div><div class="value cost-name">{summary.unresolved_requests:,} req</div><div class="sub">{unresolved_sub}</div></div>
       <div class="card"><div class="label">Highest cost model</div><div class="value cost-name">{_escape(top_model.model_name if top_model else "Unavailable")}</div><div class="sub">{_money(top_model.estimated_cost_usd, currency=top_model.pricing_currency) if top_model else "No exact price"}</div></div>
-      <div class="card"><div class="label">Reference date</div><div class="value cost-name">{_escape(pricing.get("retrieved_at") or "Unavailable")}</div><div class="sub">{_escape(report.summary.pricing_currency)} estimate · not an invoice</div></div>
+      <div class="card"><div class="label">Reference date</div><div class="value cost-name">{_escape(pricing.get("retrieved_at") or "Unavailable")}</div><div class="sub">{_escape(summary.pricing_currency)} estimate · not an invoice</div></div>
     </section>
-    <p class="analytics-intro">Costs use observed values first, then exact customer or bundled reference prices. Unmatched models remain visible and are excluded from monetary totals.</p>
-    <section class="grid"><article class="chart-card"><h2>Cost composition</h2><p>Components reconcile only when every covered call has token rates.</p>{composition}</article>
+    <p class="analytics-intro">Costs use observed values first, then exact customer or bundled reference prices. Unmatched models remain visible with volume, unresolved reason, and a remediation path — they are never folded into a misleading "Pricing unavailable" total when other calls are priced.</p>
+    <section class="grid"><article class="chart-card"><h2>Cost composition</h2><p>Components reconcile only when every covered call has token rates; excluded tokens are shown separately, never as a zero-cost bar.</p>{composition}</article>
     <article class="chart-card"><h2>Pricing provenance</h2><p>Reference pricing is bundled for offline analysis.</p>
       <div class="provenance"><strong>{_escape(pricing.get("catalog_name") or "No catalog")}</strong>
       <span>Retrieved {_escape(pricing.get("retrieved_at") or "unknown")} · {_escape(pricing.get("currency") or "USD")}</span>
       {customer_note}
-      <span>{source_link}</span><small>This analysis-date pricing snapshot is applied as an estimate, including to older traces. No currency conversion is performed. Agreements, offers, regions, and later prices may differ.</small></div></article></section>
+      <span>{source_link}</span><small>This analysis-date pricing snapshot is applied as an estimate, including to older traces. No currency conversion is performed. Agreements, offers, regions, and later prices may differ. Claude-family billing basis is a CCU-derived dollar-equivalent estimate, not an Azure token meter.</small></div></article></section>
     <section class="panel table-panel"><h2>Cost by model and deployment mode</h2><p>Rates are input / cached input / output per 1M tokens.</p>
-      <table class="data-table"><caption>Model pricing and analyzed cost</caption><thead><tr><th>Model</th><th>Mode</th><th>Requests</th><th>Tokens</th><th>Reference rates</th><th>Est. cost</th><th>Coverage</th></tr></thead>
-      <tbody>{model_rows or '<tr><td colspan="7">No model usage observed.</td></tr>'}</tbody></table></section>
+      <table class="data-table"><caption>Model pricing and analyzed cost</caption><thead><tr><th>Model</th><th>Mode</th><th>Requests</th><th>Tokens</th><th>Billing basis</th><th>Reference rates</th><th>Est. cost</th><th>Coverage</th><th>Source/status</th></tr></thead>
+      <tbody>{model_rows or '<tr><td colspan="9">No model usage observed.</td></tr>'}</tbody></table></section>
     <section class="panel table-panel"><h2>Cost by deployment</h2>
-      <table class="data-table"><caption>Deployment cost rollup</caption><thead><tr><th>Deployment</th><th>Model</th><th>Mode</th><th>Tokens</th><th>Est. cost</th><th>Coverage</th></tr></thead>
-      <tbody>{deployment_rows or '<tr><td colspan="6">No deployments observed.</td></tr>'}</tbody></table></section>
+      <table class="data-table"><caption>Deployment cost rollup</caption><thead><tr><th>Deployment</th><th>Model</th><th>Mode</th><th>Tokens</th><th>Billing basis</th><th>Est. cost</th><th>Coverage</th><th>Source/status</th></tr></thead>
+      <tbody>{deployment_rows or '<tr><td colspan="8">No deployments observed.</td></tr>'}</tbody></table></section>
+    {_unresolved_models_section(report)}
     <footer>tokenlens-for-azure · created by Tzahi Ariel</footer>"""
+
+
+def _ptu_throughput_chart(series: PtuThroughputSeries) -> tuple[str, str]:
+    if not series.points:
+        return "", ""
+    width, height = 760, 240
+    left, right, top, bottom = 54, 730, 18, 200
+    max_tpm = max([point.tpm for point in series.points] + [series.reference_tpm, series.ptu_capacity_tpm or 0]) or 1
+    max_minutes = series.points[-1].minutes_from_start or 1
+
+    def sx(minutes: float) -> float:
+        return left + minutes / max_minutes * (right - left)
+
+    def sy(tpm: float) -> float:
+        return bottom - tpm / max_tpm * (bottom - top)
+
+    path = " ".join(
+        f"{sx(point.minutes_from_start):.1f},{sy(point.tpm):.1f}" for point in series.points
+    )
+    # Cap focusable markers so keyboard users can step through a manageable
+    # set of exact values rather than every raw bucket.
+    marker_stride = max(1, len(series.points) // 24)
+    markers = "".join(
+        f'<circle cx="{sx(point.minutes_from_start):.1f}" cy="{sy(point.tpm):.1f}" r="3.2" tabindex="0" '
+        f'aria-label="Minute {point.minutes_from_start}: {point.tpm:,.0f} TPM"><title>Minute {point.minutes_from_start}: {point.tpm:,.0f} TPM</title></circle>'
+        for point in series.points[::marker_stride]
+    )
+    reference_y = sy(series.reference_tpm)
+    average_y = sy(series.average_tpm)
+    capacity_line = (
+        f'<line x1="{left}" y1="{sy(series.ptu_capacity_tpm):.1f}" x2="{right}" y2="{sy(series.ptu_capacity_tpm):.1f}" '
+        f'class="ptu-capacity-line" stroke="var(--amber)" stroke-width="1.5"></line>'
+        f'<text x="{right}" y="{sy(series.ptu_capacity_tpm) - 4:.1f}" text-anchor="end" class="axis-value">PTU capacity {series.ptu_capacity_tpm:,.0f}</text>'
+        if series.ptu_capacity_tpm
+        else ""
+    )
+    svg = f"""<svg class="columns ptu-throughput" viewBox="0 0 {width} {height}" role="img" aria-labelledby="ptu-tp-title ptu-tp-desc">
+      <title id="ptu-tp-title">Throughput over time</title>
+      <desc id="ptu-tp-desc">Weighted tokens-per-minute across {len(series.points)} five-minute buckets. Average {series.average_tpm:,.0f} TPM, P95 reference {series.reference_tpm:,.0f} TPM{f", PTU capacity {series.ptu_capacity_tpm:,.0f} TPM" if series.ptu_capacity_tpm else ""}.</desc>
+      <line x1="{left}" y1="{bottom}" x2="{right}" y2="{bottom}" class="axis"></line>
+      <line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" class="axis"></line>
+      <line x1="{left}" y1="{average_y:.1f}" x2="{right}" y2="{average_y:.1f}" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="5 4"></line>
+      <text x="{right}" y="{average_y - 4:.1f}" text-anchor="end" class="axis-value">Average {series.average_tpm:,.0f}</text>
+      <line x1="{left}" y1="{reference_y:.1f}" x2="{right}" y2="{reference_y:.1f}" stroke="var(--pink)" stroke-width="1.2" stroke-dasharray="2 3"></line>
+      <text x="{left}" y="{reference_y - 4:.1f}" class="axis-value">P95 {series.reference_tpm:,.0f}</text>
+      {capacity_line}
+      <polyline points="{path}" fill="none" stroke="var(--green)" stroke-width="2"></polyline>
+      {markers}
+      <text x="{left}" y="{height - 4}" class="axis-label">0 min</text>
+      <text x="{right}" y="{height - 4}" text-anchor="end" class="axis-label">{max_minutes:,} min</text>
+    </svg>"""
+    sample_stride = max(1, len(series.points) // 30)
+    rows = "".join(
+        f"<tr><td>{point.minutes_from_start:,}</td><td>{point.tpm:,.0f}</td></tr>"
+        for point in series.points[::sample_stride]
+    )
+    table = f"""<table class="data-table"><caption>Accessible throughput sample ({len(series.points):,} buckets total, sampled every {sample_stride})</caption>
+      <thead><tr><th scope="col">Minute</th><th scope="col">Weighted TPM</th></tr></thead><tbody>{rows}</tbody></table>"""
+    return svg, table
+
+
+def _ptu_cost_explorer_chart(curve: PtuCostCurve) -> tuple[str, str]:
+    if not curve.sustained_tpm:
+        return "", ""
+    width, height = 760, 260
+    left, right, top, bottom = 60, 730, 18, 210
+    max_x = max(curve.sustained_tpm) or 1
+    max_y = max(curve.payg_monthly + curve.hybrid_monthly + [curve.payg_at_observed_average or 0, curve.hybrid_at_observed_average or 0]) or 1
+
+    def sx(value: float) -> float:
+        return left + value / max_x * (right - left)
+
+    def sy(value: float) -> float:
+        return bottom - value / max_y * (bottom - top)
+
+    payg_path = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in zip(curve.sustained_tpm, curve.payg_monthly))
+    hybrid_path = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in zip(curve.sustained_tpm, curve.hybrid_monthly))
+    shade_start = curve.lower_break_even_tpm if curve.lower_break_even_tpm is not None else 0.0
+    shade_end = curve.upper_break_even_tpm if curve.upper_break_even_tpm is not None else max_x
+    shade = (
+        f'<rect x="{sx(shade_start):.1f}" y="{top}" width="{max(0.0, sx(shade_end) - sx(shade_start)):.1f}" height="{bottom - top}" '
+        f'fill="var(--green)" opacity="0.12"></rect>'
+        if curve.lower_break_even_tpm is not None or curve.upper_break_even_tpm is not None
+        else ""
+    )
+    markers = []
+    for label, x_value, color in (
+        ("Lower break-even", curve.lower_break_even_tpm, "var(--amber)"),
+        ("Upper break-even", curve.upper_break_even_tpm, "var(--amber)"),
+        ("Selected PTU capacity", curve.ptu_capacity_tpm, "var(--pink)"),
+        ("Observed average TPM", curve.observed_average_tpm, "var(--accent)"),
+    ):
+        if x_value is None:
+            continue
+        markers.append(
+            f'<line x1="{sx(x_value):.1f}" y1="{top}" x2="{sx(x_value):.1f}" y2="{bottom}" stroke="{color}" stroke-width="1.2" stroke-dasharray="3 3"></line>'
+            f'<circle cx="{sx(x_value):.1f}" cy="{bottom}" r="3.4" tabindex="0" fill="{color}" '
+            f'aria-label="{label}: {x_value:,.0f} TPM"><title>{label}: {x_value:,.0f} TPM</title></circle>'
+        )
+    current_markers = []
+    if curve.payg_at_observed_average is not None:
+        current_markers.append(
+            f'<circle cx="{sx(curve.observed_average_tpm):.1f}" cy="{sy(curve.payg_at_observed_average):.1f}" r="4.5" tabindex="0" fill="var(--accent)" '
+            f'aria-label="Current PAYG cost: {_escape(_money(curve.payg_at_observed_average))} per month"><title>Current PAYG: {_escape(_money(curve.payg_at_observed_average))}/month</title></circle>'
+        )
+    if curve.hybrid_at_observed_average is not None:
+        current_markers.append(
+            f'<circle cx="{sx(curve.observed_average_tpm):.1f}" cy="{sy(curve.hybrid_at_observed_average):.1f}" r="4.5" tabindex="0" fill="var(--green)" '
+            f'aria-label="Current hybrid PTU + PAYG spillover cost: {_escape(_money(curve.hybrid_at_observed_average))} per month"><title>Current hybrid: {_escape(_money(curve.hybrid_at_observed_average))}/month</title></circle>'
+        )
+    svg = f"""<svg class="columns ptu-cost-explorer" viewBox="0 0 {width} {height}" role="img" aria-labelledby="ptu-cost-title ptu-cost-desc">
+      <title id="ptu-cost-title">PAYG versus PTU hybrid cost explorer</title>
+      <desc id="ptu-cost-desc">Estimated monthly cost across sustained token-per-minute levels. Selected PTU capacity {curve.selected_ptu:,} units ({curve.ptu_capacity_tpm:,.0f} TPM). {f"Lower break-even at {curve.lower_break_even_tpm:,.0f} TPM." if curve.lower_break_even_tpm is not None else "No break-even within the plotted range."}{f" Upper break-even at {curve.upper_break_even_tpm:,.0f} TPM." if curve.upper_break_even_tpm is not None else ""}</desc>
+      {shade}
+      <line x1="{left}" y1="{bottom}" x2="{right}" y2="{bottom}" class="axis"></line>
+      <line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" class="axis"></line>
+      <polyline points="{payg_path}" fill="none" stroke="var(--soft)" stroke-width="2" stroke-dasharray="6 4"></polyline>
+      <polyline points="{hybrid_path}" fill="none" stroke="var(--green)" stroke-width="2"></polyline>
+      {''.join(markers)}
+      {''.join(current_markers)}
+      <text x="{left}" y="{height - 4}" class="axis-label">0 TPM</text>
+      <text x="{right}" y="{height - 4}" text-anchor="end" class="axis-label">{max_x:,.0f} TPM</text>
+    </svg>"""
+    legend = (
+        '<div class="legend"><span class="legend-row"><span class="swatch" style="background:var(--soft)"></span>PAYG (dashed)</span>'
+        '<span class="legend-row"><span class="swatch" style="background:var(--green)"></span>PTU + spillover (solid)</span>'
+        '<span class="legend-row"><span class="swatch" style="background:var(--amber)"></span>Break-even</span>'
+        '<span class="legend-row"><span class="swatch" style="background:var(--pink)"></span>Selected PTU capacity</span>'
+        '<span class="legend-row"><span class="swatch" style="background:var(--accent)"></span>Observed average TPM</span></div>'
+    )
+    sample_indexes = sorted({0, len(curve.sustained_tpm) // 4, len(curve.sustained_tpm) // 2, 3 * len(curve.sustained_tpm) // 4, len(curve.sustained_tpm) - 1})
+    rows = "".join(
+        f"<tr><td>{curve.sustained_tpm[i]:,.0f}</td><td>{_money(curve.payg_monthly[i])}</td><td>{_money(curve.hybrid_monthly[i])}</td></tr>"
+        for i in sample_indexes
+    )
+    table = f"""<table class="data-table"><caption>Accessible cost curve sample (selected PTU {curve.selected_ptu:,} · capacity {curve.ptu_capacity_tpm:,.0f} TPM)</caption>
+      <thead><tr><th scope="col">Sustained TPM</th><th scope="col">PAYG / month</th><th scope="col">Hybrid / month</th></tr></thead><tbody>{rows}</tbody></table>"""
+    return legend + svg, table
+
+
+_ELIGIBILITY_EXPLANATIONS = {
+    "eligible_sufficient_evidence": "Eligible and sufficient evidence: capacity, mode, workload history, and pricing are all available.",
+    "eligible_insufficient_evidence": "Eligible but insufficient evidence: capacity and mode are supported, but the observed history is too sparse for a confident recommendation or cost curve.",
+    "model_capacity_unavailable": "Model capacity unavailable: this model is not in TokenLens's supported PTU capacity table.",
+    "ptu_not_applicable": "PTU not applicable: this model is billed through Foundry's partner/consumption offer, not Azure PTU capacity purchasing.",
+    "pricing_unavailable": "Pricing unavailable: workload evidence is sufficient, but exact USD PAYG pricing is required before a cost curve can be shown.",
+    "deployment_mode_unavailable": "Deployment mode unavailable: PTU sizing requires a Global or Regional deployment mode.",
+}
 
 
 def _ptu_panel(report: AnalysisReport) -> str:
     analysis = report.ptu_analysis
     if not isinstance(analysis, PtuPortfolioAssessment):
         return '<section class="panel"><p class="empty">PTU analysis is unavailable for this report.</p></section>'
-    deployment_cards = []
-    for item in analysis.deployments:
-        dimensions = "".join(
-            f'<div class="dimension {dimension.verdict}"><strong>{_escape(dimension.name)}</strong>'
-            f'<span>{_escape(dimension.verdict.title())}</span><small>{_escape(dimension.metric)}</small></div>'
-            for dimension in item.dimensions
+    pairs = deployment_slugs(analysis)
+    dashboards = []
+    for index, (item, slug) in enumerate(pairs):
+        throughput_svg, throughput_table = (
+            _ptu_throughput_chart(item.throughput_series) if item.throughput_series else ("", "")
         )
-        deployment_cards.append(
-            f"""<article class="panel ptu-card"><div class="ptu-head"><div><h2>{_escape(item.deployment_name)}</h2>
-            <small>{_escape(item.model_name)} · {_escape(item.deployment_mode.title())}</small></div>
-            <strong class="ptu-recommendation">{_escape(item.recommendation)}</strong></div>
-            <div class="dimension-grid">{dimensions}</div>
-            <div class="ptu-stats"><span>Average TPM<strong>{item.average_tpm:,.0f}</strong></span>
-            <span>P95 TPM<strong>{item.p95_tpm:,.0f}</strong></span>
-            <span>Throttled<strong>{item.throttling_rate_percent:.2f}%</strong></span>
-            <span>Suggested PTU<strong>{item.suggested_ptu if item.suggested_ptu is not None else "N/A"}</strong></span>
-            <span>PAYG / month<strong>{_money(item.payg_monthly_usd, precision=0)}</strong></span>
-            <span>Hybrid / month<strong>{_money(item.hybrid_monthly_usd, precision=0)}</strong></span>
-            <span>Break-even TPM<strong>{f"{item.break_even_tpm:,.0f}" if item.break_even_tpm is not None else "Unavailable"}</strong></span>
-            <span>Economic result<strong>{_escape(item.economic_result)}</strong></span></div>
-            <p class="ptu-note">{_escape(item.note)}</p></article>"""
+        cost_svg, cost_table = _ptu_cost_explorer_chart(item.cost_curve) if item.cost_curve else ("", "")
+        dashboards.append(
+            render_deployment(
+                item,
+                slug,
+                selected=index == 0,
+                throughput_svg=throughput_svg,
+                throughput_table=throughput_table,
+                cost_svg=cost_svg,
+                cost_table=cost_table,
+                eligibility_label=ELIGIBILITY_STATUS_LABELS.get(item.eligibility_status, item.eligibility_status),
+                eligibility_explanation=_ELIGIBILITY_EXPLANATIONS.get(item.eligibility_status, ""),
+            )
         )
     return f"""<section class="metrics ptu-metrics">
       <div class="card"><div class="label">PTU recommended</div><div class="value">{analysis.recommended_deployments:,}</div><div class="sub">Strong workload fit</div></div>
@@ -375,10 +635,34 @@ def _ptu_panel(report: AnalysisReport) -> str:
       <div class="card"><div class="label">Insufficient / unsupported</div><div class="value">{analysis.insufficient_deployments:,}</div><div class="sub">Needs evidence or capacity data</div></div>
       <div class="card"><div class="label">Time bucket</div><div class="value">{analysis.bucket_minutes} min</div><div class="sub">Offline trace aggregation</div></div>
     </section>
-    <p class="analytics-intro">PTU suitability combines workload shape, capacity pressure, request-latency evidence, and load predictability. Monetary comparisons require both exact PAYG pricing and supported model capacity.</p>
-    <section class="ptu-list">{''.join(deployment_cards) or '<p class="empty">No deployments observed.</p>'}</section>
+    <p class="analytics-intro">The PTU Advisor renders one deployment at a time. Recommendation, confidence, metrics, evidence charts, capacity sizing, economics, and exports all describe the selected deployment only; unrelated model or deployment slices are never merged into one recommendation.</p>
+    {selector(pairs)}
+    {''.join(dashboards) or '<p class="empty">No deployments observed.</p>'}
+    {_ptu_legacy_summary(analysis)}
     <section class="panel ptu-source"><strong>Method source</strong><span>Adapted from the MIT-licensed <a href="{_escape(analysis.source_repository)}">PTU Advisor</a> at revision <code>{_escape(analysis.source_revision[:12])}</code>.</span></section>
     <footer>tokenlens-for-azure · created by Tzahi Ariel</footer>"""
+
+
+def _ptu_legacy_summary(analysis: PtuPortfolioAssessment) -> str:
+    """Keep the compact portfolio table so every deployment stays visible at once."""
+    rows = []
+    for item in analysis.deployments:
+        eligibility_label = ELIGIBILITY_STATUS_LABELS.get(item.eligibility_status, item.eligibility_status)
+        rows.append(
+            f'<tr><th scope="row">{_escape(item.deployment_name)}<small>{_escape(item.model_name)} · {_escape(item.deployment_mode.title())}</small></th>'
+            f'<td><span class="eligibility-badge {item.eligibility_status}">{_escape(eligibility_label)}</span></td>'
+            f"<td>{_escape(item.recommendation)}</td>"
+            f"<td>{item.average_tpm:,.0f}</td><td>{item.p95_tpm:,.0f}</td>"
+            f"<td>{item.suggested_ptu if item.suggested_ptu is not None else 'Unavailable'}</td>"
+            f"<td>{_money(item.payg_monthly_usd, precision=0)}</td><td>{_money(item.hybrid_monthly_usd, precision=0)}</td>"
+            f"<td>{_escape(item.economic_result)}</td></tr>"
+        )
+    return f"""<section class="panel table-panel ptu-portfolio"><h2>Portfolio summary</h2>
+      <p class="muted">All analyzed deployments, including those that cannot receive a PTU recommendation.</p>
+      <div class="table-scroll"><table class="data-table"><caption>PTU assessment by deployment</caption>
+      <thead><tr><th scope="col">Deployment</th><th scope="col">Eligibility</th><th scope="col">Recommendation</th><th scope="col">Avg TPM</th>
+      <th scope="col">P95 TPM</th><th scope="col">Suggested PTU</th><th scope="col">PAYG / month</th><th scope="col">Hybrid / month</th><th scope="col">Economic result</th></tr></thead>
+      <tbody>{''.join(rows) or '<tr><td colspan="9">No deployments observed.</td></tr>'}</tbody></table></div></section>"""
 
 
 def report_html(report: AnalysisReport) -> str:
@@ -397,9 +681,9 @@ def report_html(report: AnalysisReport) -> str:
 <title>TokenLens for Azure — Report</title>
 <style>
 :root{{--bg:#11213b;--surface:#172a49;--surface-2:#1d3559;--border:#35527a;--text:#f3f7ff;--muted:#b5c5dc;--soft:#d2deee;--accent:#73c7ff;--green:#57d68b;--amber:#ffc857;--pink:#ff8fa3;--shadow:0 12px 30px rgba(0,0,0,.22)}}
-*{{box-sizing:border-box}}html{{background:var(--bg)}}body{{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 "Segoe UI",Aptos,Calibri,Arial,sans-serif}}main{{max-width:1320px;margin:auto;padding:20px 26px 18px}}header{{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:14px}}.logo{{width:min(275px,55vw);height:auto;display:block}}.meta{{text-align:right;color:var(--muted);font-size:11px;line-height:1.5}}.meta strong{{color:var(--text);font-size:12px;margin-left:5px}}h1,h2,h3,p{{margin:0}}h2{{font-size:17px;letter-spacing:-.02em}}h3{{font-size:14px}}small,.muted{{display:block;color:var(--muted);font-size:11px}}.card,.panel,.chart-card,.kpi,.chart{{background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow)}}.metrics{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:12px}}.card,.kpi{{padding:11px 13px;min-height:76px}}.kpi b{{display:block;font-size:22px;color:var(--accent);margin-top:4px}}.kpi span,.label{{color:var(--muted);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}}.value{{font-size:22px;font-weight:700;letter-spacing:-.04em;margin-top:4px}}.sub{{font-size:10px;color:var(--muted);margin-top:2px}}.accent{{color:var(--accent)}}.overview-grid{{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(280px,.9fr);gap:12px;margin-bottom:12px}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}.panel-head{{padding:11px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:baseline;gap:12px}}.panel-head a,.tab{{color:var(--link,var(--accent));font-weight:700}}.portfolio{{padding:0 14px}}.portfolio-row{{display:grid;grid-template-columns:1.15fr 2fr 145px;gap:12px;align-items:center;padding:9px 0;border-bottom:1px solid var(--border)}}.portfolio-row:last-child{{border-bottom:0}}.portfolio-row strong{{font-size:12px}}.portfolio-row small{{margin-top:1px;font-size:10px}}.portfolio-bar{{height:9px;border-radius:9px;background:var(--surface-2);overflow:hidden}}.portfolio-bar span{{height:100%;display:block;background:var(--accent);border-radius:9px}}.portfolio-value{{text-align:right}}.portfolio-value strong{{display:block;font-size:12px}}.portfolio-value small{{font-size:10px}}.actions{{padding:9px 14px 10px}}.actions ol{{padding:0 0 0 20px;margin:0}}.actions li{{padding:5px 0 5px 2px;border-bottom:1px solid var(--border)}}.actions li:last-child{{border-bottom:0}}.actions li strong,.actions li span{{display:block;font-size:11px}}.actions li span{{color:var(--muted);font-size:10px;margin-top:1px}}.finding-panel{{margin-bottom:12px}}.finding-list{{display:grid;grid-template-columns:repeat(3,1fr)}}.finding-card{{display:grid;grid-template-columns:52px minmax(0,1.3fr) minmax(86px,.8fr);gap:9px;align-items:start;padding:10px 12px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}}.finding-card:nth-child(3n){{border-right:0}}.finding-card:last-child{{border-bottom:0}}.finding-rule{{font:700 10px Consolas,monospace;border-left:4px solid var(--accent);padding-left:6px;color:var(--soft)}}.finding-card.high .finding-rule{{border-color:var(--pink)}}.finding-card.medium .finding-rule{{border-color:var(--amber)}}.finding-card.low .finding-rule{{border-color:var(--accent)}}.finding-copy strong,.finding-impact strong,.finding-action strong{{display:block;font-size:11px}}.finding-copy span,.finding-impact span,.finding-action span{{display:block;color:var(--muted);font-size:10px;margin-top:2px}}.finding-impact strong{{color:var(--accent)}}.finding-action{{grid-column:2 / -1}}.finding-action strong{{color:var(--green)}}.tabs{{margin-top:4px}}.tab-list{{display:flex;gap:5px;border-bottom:1px solid var(--border);margin-bottom:14px}}.tab{{border:1px solid transparent;border-bottom:0;border-radius:8px 8px 0 0;background:transparent;padding:8px 13px;color:var(--muted);cursor:pointer;font:700 12px inherit}}.tab[aria-selected="true"]{{color:var(--text);background:var(--surface);border-color:var(--border)}}.tab:focus-visible,.donut-segment:focus-visible,.columns rect:focus-visible,summary:focus-visible{{outline:3px solid var(--amber);outline-offset:2px}}.js .tab-panel:not(.active){{display:none}}.tab-panel{{min-height:200px}}.analytics-intro{{color:var(--muted);font-size:12px;margin-bottom:12px}}.chart-grid{{display:grid;grid-template-columns:1fr 1.35fr;gap:12px;margin-bottom:12px}}.chart-card,.chart{{padding:14px;min-width:0}}.chart-card h2,.chart h2{{margin-bottom:3px}}.chart-card > p,.chart p{{color:var(--muted);font-size:11px;margin-bottom:10px}}.bar-row{{display:grid;grid-template-columns:150px 1fr 100px;align-items:center;gap:8px;margin:9px 0;font-size:11px}}.bar-track{{height:12px;background:var(--surface-2);border-radius:8px;overflow:hidden}}.bar-track i{{display:block;height:100%;background:var(--accent);border-radius:8px}}.donut-wrap{{display:flex;align-items:center;gap:12px;min-height:220px}}.donut{{width:220px;max-width:42%;overflow:visible}}.donut-total{{fill:var(--text);font-size:16px;font-weight:700}}.donut-label{{fill:var(--muted);font-size:9px}}.columns{{width:100%;height:auto;min-height:220px;overflow:visible}}.columns .axis,.axis{{stroke:var(--border);stroke-width:1}}.axis-label{{fill:var(--soft);font-size:10px}}.axis-value{{fill:var(--muted);font-size:9px}}svg text{{fill:var(--muted)}}svg circle{{fill:var(--green);stroke:var(--text);stroke-width:1}}.legend{{display:grid;gap:4px;min-width:130px}}.legend-row{{font-size:10px;color:var(--soft)}}.swatch{{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:0}}.data-table,.task table{{width:100%;border-collapse:collapse;font-size:10px;margin-top:10px;color:var(--soft)}}.data-table caption,.task caption{{text-align:left;color:var(--muted);font-size:10px;margin-bottom:4px}}.data-table th,.data-table td,.task th,.task td{{padding:5px 6px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}}.data-table th:first-child,.data-table td:first-child,.task th:first-child,.task td:first-child{{text-align:left}}.data-table thead th,.task thead th{{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.04em}}.table-panel{{padding:14px;margin-bottom:12px;overflow:auto}}.scenario-list{{margin:0;padding-left:20px}}.scenario-list li{{padding:6px 0;border-bottom:1px solid var(--border)}}.scenario-list small{{display:block;color:var(--muted)}}.analytics-section{{margin-bottom:12px}}.analytics-section > .panel-head{{margin-bottom:0}}.details-list{{display:grid;gap:7px}}.deployment-details{{background:var(--surface);border:1px solid var(--border);border-radius:9px;overflow:hidden}}summary{{cursor:pointer;padding:10px 13px;list-style-position:inside}}summary span{{color:var(--muted);font-size:11px;margin-left:10px}}.detail-body{{border-top:1px solid var(--border);padding:10px 13px}}.mini-stats{{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:10px;margin-bottom:7px}}.mini-stats strong{{color:var(--text);margin-left:3px}}.detail-body .finding-card{{background:var(--surface-2);border:1px solid var(--border);border-radius:7px;margin-top:6px;grid-template-columns:52px minmax(0,1.3fr) minmax(86px,.8fr)}}.additional{{border-left:3px solid var(--amber)}}.empty{{padding:12px 14px;color:var(--muted);font-size:11px}}footer{{text-align:center;color:var(--muted);font-size:9px;letter-spacing:.04em;margin-top:12px}}@media(max-width:960px){{main{{padding:16px}}.metrics{{grid-template-columns:repeat(3,1fr)}}.overview-grid,.chart-grid,.grid{{grid-template-columns:1fr}}.finding-list{{grid-template-columns:1fr}}.finding-card,.finding-card:nth-child(3n){{border-right:0}}.donut-wrap{{justify-content:center}}}}@media(max-width:620px){{header{{display:block}}.meta{{text-align:left;margin-top:8px}}.metrics{{grid-template-columns:repeat(2,1fr)}}.portfolio-row{{grid-template-columns:1fr 100px}}.portfolio-bar{{grid-column:1 / -1;grid-row:2}}.portfolio-value{{text-align:right}}.donut-wrap{{display:block}}.donut{{display:block;max-width:220px;margin:auto}}.data-table{{display:block;overflow-x:auto}}summary span{{display:block;margin:3px 0 0 21px}}}}@media print{{@page{{size:landscape;margin:.35in}}body{{background:#fff;color:#11213b;font-size:10px}}main{{max-width:none;padding:0}}header{{border-color:#9aa8ba}}.card,.panel,.chart-card,.kpi,.chart,.deployment-details{{box-shadow:none;background:#fff;border-color:#9aa8ba}}.metrics{{gap:5px}}.value{{font-size:16px}}.overview{{min-height:6.8in;page-break-after:always}}.usage{{page-break-before:always}}.tab-list{{display:none}}.js .tab-panel:not(.active){{display:block}}.finding-card,.portfolio-row{{border-color:#b8c2cf}}.finding-copy span,.finding-impact span,.finding-action span,.analytics-intro,.data-table caption,small,.muted{{color:#46556b}}.data-table th,.data-table td{{border-color:#b8c2cf}}footer{{color:#46556b}}}}
-@media(min-width:961px) and (max-width:1400px){{main{{padding:10px 20px 6px}}.logo{{width:240px}}.tab-list{{margin-bottom:8px}}.metrics{{gap:7px;margin-bottom:8px}}.card{{padding:8px 10px;min-height:68px}}.overview-grid{{gap:8px;margin-bottom:8px}}.panel-head{{padding:8px 11px}}.portfolio{{padding:0 11px}}.portfolio-row{{padding:6px 0}}.actions{{padding:6px 11px}}.actions li{{padding:3px 0}}.finding-card{{padding:7px 10px}}.finding-panel{{margin-bottom:8px}}footer{{margin-top:7px}}}}
-.donut-segment,.donut-track{{fill:none}}.cost-name{{font-size:15px;line-height:1.2}}.cost-bar{{display:grid;grid-template-columns:100px 1fr 90px;gap:9px;align-items:center;margin:12px 0;font-size:11px}}.cost-track{{height:14px;background:var(--surface-2);border-radius:8px;overflow:hidden}}.cost-track i{{display:block;height:100%;border-radius:8px}}.cost-bar strong{{text-align:right}}.provenance{{display:grid;gap:7px;font-size:12px}}.provenance span,.provenance small{{color:var(--muted)}}a{{color:var(--accent)}}.ptu-list{{display:grid;gap:12px}}.ptu-card{{padding:14px}}.ptu-head{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:11px}}.ptu-recommendation{{color:var(--accent);font-size:14px}}.dimension-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-bottom:11px}}.dimension{{padding:8px;border:1px solid var(--border);border-left:4px solid var(--muted);border-radius:7px;background:var(--surface-2)}}.dimension.positive{{border-left-color:var(--green)}}.dimension.neutral{{border-left-color:var(--amber)}}.dimension.negative{{border-left-color:var(--pink)}}.dimension strong,.dimension span,.dimension small{{display:block}}.dimension strong{{font-size:10px}}.dimension span{{font-size:10px;color:var(--soft);margin-top:2px}}.dimension small{{font-size:9px;margin-top:2px}}.ptu-stats{{display:grid;grid-template-columns:repeat(8,1fr);gap:7px}}.ptu-stats span{{font-size:9px;color:var(--muted);text-transform:uppercase}}.ptu-stats strong{{display:block;color:var(--text);font-size:11px;text-transform:none;margin-top:3px}}.ptu-note{{font-size:10px;color:var(--muted);margin-top:10px}}.ptu-source{{display:flex;gap:8px;padding:12px;margin-top:12px;font-size:11px}}@media(max-width:960px){{.dimension-grid{{grid-template-columns:1fr 1fr}}.ptu-stats{{grid-template-columns:repeat(4,1fr)}}}}@media(max-width:620px){{.cost-bar{{grid-template-columns:80px 1fr}}.cost-bar strong{{grid-column:2}}.dimension-grid,.ptu-stats{{grid-template-columns:1fr 1fr}}.ptu-head{{display:block}}.ptu-recommendation{{display:block;margin-top:5px}}}}
+*{{box-sizing:border-box}}html,body{{min-height:100%}}html{{background:var(--bg)}}body{{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:14px/1.4 "Segoe UI",Aptos,Calibri,Arial,sans-serif}}main{{width:100%;min-height:100vh;margin:0;padding:clamp(16px,1.5vw,28px)}}header{{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:14px}}.logo{{width:min(275px,55vw);height:auto;display:block}}.meta{{text-align:right;color:var(--muted);font-size:12px;line-height:1.5}}.meta strong{{color:var(--text);font-size:12px;margin-left:5px}}h1,h2,h3,p{{margin:0}}h2{{font-size:17px;letter-spacing:-.02em}}h3{{font-size:14px}}small,.muted{{display:block;color:var(--muted);font-size:12px}}.card,.panel,.chart-card,.kpi,.chart{{background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow)}}.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px}}.card,.kpi{{padding:11px 13px;min-height:76px}}.kpi b{{display:block;font-size:22px;color:var(--accent);margin-top:4px}}.kpi span,.label{{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}}.value{{font-size:22px;font-weight:700;letter-spacing:-.04em;margin-top:4px}}.sub{{font-size:12px;color:var(--muted);margin-top:2px}}.accent{{color:var(--accent)}}.overview-grid{{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(280px,.9fr);gap:12px;margin-bottom:12px}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}.panel-head{{padding:11px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:baseline;gap:12px}}.panel-head a,.tab{{color:var(--link,var(--accent));font-weight:700}}.portfolio{{padding:0 14px}}.portfolio-row{{display:grid;grid-template-columns:1.15fr 2fr 145px;gap:12px;align-items:center;padding:9px 0;border-bottom:1px solid var(--border)}}.portfolio-row:last-child{{border-bottom:0}}.portfolio-row strong{{font-size:12px}}.portfolio-row small{{margin-top:1px;font-size:12px}}.portfolio-bar{{height:9px;border-radius:9px;background:var(--surface-2);overflow:hidden}}.portfolio-bar span{{height:100%;display:block;background:var(--accent);border-radius:9px}}.portfolio-value{{text-align:right}}.portfolio-value strong{{display:block;font-size:12px}}.portfolio-value small{{font-size:12px}}.actions{{padding:9px 14px 10px}}.actions ol{{padding:0 0 0 20px;margin:0}}.actions li{{padding:5px 0 5px 2px;border-bottom:1px solid var(--border)}}.actions li:last-child{{border-bottom:0}}.actions li strong,.actions li span{{display:block;font-size:12px}}.actions li span{{color:var(--muted);font-size:12px;margin-top:1px}}.finding-panel{{margin-bottom:12px}}.finding-list{{display:grid;grid-template-columns:repeat(3,1fr)}}.finding-card{{display:grid;grid-template-columns:52px minmax(0,1.3fr) minmax(86px,.8fr);gap:9px;align-items:start;padding:10px 12px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}}.finding-card:nth-child(3n){{border-right:0}}.finding-card:last-child{{border-bottom:0}}.finding-rule{{font:700 10px Consolas,monospace;border-left:4px solid var(--accent);padding-left:6px;color:var(--soft)}}.finding-card.high .finding-rule{{border-color:var(--pink)}}.finding-card.medium .finding-rule{{border-color:var(--amber)}}.finding-card.low .finding-rule{{border-color:var(--accent)}}.finding-copy strong,.finding-impact strong,.finding-action strong{{display:block;font-size:12px}}.finding-copy span,.finding-impact span,.finding-action span{{display:block;color:var(--muted);font-size:12px;margin-top:2px}}.finding-impact strong{{color:var(--accent)}}.finding-action{{grid-column:2 / -1}}.finding-action strong{{color:var(--green)}}.tabs{{margin-top:4px}}.tab-list{{display:flex;gap:5px;border-bottom:1px solid var(--border);margin-bottom:14px}}.tab{{border:1px solid transparent;border-bottom:0;border-radius:8px 8px 0 0;background:transparent;padding:8px 13px;color:var(--muted);cursor:pointer;font:700 12px inherit}}.tab[aria-selected="true"]{{color:var(--text);background:var(--surface);border-color:var(--border)}}.tab:focus-visible,.donut-segment:focus-visible,.columns rect:focus-visible,summary:focus-visible{{outline:3px solid var(--amber);outline-offset:2px}}.js .tab-panel:not(.active){{display:none}}.tab-panel{{min-height:200px}}.analytics-intro{{color:var(--muted);font-size:12px;margin-bottom:12px}}.chart-grid{{display:grid;grid-template-columns:1fr 1.35fr;gap:12px;margin-bottom:12px}}.chart-card,.chart{{padding:14px;min-width:0}}.chart-card h2,.chart h2{{margin-bottom:3px}}.chart-card > p,.chart p{{color:var(--muted);font-size:12px;margin-bottom:10px}}.bar-row{{display:grid;grid-template-columns:150px 1fr 100px;align-items:center;gap:8px;margin:9px 0;font-size:12px}}.bar-track{{height:12px;background:var(--surface-2);border-radius:8px;overflow:hidden}}.bar-track i{{display:block;height:100%;background:var(--accent);border-radius:8px}}.donut-wrap{{display:flex;align-items:center;gap:12px;min-height:220px}}.donut{{width:220px;max-width:42%;overflow:visible}}.donut-total{{fill:var(--text);font-size:16px;font-weight:700}}.donut-label{{fill:var(--muted);font-size:11px}}.columns{{width:100%;height:auto;min-height:220px;overflow:visible}}.columns .axis,.axis{{stroke:var(--border);stroke-width:1}}.axis-label{{fill:var(--soft);font-size:12px}}.axis-value{{fill:var(--muted);font-size:11px}}svg text{{fill:var(--muted)}}svg circle{{fill:var(--green);stroke:var(--text);stroke-width:1}}.legend{{display:grid;gap:4px;min-width:130px}}.legend-row{{font-size:12px;color:var(--soft)}}.swatch{{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:0}}.data-table,.task table{{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px;color:var(--soft)}}.data-table caption,.task caption{{text-align:left;color:var(--muted);font-size:12px;margin-bottom:4px}}.data-table th,.data-table td,.task th,.task td{{padding:5px 6px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}}.data-table th:first-child,.data-table td:first-child,.task th:first-child,.task td:first-child{{text-align:left}}.data-table thead th,.task thead th{{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}}.table-panel{{padding:14px;margin-bottom:12px;overflow:auto}}.scenario-list{{margin:0;padding-left:20px}}.scenario-list li{{padding:6px 0;border-bottom:1px solid var(--border)}}.scenario-list small{{display:block;color:var(--muted)}}.analytics-section{{margin-bottom:12px}}.analytics-section > .panel-head{{margin-bottom:0}}.details-list{{display:grid;gap:7px}}.deployment-details{{background:var(--surface);border:1px solid var(--border);border-radius:9px;overflow:hidden}}summary{{cursor:pointer;padding:10px 13px;list-style-position:inside}}summary span{{color:var(--muted);font-size:11px;margin-left:10px}}.detail-body{{border-top:1px solid var(--border);padding:10px 13px}}.mini-stats{{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-bottom:7px}}.mini-stats strong{{color:var(--text);margin-left:3px}}.detail-body .finding-card{{background:var(--surface-2);border:1px solid var(--border);border-radius:7px;margin-top:6px;grid-template-columns:52px minmax(0,1.3fr) minmax(86px,.8fr)}}.additional{{border-left:3px solid var(--amber)}}.empty{{padding:12px 14px;color:var(--muted);font-size:12px}}footer{{text-align:center;color:var(--muted);font-size:10px;letter-spacing:.04em;margin-top:12px}}@media(max-width:960px){{main{{padding:16px}}.metrics{{grid-template-columns:repeat(3,1fr)}}.overview-grid,.chart-grid,.grid{{grid-template-columns:1fr}}.finding-list{{grid-template-columns:1fr}}.finding-card,.finding-card:nth-child(3n){{border-right:0}}.donut-wrap{{justify-content:center}}}}@media(max-width:620px){{header{{display:block}}.meta{{text-align:left;margin-top:8px}}.metrics{{grid-template-columns:repeat(2,1fr)}}.portfolio-row{{grid-template-columns:1fr 100px}}.portfolio-bar{{grid-column:1 / -1;grid-row:2}}.portfolio-value{{text-align:right}}.donut-wrap{{display:block}}.donut{{display:block;max-width:220px;margin:auto}}.data-table{{display:block;overflow-x:auto}}summary span{{display:block;margin:3px 0 0 21px}}}}@media print{{@page{{size:landscape;margin:.35in}}body{{background:#fff;color:#11213b;font-size:10px}}main{{max-width:none;padding:0}}header{{border-color:#9aa8ba}}.card,.panel,.chart-card,.kpi,.chart,.deployment-details{{box-shadow:none;background:#fff;border-color:#9aa8ba}}.metrics{{gap:5px}}.value{{font-size:16px}}.overview{{min-height:6.8in;page-break-after:always}}.usage{{page-break-before:always}}.tab-list{{display:none}}.js .tab-panel:not(.active){{display:block}}.finding-card,.portfolio-row{{border-color:#b8c2cf}}.finding-copy span,.finding-impact span,.finding-action span,.analytics-intro,.data-table caption,small,.muted{{color:#46556b}}.data-table th,.data-table td{{border-color:#b8c2cf}}footer{{color:#46556b}}}}
+.donut-segment,.donut-track{{fill:none}}.cost-name{{font-size:15px;line-height:1.2}}.cost-bar{{display:grid;grid-template-columns:130px 1fr 110px;gap:9px;align-items:center;margin:12px 0;font-size:12px}}.cost-track{{height:14px;background:var(--surface-2);border-radius:8px;overflow:hidden;display:flex}}.cost-track i.excluded,.cost-track i.covered.partial{{background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.4) 0 5px,rgba(255,255,255,.08) 5px 10px);background-color:var(--muted)}}.cost-bar.partial span{{color:var(--amber)}}.cost-empty{{display:grid;gap:6px;padding:14px;border:1px dashed var(--border);border-radius:9px;background:var(--surface-2)}}.cost-empty strong{{font-size:13px}}.cost-empty span{{font-size:12px;color:var(--muted)}}.cost-empty a{{font-size:12px;font-weight:700}}.unresolved-list{{display:grid;gap:8px;margin-top:8px}}.unresolved-row{{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:8px;padding:8px 10px;border:1px solid var(--border);border-left:3px solid var(--amber);border-radius:7px;background:var(--surface-2);font-size:12px}}.unresolved-row strong{{display:block;font-size:12px}}.unresolved-row span{{display:block;color:var(--muted);font-size:12px;margin-top:2px}}.cost-track i{{display:block;height:100%;border-radius:8px}}.cost-bar strong{{text-align:right}}.provenance{{display:grid;gap:7px;font-size:12px}}.provenance{{font-size:12px}}.provenance span,.provenance small{{color:var(--muted)}}a{{color:var(--accent)}}.ptu-list{{display:grid;gap:12px}}.ptu-card{{padding:14px}}.ptu-head{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:11px}}.ptu-recommendation{{color:var(--accent);font-size:14px}}.dimension-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-bottom:11px}}.dimension{{padding:8px;border:1px solid var(--border);border-left:4px solid var(--muted);border-radius:7px;background:var(--surface-2)}}.dimension.positive{{border-left-color:var(--green)}}.dimension.neutral{{border-left-color:var(--amber)}}.dimension.negative{{border-left-color:var(--pink)}}.dimension strong,.dimension span,.dimension small{{display:block}}.dimension strong{{font-size:11px}}.dimension span{{font-size:12px;color:var(--soft);margin-top:2px}}.dimension small{{font-size:11px;margin-top:2px}}.ptu-stats{{display:grid;grid-template-columns:repeat(8,1fr);gap:7px}}.ptu-stats span{{font-size:11px;color:var(--muted);text-transform:uppercase}}.ptu-stats strong{{display:block;color:var(--text);font-size:11px;text-transform:none;margin-top:3px}}.ptu-note{{font-size:12px;color:var(--muted);margin-top:10px}}.ptu-evidence-note{{font-size:12px;color:var(--amber);margin:10px 0;padding:10px 12px;border:1px dashed var(--border);border-radius:8px;background:var(--surface-2)}}.eligibility-badge{{font-weight:700;padding:1px 6px;border-radius:5px;background:var(--surface-2);color:var(--soft)}}.eligibility-badge.eligible_sufficient_evidence{{color:var(--green)}}.eligibility-badge.eligible_insufficient_evidence,.eligibility-badge.pricing_unavailable,.eligibility-badge.deployment_mode_unavailable{{color:var(--amber)}}.eligibility-badge.model_capacity_unavailable,.eligibility-badge.ptu_not_applicable{{color:var(--pink)}}.ptu-graphs{{margin-top:12px}}.ptu-source{{display:flex;gap:8px;padding:12px;margin-top:12px;font-size:11px}}@media(max-width:960px){{.dimension-grid{{grid-template-columns:1fr 1fr}}.ptu-stats{{grid-template-columns:repeat(4,1fr)}}}}@media(max-width:620px){{.cost-bar{{grid-template-columns:80px 1fr}}.cost-bar strong{{grid-column:2}}.dimension-grid,.ptu-stats{{grid-template-columns:1fr 1fr}}.ptu-head{{display:block}}.ptu-recommendation{{display:block;margin-top:5px}}}}
+{PTU_DASHBOARD_CSS}
 </style></head><body><main>
 <header><div><img class="logo" src="data:image/png;base64,{_logo_data_uri().split(',',1)[1]}" alt="TokenLens for Azure logo"></div>
 <div class="meta">Generated<strong>{_escape(report.generated_at)}</strong> · Source<strong>{_escape(report.source)}</strong> · Offline synthetic example</div></header>
@@ -449,11 +733,13 @@ document.documentElement.classList.add("js");
     if (event.key === "Home" || event.key === "End") {{ event.preventDefault(); activate(event.key === "Home" ? "overview" : "ptu", true); }}
   }}));
   document.querySelectorAll("[data-tab-link]").forEach(link => link.addEventListener("click", event => {{ event.preventDefault(); activate(link.dataset.tabLink, false); }}));
-  if (location.hash.toLowerCase() === "#usage") activate("usage", false);
-  if (location.hash.toLowerCase() === "#cost") activate("cost", false);
-  if (location.hash.toLowerCase() === "#ptu") activate("ptu", false);
-  if (location.hash.toLowerCase() === "#overview") activate("overview", false);
+  const hash = location.hash.toLowerCase();
+  if (hash === "#usage") activate("usage", false);
+  if (hash === "#cost") activate("cost", false);
+  if (hash === "#ptu" || hash.startsWith("#ptu=")) activate("ptu", false);
+  if (hash === "#overview") activate("overview", false);
 }})();
+{PTU_DASHBOARD_JS}
 </script></body></html>"""
 
 
@@ -556,7 +842,7 @@ def task_economics_html(
 <title>TokenLens for Azure — Task economics</title>
 <style>
 :root{{--bg:#11213b;--surface:#172a49;--surface2:#1d3559;--border:#35527a;--text:#f3f7ff;--muted:#b5c5dc;--accent:#73c7ff;--green:#57d68b;--amber:#ffc857}}
-*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI",Arial,sans-serif}}main{{max-width:1320px;margin:auto;padding:22px}}header{{display:flex;justify-content:space-between;align-items:center;gap:18px;border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:14px}}.logo{{width:min(300px,58vw);height:auto;display:block}}h1{{font-size:22px;margin:0}}h2{{font-size:17px;margin:0}}h3{{font-size:13px;margin:0}}p{{margin:0;color:var(--muted)}}.meta{{color:var(--muted);font-size:11px;text-align:right}}.tabs{{display:flex;gap:5px;border-bottom:1px solid var(--border);margin-bottom:14px}}button{{font:700 12px inherit;color:var(--muted);background:transparent;border:1px solid transparent;padding:9px 14px;border-radius:8px 8px 0 0;cursor:pointer}}button[aria-selected=true]{{color:var(--text);background:var(--surface);border-color:var(--border)}}button:focus-visible,svg circle:focus-visible{{outline:3px solid var(--amber);outline-offset:3px}}.panel,.kpi,.chart{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px}}.metrics{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:12px}}.kpi b{{display:block;font-size:22px;color:var(--accent);margin-top:4px}}.kpi span,.label{{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}.chart-head{{display:flex;justify-content:space-between;gap:8px;margin-bottom:10px}}.bar-row{{display:grid;grid-template-columns:150px 1fr 100px;align-items:center;gap:8px;margin:9px 0;font-size:11px}}.bar-track{{height:12px;background:var(--surface2);border-radius:8px;overflow:hidden}}.bar-track i{{display:block;height:100%;background:var(--accent);border-radius:8px}}.overview-list{{padding:14px}}.overview-list h2{{margin-bottom:3px}}.overview-list > p{{margin-bottom:10px}}.overview-list .portfolio-row{{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);font-size:11px}}.overview-list .portfolio-row small{{display:block;color:var(--muted)}}.overview-list .portfolio-bar{{height:8px;background:var(--surface2);border-radius:8px;overflow:hidden}}.overview-list .portfolio-bar span{{display:block;height:100%;background:var(--accent)}}.overview-list .portfolio-value{{text-align:right}}.overview-list ol{{margin:0;padding-left:20px}}.overview-list li{{padding:5px 0;color:var(--muted)}}svg{{width:100%;height:auto;background:var(--surface2);border-radius:8px}}.axis{{stroke:var(--border);stroke-width:1}}svg text{{fill:var(--muted);font-size:10px}}svg circle{{fill:var(--green);stroke:var(--text);stroke-width:1}}table{{width:100%;border-collapse:collapse;font-size:11px;display:block;overflow-x:auto}}caption{{text-align:left;color:var(--muted);padding:0 0 6px}}th,td{{padding:7px;border-bottom:1px solid var(--border);white-space:nowrap;text-align:right}}th:first-child,td:first-child{{text-align:left}}thead th{{color:var(--muted);font-size:9px;text-transform:uppercase}}.table-panel{{margin-bottom:12px}}.scenario-list{{margin:0;padding-left:20px}}.scenario-list li{{padding:6px 0;border-bottom:1px solid var(--border)}}.scenario-list small{{display:block;color:var(--muted)}}.fallback{{padding:24px;text-align:center}}@media(max-width:900px){{.metrics,.grid{{grid-template-columns:1fr 1fr}}.bar-row{{grid-template-columns:110px 1fr 90px}}}}@media(max-width:600px){{main{{padding:14px}}header{{display:block}}.meta{{text-align:left;margin-top:7px}}.metrics,.grid{{grid-template-columns:1fr}}}}@media print{{body{{background:#fff;color:#11213b}}.panel,.kpi,.chart{{background:#fff;border-color:#9aa8ba}}.tabs{{display:none}}}}
+*{{box-sizing:border-box}}html,body{{min-height:100%}}body{{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI",Arial,sans-serif}}main{{width:100%;min-height:100vh;margin:0;padding:clamp(16px,1.5vw,28px)}}header{{display:flex;justify-content:space-between;align-items:center;gap:18px;border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:14px}}.logo{{width:min(300px,58vw);height:auto;display:block}}h1{{font-size:22px;margin:0}}h2{{font-size:17px;margin:0}}h3{{font-size:13px;margin:0}}p{{margin:0;color:var(--muted)}}.meta{{color:var(--muted);font-size:12px;text-align:right}}.tabs{{display:flex;gap:5px;border-bottom:1px solid var(--border);margin-bottom:14px}}button{{font:700 12px inherit;color:var(--muted);background:transparent;border:1px solid transparent;padding:9px 14px;border-radius:8px 8px 0 0;cursor:pointer}}button[aria-selected=true]{{color:var(--text);background:var(--surface);border-color:var(--border)}}button:focus-visible,svg circle:focus-visible{{outline:3px solid var(--amber);outline-offset:3px}}.panel,.kpi,.chart{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px}}.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px}}.kpi b{{display:block;font-size:22px;color:var(--accent);margin-top:4px}}.kpi span,.label{{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}.chart-head{{display:flex;justify-content:space-between;gap:8px;margin-bottom:10px}}.bar-row{{display:grid;grid-template-columns:150px 1fr 100px;align-items:center;gap:8px;margin:9px 0;font-size:12px}}.bar-track{{height:12px;background:var(--surface2);border-radius:8px;overflow:hidden}}.bar-track i{{display:block;height:100%;background:var(--accent);border-radius:8px}}.overview-list{{padding:14px}}.overview-list h2{{margin-bottom:3px}}.overview-list > p{{margin-bottom:10px}}.overview-list .portfolio-row{{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);font-size:12px}}.overview-list .portfolio-row small{{display:block;color:var(--muted)}}.overview-list .portfolio-bar{{height:8px;background:var(--surface2);border-radius:8px;overflow:hidden}}.overview-list .portfolio-bar span{{display:block;height:100%;background:var(--accent)}}.overview-list .portfolio-value{{text-align:right}}.overview-list ol{{margin:0;padding-left:20px}}.overview-list li{{padding:5px 0;color:var(--muted)}}svg{{width:100%;height:auto;background:var(--surface2);border-radius:8px}}.axis{{stroke:var(--border);stroke-width:1}}svg text{{fill:var(--muted);font-size:11px}}svg circle{{fill:var(--green);stroke:var(--text);stroke-width:1}}table{{width:100%;border-collapse:collapse;font-size:13px;display:block;overflow-x:auto}}caption{{text-align:left;color:var(--muted);padding:0 0 6px}}th,td{{padding:7px;border-bottom:1px solid var(--border);white-space:nowrap;text-align:right}}th:first-child,td:first-child{{text-align:left}}thead th{{color:var(--muted);font-size:11px;text-transform:uppercase}}.table-panel{{margin-bottom:12px}}.scenario-list{{margin:0;padding-left:20px}}.scenario-list li{{padding:6px 0;border-bottom:1px solid var(--border)}}.scenario-list small{{display:block;color:var(--muted)}}.fallback{{padding:24px;text-align:center}}@media(max-width:900px){{.metrics,.grid{{grid-template-columns:1fr 1fr}}.bar-row{{grid-template-columns:110px 1fr 90px}}}}@media(max-width:600px){{main{{padding:14px}}header{{display:block}}.meta{{text-align:left;margin-top:7px}}.metrics,.grid{{grid-template-columns:1fr}}}}@media print{{body{{background:#fff;color:#11213b}}.panel,.kpi,.chart{{background:#fff;border-color:#9aa8ba}}.tabs{{display:none}}}}
 </style></head><body><main>
 <header><div><img class="logo" src="{_logo_data_uri()}" alt="TokenLens for Azure logo"></div>
 <div class="meta">Attempted tasks <strong>{report.total_attempted_tasks:,}</strong><br>Cost coverage <strong>{report.pricing.coverage_percent:.1f}%</strong></div></header>

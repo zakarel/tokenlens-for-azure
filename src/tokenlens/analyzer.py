@@ -62,10 +62,16 @@ def _cost_summary(
         for record in records
     ]
     resolved = [item for item in resolutions if item.resolved and item.cost_usd is not None]
+    unresolved = [item for item in resolutions if not (item.resolved and item.cost_usd is not None)]
     resolved_tokens = sum(
         record.usage.input_tokens + record.usage.output_tokens
         for record, resolution in zip(records, resolutions)
         if resolution.resolved
+    )
+    unresolved_tokens = sum(
+        record.usage.input_tokens + record.usage.output_tokens
+        for record, resolution in zip(records, resolutions)
+        if not resolution.resolved
     )
     total_tokens = sum(record.usage.input_tokens + record.usage.output_tokens for record in records)
     all_components = bool(resolved) and all(
@@ -77,6 +83,11 @@ def _cost_summary(
     sources = {item.source for item in resolved}
     catalogs = {item.catalog_name for item in resolved if item.catalog_name}
     effective_dates = {item.effective_from.isoformat() for item in resolved if item.effective_from}
+    billing_bases = {item.billing_basis for item in resolved if item.billing_basis}
+    publishers = {item.publisher for item in resolved if item.publisher}
+    confidences = {item.confidence for item in resolved if item.confidence}
+    unresolved_reasons = sorted({item.unresolved_reason for item in unresolved if item.unresolved_reason})
+    suggested_override_keys = sorted({item.suggested_override_key for item in unresolved if item.suggested_override_key})
     return {
         "estimated_cost_usd": sum(item.cost_usd or 0 for item in resolved) if resolved else None,
         "fresh_input_cost_usd": (
@@ -105,6 +116,13 @@ def _cost_summary(
         "input_price_per_million": _common_value(resolved, "input_per_million"),
         "cached_input_price_per_million": _common_value(resolved, "cached_input_per_million"),
         "output_price_per_million": _common_value(resolved, "output_per_million"),
+        "pricing_billing_basis": billing_bases.pop() if len(billing_bases) == 1 else "mixed" if billing_bases else None,
+        "pricing_publisher": publishers.pop() if len(publishers) == 1 else "mixed" if publishers else None,
+        "pricing_confidence": confidences.pop() if len(confidences) == 1 else "mixed" if confidences else None,
+        "unresolved_requests": len(unresolved),
+        "unresolved_tokens": unresolved_tokens,
+        "unresolved_reasons": unresolved_reasons,
+        "suggested_override_keys": suggested_override_keys,
     }
 
 
@@ -224,9 +242,20 @@ def _summary(
                 "pricing_coverage_tokens_percent",
                 "pricing_complete",
                 "pricing_currency",
+                "pricing_source",
+                "pricing_billing_basis",
+                "pricing_publisher",
+                "pricing_confidence",
+                "unresolved_requests",
+                "unresolved_tokens",
+                "unresolved_reasons",
+                "suggested_override_keys",
             )
         }
     )
+    service_tiers = {record.service_tier for record in records}
+    common["service_tier"] = service_tiers.pop() if len(service_tiers) == 1 else "mixed"
+    common["pricing_source"] = str(common["pricing_source"])
     if deployment_name is None:
         return AnalysisSummary(**common)
     request_total = total_requests or 0
@@ -242,7 +271,6 @@ def _summary(
         project_name=project_name,
         request_share_percent=round(len(records) / max(1, request_total) * 100, 1),
         token_share_percent=round((input_tokens + output_tokens) / max(1, token_total) * 100, 1),
-        pricing_source=str(pricing["pricing_source"]),
         pricing_catalog_name=pricing["pricing_catalog_name"],
         pricing_effective_from=pricing["pricing_effective_from"],
         input_price_per_million=pricing["input_price_per_million"],
@@ -374,7 +402,18 @@ def analyze(
             },
         },
     )
-    report.ptu_analysis = analyze_ptu(records, deployments)
+    # The PTU dashboard's daily cost must agree with Cost analysis exactly, so
+    # it reuses the same resolver rather than recomputing any rate.
+    def _ptu_cost_resolver(record: TraceRecord) -> PricingResolution:
+        return resolve_trace_cost(
+            record,
+            when=_parse_when(record.timestamp) if record.timestamp else pricing_when,
+            customer_catalog=customer_catalog,
+            reference_catalog=reference_catalog,
+            required_currency=pricing_currency,
+        )
+
+    report.ptu_analysis = analyze_ptu(records, deployments, cost_resolver=_ptu_cost_resolver)
     return report
 
 

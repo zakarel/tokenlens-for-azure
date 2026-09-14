@@ -1,0 +1,88 @@
+# Example customer pricing catalog for models TokenLens cannot resolve from
+# the bundled reference catalog. TokenLens never guesses a rate from a
+# related model or family, so any deployment routed to a model without an
+# authoritative published rate (or a not-yet-public model) stays
+# "Pricing unavailable" until you supply one of these entries yourself.
+#
+# Every entry below is commented out on purpose: this file is a *template*,
+# not verified pricing. As shipped it loads as an empty catalog (`prices: []`)
+# so pointing `.tokenlens.yml` at an unedited copy never silently invents a
+# $0.00 cost. Uncomment and fill in only the models you have a confirmed rate
+# for, then reference your copy from `.tokenlens.yml`:
+#
+#   pricing:
+#     customer_catalog: <paste this catalog's contents, or load it yourself
+#                         and pass PricingCatalog.model_validate(...) via the
+#                         Python API>
+#
+# Run `tokenlens-azure pricing-audit INPUT` against your trace first: it
+# lists every unresolved model, its suggested override key, and why it did
+# not resolve, without ever touching prompt/response content.
+#
+# billing_basis documents *how* a rate should be read, since not every
+# deployment is billed the same way:
+#   token_rate                     - a standard Azure per-token meter.
+#   claude_ccu_equivalent          - Anthropic/Claude models on Foundry are
+#                                     invoiced in Claude Consumption Units
+#                                     (CCU), not raw Azure tokens. The
+#                                     input/output numbers here must be
+#                                     TokenLens's dollar-equivalent-per-token
+#                                     *estimate* derived from your published
+#                                     CCU rate; they are not an Azure token
+#                                     meter and TokenLens labels them as an
+#                                     estimate wherever they are shown.
+#   marketplace_partner_token_rate  - a partner (non-Microsoft) model billed
+#                                     through Azure Marketplace at its own
+#                                     published per-token rate.
+#   observed_cost                   - not used here; reserved for traces that
+#                                     already carry `observed_cost_usd`.
+currency: USD
+catalog_name: customer-overrides-example
+source_url: null
+retrieved_at: 2026-09-14
+pricing_basis: analysis_date_snapshot
+prices: []
+# Uncomment and complete one block per model once you have a citable rate.
+# Every field below must be exact: TokenLens matches provider, canonical
+# model (aliases included), service tier, and deployment mode; it never
+# falls back to a similar model.
+#
+# - provider: azure_foundry
+#   publisher: microsoft
+#   model: gpt-5.6-luna-2026-07-09
+#   service_tier: standard
+#   region: global          # "global" or "regional" deployment mode
+#   effective_from: 2026-09-14
+#   billing_basis: token_rate
+#   confidence: customer_override
+#   source_url: https://azure.microsoft.com/en-us/pricing/details/ai-foundry-models/microsoft/
+#   note: "Confirmed Foundry per-token rate for gpt-5.6-luna-2026-07-09."
+#   input_per_million: 0.0        # REPLACE with your confirmed rate
+#   cached_input_per_million: 0.0 # optional; omit if not offered
+#   output_per_million: 0.0       # REPLACE with your confirmed rate
+#
+# - provider: azure_foundry
+#   publisher: anthropic
+#   model: claude-opus-5
+#   service_tier: standard
+#   region: global
+#   effective_from: 2026-09-14
+#   billing_basis: claude_ccu_equivalent
+#   confidence: customer_override
+#   source_url: https://azure.microsoft.com/en-us/pricing/details/ai-foundry-models/anthropic/
+#   note: "Dollar-equivalent estimate converted from the published Claude Consumption Unit (CCU) rate; not an Azure token meter."
+#   input_per_million: 0.0        # REPLACE with your CCU-derived estimate
+#   output_per_million: 0.0       # REPLACE with your CCU-derived estimate
+#
+# - provider: azure_foundry
+#   publisher: mistral
+#   model: ministral-3b-2410
+#   service_tier: standard
+#   region: global
+#   effective_from: 2026-09-14
+#   billing_basis: marketplace_partner_token_rate
+#   confidence: customer_override
+#   source_url: https://azure.microsoft.com/en-us/pricing/details/ai-foundry-models/mistral-ai/
+#   note: "Azure Marketplace / Mistral partner offer rate for Ministral 3B."
+#   input_per_million: 0.0        # REPLACE with your Marketplace offer rate
+#   output_per_million: 0.0       # REPLACE with your Marketplace offer rate

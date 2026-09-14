@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .economics import TaskEconomicsReport
+from .models import AnalysisReport
 
 
 def timestamp_slug(now: datetime | None = None) -> str:
@@ -78,4 +79,57 @@ def economics_text(report: TaskEconomicsReport) -> str:
                 f"- {strategy.task_type} · {strategy.execution_strategy} {strategy.strategy_version} · "
                 f"{strategy.closed_tasks:,} closed · {strategy.eventual_success_rate if strategy.eventual_success_rate is not None else 'n/a'}% success · {cost}"
             )
+    return "\n".join(lines) + "\n"
+
+
+def pricing_audit_text(report: AnalysisReport) -> str:
+    """Render a non-networking pricing coverage audit.
+
+    Reports only model/mode/coverage/provenance facts; it never prints
+    endpoints, resource IDs, tenant values, request IDs, or prompt/response
+    content.
+    """
+    from .presentation import model_rollups
+
+    summary = report.summary
+    lines = [
+        "TokenLens for Azure · Pricing audit",
+        "─" * 68,
+        (
+            f"{summary.requests_analyzed:,} requests · {summary.total_tokens:,} tokens · "
+            f"{len(model_rollups(report)):,} unique model/mode combinations"
+        ),
+        (
+            f"Coverage: {summary.pricing_coverage_requests_percent:.1f}% of requests · "
+            f"{summary.pricing_coverage_tokens_percent:.1f}% of tokens priced"
+        ),
+        "",
+    ]
+    for item in model_rollups(report):
+        lines.append(f"model={item.model_name} mode={item.deployment_mode} tier={item.service_tier}")
+        lines.append(
+            f"  requests={item.requests:,} tokens={item.total_tokens:,} "
+            f"coverage={item.pricing_coverage_requests_percent:.1f}%"
+        )
+        if item.estimated_cost_usd is not None:
+            catalog = "customer" if item.pricing_source == "customer" else (
+                "reference" if item.pricing_source == "reference" else item.pricing_source
+            )
+            lines.append(
+                f"  selected-catalog={catalog} billing-basis={item.pricing_billing_basis or 'unknown'} "
+                f"publisher={item.pricing_publisher or 'unknown'}"
+            )
+        if item.unresolved_requests:
+            reasons = ", ".join(item.unresolved_reasons) or "no-exact-model-mode-price"
+            overrides = ", ".join(item.suggested_override_keys) or item.canonical_model_key
+            lines.append(
+                f"  unresolved: {item.unresolved_requests:,} requests / {item.unresolved_tokens:,} tokens "
+                f"· reason={reasons}"
+            )
+            lines.append(f"  suggested-override-key: {overrides}")
+        lines.append("")
+    lines.append(
+        "Add a customer_catalog entry (see examples/customer-pricing-overrides-example.yml) "
+        "for any model listed as unresolved above."
+    )
     return "\n".join(lines) + "\n"

@@ -82,8 +82,12 @@ def test_html_report_embeds_logo():
     header = rendered.split("<header>", 1)[1].split("</header>", 1)[0]
     assert "<h1>" not in header
     assert "Token efficiency assessment" not in header
-    assert "confidence" not in rendered.lower()
-    assert "Data quality" not in rendered
+    # Internal rule confidence and evaluation jargon must stay out of the
+    # executive views. The PTU Advisor tab has its own documented evidence
+    # confidence score, so it is scoped out of this assertion.
+    executive_views = rendered.split("<body>", 1)[1].split('<section class="tab-panel ptu"', 1)[0]
+    assert "confidence" not in executive_views.lower()
+    assert "Data quality" not in executive_views
     assert "tokenlens-for-azure · created by Tzahi Ariel" in rendered
 
 
