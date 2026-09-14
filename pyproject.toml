@@ -21,6 +21,15 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 foundry = ["openai>=1.40", "azure-identity>=1.17"]
+foundry-claude = ["anthropic>=0.40", "azure-identity>=1.17"]
+otel = ["opentelemetry-sdk>=1.27", "opentelemetry-semantic-conventions>=0.48b0"]
+foundry-monitor = [
+  "azure-identity>=1.17",
+  "azure-monitor-querymetrics>=1.0.0b1",
+  "azure-monitor-query>=1.2",
+  "azure-mgmt-cognitiveservices>=13.5",
+  "azure-mgmt-monitor>=6.0",
+]
 
 [project.scripts]
 tokenlens-azure = "tokenlens.cli:app"

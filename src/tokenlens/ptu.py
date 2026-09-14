@@ -8,15 +8,19 @@ revision eb0558cd4c6d3794be76d9caa2e87129d1f8221c.
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from math import ceil, sqrt
 from statistics import mean, pstdev
-from typing import Literal
+from typing import Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .models import DeploymentAnalysis, TraceRecord
-from .pricing import canonical_model_name
+from .pricing import PricingResolution, canonical_model_name, infer_publisher
+
+#: Resolves one analysis event to the same pricing decision the cost engine
+#: used. The PTU dashboard never recomputes rates of its own.
+CostResolver = Callable[[TraceRecord], PricingResolution]
 
 
 class PtuDimension(BaseModel):
@@ -28,6 +32,186 @@ class PtuDimension(BaseModel):
     metric: str
 
 
+EligibilityStatus = Literal[
+    "eligible_sufficient_evidence",
+    "eligible_insufficient_evidence",
+    "model_capacity_unavailable",
+    "ptu_not_applicable",
+    "pricing_unavailable",
+    "deployment_mode_unavailable",
+]
+
+ELIGIBILITY_STATUS_LABELS: dict[str, str] = {
+    "eligible_sufficient_evidence": "Eligible and sufficient evidence",
+    "eligible_insufficient_evidence": "Eligible but insufficient evidence",
+    "model_capacity_unavailable": "Model capacity unavailable",
+    "ptu_not_applicable": "PTU not applicable",
+    "pricing_unavailable": "Pricing unavailable",
+    "deployment_mode_unavailable": "Deployment mode unavailable",
+}
+
+MINIMUM_ACTIVE_BUCKETS = 100
+
+
+class PtuThroughputPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    bucket_index: int
+    minutes_from_start: int
+    tpm: float
+
+
+class PtuThroughputSeries(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    bucket_minutes: int
+    points: list[PtuThroughputPoint] = Field(default_factory=list)
+    average_tpm: float = Field(ge=0)
+    reference_tpm: float = Field(ge=0)
+    reference_label: str = "P95"
+    ptu_capacity_tpm: float | None = Field(default=None, ge=0)
+
+
+class PtuCostCurve(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sustained_tpm: list[float] = Field(default_factory=list)
+    payg_monthly: list[float] = Field(default_factory=list)
+    hybrid_monthly: list[float] = Field(default_factory=list)
+    lower_break_even_tpm: float | None = Field(default=None, ge=0)
+    upper_break_even_tpm: float | None = Field(default=None, ge=0)
+    selected_ptu: int = Field(ge=0)
+    ptu_capacity_tpm: float = Field(ge=0)
+    observed_average_tpm: float = Field(ge=0)
+    payg_at_observed_average: float | None = Field(default=None, ge=0)
+    hybrid_at_observed_average: float | None = Field(default=None, ge=0)
+
+
+DashboardState = Literal[
+    "ptu_recommended",
+    "borderline",
+    "payg_recommended",
+    "insufficient_evidence",
+    "pricing_unavailable",
+    "ptu_not_applicable",
+    "capacity_unavailable",
+]
+
+DASHBOARD_STATE_LABELS: dict[str, str] = {
+    "ptu_recommended": "PTU Recommended",
+    "borderline": "Borderline — validate before committing",
+    "payg_recommended": "PAYG Recommended",
+    "insufficient_evidence": "Insufficient Evidence",
+    "pricing_unavailable": "Pricing Required",
+    "ptu_not_applicable": "PTU Not Applicable",
+    "capacity_unavailable": "Capacity Data Required",
+}
+
+#: States where a classification was actually produced. Confidence describes
+#: confidence in that classification, so it is withheld everywhere else.
+STATES_WITH_CONFIDENCE = frozenset({"ptu_recommended", "borderline", "payg_recommended"})
+
+
+class PtuEvidencePoint(BaseModel):
+    """One observed time bucket. ``None`` means the source did not report it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    timestamp: datetime
+    input_tokens: int | None = Field(default=None, ge=0)
+    cached_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    successful_requests: int | None = Field(default=None, ge=0)
+    rate_limited_requests: int | None = Field(default=None, ge=0)
+    failed_requests: int | None = Field(default=None, ge=0)
+    total_requests: int | None = Field(default=None, ge=0)
+
+
+class PtuDailyCostPoint(BaseModel):
+    """One observed day of cost, produced by the shared pricing engine."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    date: date
+    input_cost: float | None = Field(default=None, ge=0)
+    cached_input_cost: float | None = Field(default=None, ge=0)
+    output_cost: float | None = Field(default=None, ge=0)
+    total_cost: float | None = Field(default=None, ge=0)
+    pricing_coverage_tokens_percent: float = Field(default=0, ge=0, le=100)
+    total_tokens: int = Field(default=0, ge=0)
+    unpriced_tokens: int = Field(default=0, ge=0)
+    partial_day: bool = False
+
+
+class PtuDashboardSummary(BaseModel):
+    """Decision header and At-a-Glance metrics for one selected deployment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deployment_name: str
+    model_name: str
+    deployment_mode: str
+    state: DashboardState
+    state_label: str
+    recommendation: str
+    confidence_percent: float | None = Field(default=None, ge=0, le=100)
+    confidence_label: str | None = None
+    summary: str
+    average_weighted_tpm: float | None = Field(default=None, ge=0)
+    p95_weighted_tpm: float | None = Field(default=None, ge=0)
+    weighted_basis: str
+    total_input_tokens: int | None = Field(default=None, ge=0)
+    total_cached_tokens: int | None = Field(default=None, ge=0)
+    total_output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    daily_average_tokens: float | None = Field(default=None, ge=0)
+    rate_limited_requests: int | None = Field(default=None, ge=0)
+    rate_limit_percent: float | None = Field(default=None, ge=0, le=100)
+    total_requests: int | None = Field(default=None, ge=0)
+    observed_days: float = Field(ge=0)
+    complete_days: int = Field(default=0, ge=0)
+    partial_days: int = Field(default=0, ge=0)
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    active_buckets: int = Field(default=0, ge=0)
+    elapsed_buckets: int = Field(default=0, ge=0)
+    pricing_coverage_tokens_percent: float = Field(default=0, ge=0, le=100)
+    pricing_currency: str = "USD"
+    total_cost: float | None = Field(default=None, ge=0)
+    average_daily_cost: float | None = Field(default=None, ge=0)
+    data_quality: str
+    smoke_test_window: bool = False
+
+
+class PtuConfidenceComponent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    weight: float = Field(ge=0, le=1)
+    score: float = Field(ge=0, le=1)
+    detail: str
+
+
+class PtuDashboardData(BaseModel):
+    """The only payload the PTU report renderer consumes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: PtuDashboardSummary
+    evidence: list[PtuEvidencePoint] = Field(default_factory=list)
+    daily_cost: list[PtuDailyCostPoint] = Field(default_factory=list)
+    throughput: PtuThroughputSeries | None = None
+    cost_curve: PtuCostCurve | None = None
+    confidence_components: list[PtuConfidenceComponent] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    missing_metrics: list[str] = Field(default_factory=list)
+    recommendation_reasons: list[str] = Field(default_factory=list)
+    what_would_change: list[str] = Field(default_factory=list)
+    next_steps: list[str] = Field(default_factory=list)
+    data_quality_notes: list[str] = Field(default_factory=list)
+
+
 class PtuDeploymentAssessment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -35,12 +219,14 @@ class PtuDeploymentAssessment(BaseModel):
     model_name: str
     deployment_mode: str
     eligible: bool
+    eligibility_status: EligibilityStatus = "model_capacity_unavailable"
     recommendation: Literal[
         "PTU recommended",
         "Borderline",
         "PAYG recommended",
         "Insufficient evidence",
         "Model not supported",
+        "PTU not applicable",
     ]
     economic_result: Literal["PTU lower", "PAYG lower", "Unavailable"]
     data_points: int = Field(ge=0)
@@ -61,6 +247,9 @@ class PtuDeploymentAssessment(BaseModel):
     break_even_tpm: float | None = Field(default=None, ge=0)
     spillover_percent: float | None = Field(default=None, ge=0, le=100)
     dimensions: list[PtuDimension] = Field(default_factory=list)
+    throughput_series: PtuThroughputSeries | None = None
+    cost_curve: PtuCostCurve | None = None
+    dashboard: PtuDashboardData | None = None
     note: str
 
 
@@ -238,8 +427,10 @@ def _dimensions(
     }
 
 
-def _recommendation(dimensions: list[PtuDimension], eligible: bool) -> str:
+def _recommendation(dimensions: list[PtuDimension], eligible: bool, publisher: str | None) -> str:
     if not eligible:
+        if publisher and publisher != "microsoft":
+            return "PTU not applicable"
         return "Model not supported"
     if sum(item.verdict == "insufficient" for item in dimensions) >= 2:
         return "Insufficient evidence"
@@ -251,13 +442,706 @@ def _recommendation(dimensions: list[PtuDimension], eligible: bool) -> str:
     return "PAYG recommended"
 
 
-def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis) -> PtuDeploymentAssessment:
+def _throughput_series(tpm: list[float], *, bucket_minutes: int, ptu_capacity_tpm: float | None) -> PtuThroughputSeries:
+    return PtuThroughputSeries(
+        bucket_minutes=bucket_minutes,
+        points=[
+            PtuThroughputPoint(bucket_index=index, minutes_from_start=index * bucket_minutes, tpm=round(value, 2))
+            for index, value in enumerate(tpm)
+        ],
+        average_tpm=round(mean(tpm), 2) if tpm else 0.0,
+        reference_tpm=round(_percentile(tpm, 95), 2) if tpm else 0.0,
+        ptu_capacity_tpm=ptu_capacity_tpm,
+    )
+
+
+def _cost_curve(
+    *,
+    weighted_tpm: list[float],
+    average_tpm: float,
+    selected_ptu: int,
+    capacity_tpm: float,
+    reserved_monthly: float,
+    blended_rate: float,
+    payg_monthly_usd: float,
+    hybrid_monthly_usd: float,
+) -> PtuCostCurve:
+    """Build deterministic curve points from the exact functions the engine used to pick the baseline.
+
+    Both lines are the idealized "sustained constant TPM for a month" model
+    the engine already uses for ``payg_monthly_usd``/``hybrid_monthly_usd``
+    (mean(tpm) * 43_200 / 1_000_000 * blended_rate, and reserved cost plus
+    overflow at the same blended rate). The "current" markers use the
+    engine's own scalars rather than re-deriving them from the line, so they
+    always agree exactly with the rest of the report even though the real
+    observed distribution is peakier than a constant-TPM line.
+    """
+    rate_per_tpm_month = 43_200 / 1_000_000 * blended_rate
+    peak = max(weighted_tpm, default=0.0)
+    max_x = max(peak, capacity_tpm, average_tpm, 1.0) * 1.2
+    steps = 60
+    sustained = [max_x * index / steps for index in range(steps + 1)]
+    payg_line = [value * rate_per_tpm_month for value in sustained]
+    hybrid_line = [reserved_monthly + max(0.0, value - capacity_tpm) * rate_per_tpm_month for value in sustained]
+    diff = [hybrid_value - payg_value for hybrid_value, payg_value in zip(hybrid_line, payg_line)]
+    crossings: list[float] = []
+    for index in range(1, len(diff)):
+        previous, current = diff[index - 1], diff[index]
+        if previous == 0:
+            crossings.append(sustained[index - 1])
+        elif (previous < 0) != (current < 0):
+            fraction = abs(previous) / (abs(previous) + abs(current))
+            crossings.append(sustained[index - 1] + fraction * (sustained[index] - sustained[index - 1]))
+    lower_break_even = round(crossings[0], 2) if crossings else None
+    upper_break_even = round(crossings[-1], 2) if len(crossings) > 1 else None
+    return PtuCostCurve(
+        sustained_tpm=[round(value, 2) for value in sustained],
+        payg_monthly=[round(value, 4) for value in payg_line],
+        hybrid_monthly=[round(value, 4) for value in hybrid_line],
+        lower_break_even_tpm=lower_break_even,
+        upper_break_even_tpm=upper_break_even,
+        selected_ptu=selected_ptu,
+        ptu_capacity_tpm=capacity_tpm,
+        observed_average_tpm=round(average_tpm, 2),
+        payg_at_observed_average=round(payg_monthly_usd, 4),
+        hybrid_at_observed_average=round(hybrid_monthly_usd, 4),
+    )
+
+
+BUCKET_MINUTES = 5
+
+
+def _aggregate_metrics(record: TraceRecord) -> dict[str, object] | None:
+    """Return collector-provided aggregate metrics, when the record is a bucket."""
+    metadata = record.metadata or {}
+    if metadata.get("record_type") != "foundry_metric_bucket":
+        return None
+    metrics = metadata.get("metrics")
+    return metrics if isinstance(metrics, dict) else {}
+
+
+def _bucket_key(stamp: datetime, bucket_minutes: int = BUCKET_MINUTES) -> datetime:
+    seconds = bucket_minutes * 60
+    return datetime.fromtimestamp(int(stamp.timestamp()) // seconds * seconds, tz=UTC)
+
+
+class _BucketAggregate:
+    __slots__ = (
+        "input_tokens",
+        "cached_tokens",
+        "output_tokens",
+        "successful",
+        "rate_limited",
+        "failed",
+        "requests",
+        "cached_known",
+        "outcome_known",
+        "requests_known",
+    )
+
+    def __init__(self) -> None:
+        self.input_tokens = 0
+        self.cached_tokens = 0
+        self.output_tokens = 0
+        self.successful = 0
+        self.rate_limited = 0
+        self.failed = 0
+        self.requests = 0
+        self.cached_known = False
+        self.outcome_known = False
+        self.requests_known = False
+
+
+def _evidence_table(records: list[TraceRecord]) -> tuple[dict[datetime, _BucketAggregate], set[str]]:
+    """Aggregate request or bucket telemetry into aligned five-minute buckets.
+
+    Missing metrics are reported explicitly instead of being zero-filled: a
+    source that never reported request outcomes is not evidence that no request
+    ever failed.
+    """
+    table: dict[datetime, _BucketAggregate] = {}
+    missing: set[str] = set()
+    for record in records:
+        stamp = _timestamp(record.timestamp)
+        if stamp is None:
+            missing.add("timestamp")
+            continue
+        bucket = table.setdefault(_bucket_key(stamp), _BucketAggregate())
+        metrics = _aggregate_metrics(record)
+        if metrics is not None:
+            bucket.input_tokens += int(metrics.get("input_tokens") or 0)
+            bucket.output_tokens += int(metrics.get("output_tokens") or 0)
+            if metrics.get("cached_tokens") is not None:
+                bucket.cached_tokens += int(metrics["cached_tokens"])
+                bucket.cached_known = True
+            else:
+                missing.add("cached_tokens")
+            requests = metrics.get("requests")
+            successful = metrics.get("successful_requests")
+            throttled = metrics.get("throttled_requests")
+            failed = metrics.get("failed_requests")
+            if requests is not None:
+                bucket.requests += int(requests)
+                bucket.requests_known = True
+            else:
+                missing.add("request_totals")
+            if successful is None and throttled is None:
+                missing.add("request_outcomes")
+            else:
+                bucket.outcome_known = True
+                bucket.successful += int(successful or 0)
+                bucket.rate_limited += int(throttled or 0)
+                if failed is not None:
+                    bucket.failed += int(failed)
+                elif successful is not None and throttled is not None and requests is not None:
+                    bucket.failed += max(0, int(requests) - int(successful) - int(throttled))
+                else:
+                    missing.add("failed_requests")
+            continue
+        bucket.input_tokens += record.usage.input_tokens
+        bucket.output_tokens += record.usage.output_tokens
+        bucket.cached_tokens += record.usage.cached_tokens
+        # Request-level telemetry always knows its own cached count, including
+        # a genuine zero.
+        bucket.cached_known = True
+        bucket.requests += 1
+        bucket.requests_known = True
+        status = record.status_code
+        if status is None:
+            missing.add("request_outcomes")
+            continue
+        bucket.outcome_known = True
+        if status == 429:
+            bucket.rate_limited += 1
+        elif 200 <= status < 400:
+            bucket.successful += 1
+        else:
+            bucket.failed += 1
+    return table, missing
+
+
+def _confidence(
+    *,
+    active_buckets: int,
+    elapsed_buckets: int,
+    observed_days: float,
+    outcome_coverage: float,
+    latency_coverage: float,
+    pricing_coverage: float,
+    capacity_known: bool,
+    mode_known: bool,
+) -> tuple[float, list[PtuConfidenceComponent]]:
+    """Score confidence in the *evidence*, never in how favourable PTU looks.
+
+    The formula is a fixed weighted sum of eight bounded components. Continuity
+    uses active over elapsed buckets, so a window padded with silent buckets can
+    never earn confidence it did not observe.
+    """
+    components = [
+        PtuConfidenceComponent(
+            name="Active five-minute buckets",
+            weight=0.30,
+            score=min(1.0, active_buckets / MINIMUM_ACTIVE_BUCKETS),
+            detail=f"{active_buckets:,} of {MINIMUM_ACTIVE_BUCKETS} required active buckets",
+        ),
+        PtuConfidenceComponent(
+            name="Lookback duration",
+            weight=0.20,
+            score=min(1.0, observed_days / 7),
+            detail=f"{observed_days:.2f} of 7 reference days observed",
+        ),
+        PtuConfidenceComponent(
+            name="Bucket continuity",
+            weight=0.15,
+            score=min(1.0, active_buckets / elapsed_buckets) if elapsed_buckets else 0.0,
+            detail=f"{active_buckets:,} active of {elapsed_buckets:,} elapsed buckets",
+        ),
+        PtuConfidenceComponent(
+            name="Request-outcome coverage",
+            weight=0.10,
+            score=max(0.0, min(1.0, outcome_coverage)),
+            detail=f"{outcome_coverage * 100:.1f}% of buckets report outcomes",
+        ),
+        PtuConfidenceComponent(
+            name="Latency coverage",
+            weight=0.10,
+            score=max(0.0, min(1.0, latency_coverage)),
+            detail=f"{latency_coverage * 100:.1f}% of events report latency",
+        ),
+        PtuConfidenceComponent(
+            name="Pricing coverage",
+            weight=0.10,
+            score=max(0.0, min(1.0, pricing_coverage)),
+            detail=f"{pricing_coverage * 100:.1f}% of tokens priced exactly",
+        ),
+        PtuConfidenceComponent(
+            name="Model capacity",
+            weight=0.03,
+            score=1.0 if capacity_known else 0.0,
+            detail="Exact PTU capacity available" if capacity_known else "PTU capacity unavailable",
+        ),
+        PtuConfidenceComponent(
+            name="Deployment mode",
+            weight=0.02,
+            score=1.0 if mode_known else 0.0,
+            detail="Global or Regional confirmed" if mode_known else "Deployment mode unknown",
+        ),
+    ]
+    total = sum(item.weight * item.score for item in components)
+    return round(total * 100, 1), components
+
+
+def _confidence_label(value: float) -> str:
+    if value >= 90:
+        return "High confidence"
+    if value >= 70:
+        return "Moderate confidence"
+    if value >= 50:
+        return "Low confidence"
+    return "Insufficient evidence"
+
+
+def _dashboard_state(
+    *,
+    eligibility_status: EligibilityStatus,
+    recommendation: str,
+    publisher: str | None,
+) -> DashboardState:
+    if eligibility_status == "ptu_not_applicable":
+        return "ptu_not_applicable"
+    if eligibility_status == "model_capacity_unavailable":
+        return "capacity_unavailable"
+    if eligibility_status == "pricing_unavailable":
+        return "pricing_unavailable"
+    if eligibility_status in {"eligible_insufficient_evidence", "deployment_mode_unavailable"}:
+        return "insufficient_evidence"
+    if recommendation == "PTU recommended":
+        return "ptu_recommended"
+    if recommendation == "Borderline":
+        return "borderline"
+    if recommendation == "PAYG recommended":
+        return "payg_recommended"
+    return "insufficient_evidence"
+
+
+_STATE_SUMMARIES: dict[str, str] = {
+    "ptu_recommended": "Observed throughput, capacity pressure, and modeled economics all support committing to dedicated capacity.",
+    "borderline": "PTU and PAYG are currently close. Validate with additional data before committing.",
+    "payg_recommended": "Pay-as-you-go remains the safer or cheaper strategy for the observed demand.",
+    "insufficient_evidence": "The observed window cannot support a PTU recommendation yet.",
+    "pricing_unavailable": "Workload evidence exists, but exact PAYG pricing is required before the economics can be calculated.",
+    "ptu_not_applicable": "This model is billed through Foundry's partner/consumption offer; Azure PTU capacity purchasing does not apply.",
+    "capacity_unavailable": "Exact PTU capacity for this model and version is unavailable, so dedicated capacity cannot be sized.",
+}
+
+
+def _daily_cost(
+    records: list[TraceRecord],
+    cost_resolver: CostResolver | None,
+    *,
+    window_start: datetime | None,
+    window_end: datetime | None,
+) -> list[PtuDailyCostPoint]:
+    """Build daily cost points from the shared pricing engine's own resolutions."""
+    if cost_resolver is None:
+        return []
+    buckets: dict[date, dict[str, float | int | bool]] = {}
+    for record in records:
+        stamp = _timestamp(record.timestamp)
+        if stamp is None:
+            continue
+        day = stamp.date()
+        entry = buckets.setdefault(
+            day,
+            {"input": 0.0, "cached": 0.0, "output": 0.0, "total": 0.0, "tokens": 0, "priced_tokens": 0, "components": True, "priced": False},
+        )
+        tokens = record.usage.input_tokens + record.usage.output_tokens
+        entry["tokens"] = int(entry["tokens"]) + tokens
+        resolution = cost_resolver(record)
+        if not resolution.resolved or resolution.cost_usd is None:
+            continue
+        entry["priced"] = True
+        entry["priced_tokens"] = int(entry["priced_tokens"]) + tokens
+        entry["total"] = float(entry["total"]) + resolution.cost_usd
+        if (
+            resolution.fresh_input_cost_usd is None
+            or resolution.cached_input_cost_usd is None
+            or resolution.output_cost_usd is None
+        ):
+            entry["components"] = False
+            continue
+        entry["input"] = float(entry["input"]) + resolution.fresh_input_cost_usd
+        entry["cached"] = float(entry["cached"]) + resolution.cached_input_cost_usd
+        entry["output"] = float(entry["output"]) + resolution.output_cost_usd
+    points: list[PtuDailyCostPoint] = []
+    for day in sorted(buckets):
+        entry = buckets[day]
+        tokens = int(entry["tokens"])
+        priced_tokens = int(entry["priced_tokens"])
+        has_components = bool(entry["components"]) and bool(entry["priced"])
+        points.append(
+            PtuDailyCostPoint(
+                date=day,
+                input_cost=round(float(entry["input"]), 10) if has_components else None,
+                cached_input_cost=round(float(entry["cached"]), 10) if has_components else None,
+                output_cost=round(float(entry["output"]), 10) if has_components else None,
+                total_cost=round(float(entry["total"]), 10) if entry["priced"] else None,
+                pricing_coverage_tokens_percent=round(priced_tokens / max(1, tokens) * 100, 1),
+                total_tokens=tokens,
+                unpriced_tokens=max(0, tokens - priced_tokens),
+                partial_day=_is_partial_day(day, window_start, window_end),
+            )
+        )
+    return points
+
+
+def _is_partial_day(day: date, window_start: datetime | None, window_end: datetime | None) -> bool:
+    if window_start is None or window_end is None:
+        return True
+    day_start = datetime.combine(day, datetime.min.time(), tzinfo=UTC)
+    day_end = day_start + timedelta(days=1)
+    return window_start > day_start or window_end < day_end - timedelta(minutes=BUCKET_MINUTES)
+
+
+def _dashboard(
+    *,
+    records: list[TraceRecord],
+    deployment: DeploymentAnalysis,
+    capacity: _Capacity | None,
+    publisher: str | None,
+    eligibility_status: EligibilityStatus,
+    recommendation: str,
+    weighted_tpm: list[float],
+    observed_days: float,
+    active_buckets: int,
+    throughput_series: PtuThroughputSeries | None,
+    cost_curve: PtuCostCurve | None,
+    suggested_ptu: int | None,
+    payg_monthly_usd: float | None,
+    hybrid_monthly_usd: float | None,
+    spillover_percent: float | None,
+    dimensions: list[PtuDimension],
+    cost_resolver: CostResolver | None,
+) -> PtuDashboardData:
+    summary = deployment.summary
+    table, missing_metrics = _evidence_table(records)
+    ordered = sorted(table.items())
+    window_start = ordered[0][0] if ordered else None
+    window_end = ordered[-1][0] + timedelta(minutes=BUCKET_MINUTES) if ordered else None
+    cached_known = any(bucket.cached_known for _, bucket in ordered)
+    outcome_known = any(bucket.outcome_known for _, bucket in ordered)
+    evidence = [
+        PtuEvidencePoint(
+            timestamp=stamp,
+            input_tokens=bucket.input_tokens,
+            cached_tokens=bucket.cached_tokens if bucket.cached_known else None,
+            output_tokens=bucket.output_tokens,
+            total_tokens=bucket.input_tokens + bucket.output_tokens,
+            successful_requests=bucket.successful if bucket.outcome_known else None,
+            rate_limited_requests=bucket.rate_limited if bucket.outcome_known else None,
+            failed_requests=bucket.failed if bucket.outcome_known else None,
+            total_requests=bucket.requests if bucket.requests_known else None,
+        )
+        for stamp, bucket in ordered
+    ]
+
+    total_input = sum(record.usage.input_tokens for record in records)
+    total_output = sum(record.usage.output_tokens for record in records)
+    total_cached = sum(bucket.cached_tokens for _, bucket in ordered) if cached_known else None
+    total_tokens = total_input + total_output
+    requests_known = any(bucket.requests_known for _, bucket in ordered)
+    total_requests = sum(bucket.requests for _, bucket in ordered) if requests_known else None
+    rate_limited = sum(bucket.rate_limited for _, bucket in ordered) if outcome_known else None
+    # The 429 rate needs both a numerator and a denominator from the *same*
+    # buckets. A source that reported throttled counts without request totals
+    # gives a numerator with nothing to divide by, and a partial denominator
+    # would produce a rate above 100%. Either way the rate is withheld and the
+    # missing metric is named, rather than presenting an impossible percentage.
+    denominator = sum(
+        bucket.requests for _, bucket in ordered if bucket.outcome_known and bucket.requests_known
+    )
+    rate_limit_percent: float | None = None
+    if rate_limited is not None and denominator > 0 and rate_limited <= denominator:
+        rate_limit_percent = round(min(100.0, rate_limited / denominator * 100), 2)
+    elif rate_limited is not None:
+        missing_metrics.add("request_totals")
+
+    daily_totals: dict[date, int] = defaultdict(int)
+    for stamp, bucket in ordered:
+        daily_totals[stamp.date()] += bucket.input_tokens + bucket.output_tokens
+    partial_days = sum(_is_partial_day(day, window_start, window_end) for day in daily_totals)
+    complete_days = len(daily_totals) - partial_days
+    daily_average_tokens = round(sum(daily_totals.values()) / len(daily_totals), 1) if daily_totals else None
+
+    elapsed_buckets = len(weighted_tpm)
+    weighted_basis = (
+        f"input + output x {capacity.output_ratio}"
+        if capacity
+        else "input + output (model output weighting unavailable)"
+    )
+    average_weighted = round(mean(weighted_tpm), 2) if weighted_tpm else None
+    p95_weighted = round(_percentile(weighted_tpm, 95), 2) if weighted_tpm else None
+
+    latency_coverage = (
+        sum(record.latency_ms is not None for record in records) / len(records) if records else 0.0
+    )
+    outcome_coverage = (
+        sum(1 for _, bucket in ordered if bucket.outcome_known) / len(ordered) if ordered else 0.0
+    )
+    mode_known = summary.deployment_mode.casefold() in {"global", "regional"}
+    confidence_percent, confidence_components = _confidence(
+        active_buckets=active_buckets,
+        elapsed_buckets=elapsed_buckets,
+        observed_days=observed_days,
+        outcome_coverage=outcome_coverage,
+        latency_coverage=latency_coverage,
+        pricing_coverage=summary.pricing_coverage_tokens_percent / 100,
+        capacity_known=capacity is not None,
+        mode_known=mode_known,
+    )
+    state = _dashboard_state(
+        eligibility_status=eligibility_status,
+        recommendation=recommendation,
+        publisher=publisher,
+    )
+    show_confidence = state in STATES_WITH_CONFIDENCE
+    daily_cost = _daily_cost(records, cost_resolver, window_start=window_start, window_end=window_end)
+    priced_days = [point for point in daily_cost if point.total_cost is not None]
+    total_cost = round(sum(point.total_cost or 0 for point in priced_days), 10) if priced_days else None
+    average_daily_cost = round(total_cost / len(priced_days), 10) if total_cost is not None and priced_days else None
+
+    if not cached_known:
+        missing_metrics.add("cached_tokens")
+    if not outcome_known:
+        missing_metrics.add("request_outcomes")
+    if latency_coverage == 0:
+        missing_metrics.add("latency")
+    if summary.pricing_coverage_tokens_percent < 100:
+        missing_metrics.add("pricing")
+
+    smoke_test = active_buckets < 5 and len(records) <= 10
+    dashboard_summary = PtuDashboardSummary(
+        deployment_name=summary.deployment_name,
+        model_name=summary.model_name,
+        deployment_mode=summary.deployment_mode,
+        state=state,
+        state_label=DASHBOARD_STATE_LABELS[state],
+        recommendation=DASHBOARD_STATE_LABELS[state],
+        confidence_percent=confidence_percent if show_confidence else None,
+        confidence_label=_confidence_label(confidence_percent) if show_confidence else None,
+        summary=_STATE_SUMMARIES[state],
+        average_weighted_tpm=average_weighted,
+        p95_weighted_tpm=p95_weighted,
+        weighted_basis=weighted_basis,
+        total_input_tokens=total_input or None if records else None,
+        total_cached_tokens=total_cached,
+        total_output_tokens=total_output or None if records else None,
+        total_tokens=total_tokens or None if records else None,
+        daily_average_tokens=daily_average_tokens,
+        rate_limited_requests=rate_limited,
+        rate_limit_percent=rate_limit_percent,
+        total_requests=total_requests,
+        observed_days=round(observed_days, 2),
+        complete_days=max(0, complete_days),
+        partial_days=partial_days,
+        window_start=window_start,
+        window_end=window_end,
+        active_buckets=active_buckets,
+        elapsed_buckets=elapsed_buckets,
+        pricing_coverage_tokens_percent=summary.pricing_coverage_tokens_percent,
+        pricing_currency=summary.pricing_currency,
+        total_cost=total_cost,
+        average_daily_cost=average_daily_cost,
+        data_quality=_confidence_label(confidence_percent),
+        smoke_test_window=smoke_test,
+    )
+    return PtuDashboardData(
+        summary=dashboard_summary,
+        evidence=evidence,
+        daily_cost=daily_cost,
+        throughput=throughput_series,
+        cost_curve=cost_curve,
+        confidence_components=confidence_components,
+        assumptions=_assumptions(
+            summary=dashboard_summary,
+            capacity=capacity,
+            suggested_ptu=suggested_ptu,
+            cost_curve=cost_curve,
+            deployment=deployment,
+        ),
+        missing_metrics=sorted(missing_metrics),
+        recommendation_reasons=_reasons(
+            state=state,
+            dimensions=dimensions,
+            payg_monthly_usd=payg_monthly_usd,
+            hybrid_monthly_usd=hybrid_monthly_usd,
+            spillover_percent=spillover_percent,
+            summary=dashboard_summary,
+        ),
+        what_would_change=_what_would_change(state=state, summary=dashboard_summary, capacity=capacity),
+        next_steps=_next_steps(state=state, summary=dashboard_summary, suggested_ptu=suggested_ptu),
+        data_quality_notes=_data_quality_notes(
+            summary=dashboard_summary,
+            missing=sorted(missing_metrics),
+        ),
+    )
+
+
+def _money(value: float | None, currency: str = "USD") -> str:
+    if value is None:
+        return "unavailable"
+    return f"{currency} {value:,.2f}"
+
+
+def _assumptions(
+    *,
+    summary: PtuDashboardSummary,
+    capacity: _Capacity | None,
+    suggested_ptu: int | None,
+    cost_curve: PtuCostCurve | None,
+    deployment: DeploymentAnalysis,
+) -> list[str]:
+    items = [
+        f"Throughput is aggregated into {BUCKET_MINUTES}-minute buckets from the observed telemetry window.",
+        f"Weighted TPM is calculated as {summary.weighted_basis}.",
+        "Monthly figures are 30-day (720-hour) run-rate estimates, not invoices.",
+    ]
+    if capacity is not None:
+        items.append(
+            f"PTU sizing uses {capacity.input_tpm_per_ptu:,} input TPM per PTU and a {capacity.output_ratio}x output weighting."
+        )
+    if suggested_ptu is not None:
+        items.append(f"Reserved pricing assumes a one-year commitment discount applied to {suggested_ptu:,} PTU.")
+    if cost_curve is not None:
+        items.append("The cost explorer models a constant sustained TPM; real traffic is peakier than the plotted line.")
+    price = deployment.summary
+    if price.input_price_per_million is not None and price.output_price_per_million is not None:
+        items.append(
+            f"Prices come from {price.pricing_catalog_name or price.pricing_source} "
+            f"({price.pricing_currency} {price.input_price_per_million:,.2f} input / "
+            f"{price.output_price_per_million:,.2f} output per 1M tokens)."
+        )
+    if summary.partial_days:
+        items.append(f"{summary.partial_days} observed day(s) are partial, so daily averages are marked partial.")
+    return items
+
+
+def _reasons(
+    *,
+    state: DashboardState,
+    dimensions: list[PtuDimension],
+    payg_monthly_usd: float | None,
+    hybrid_monthly_usd: float | None,
+    spillover_percent: float | None,
+    summary: PtuDashboardSummary,
+) -> list[str]:
+    reasons = [f"{item.name}: {item.verdict} — {item.summary} ({item.metric})" for item in dimensions]
+    if payg_monthly_usd is not None and hybrid_monthly_usd is not None:
+        difference = payg_monthly_usd - hybrid_monthly_usd
+        direction = "cheaper" if difference > 0 else "more expensive"
+        reasons.append(
+            f"Modeled economics: PAYG {_money(payg_monthly_usd, summary.pricing_currency)} per month versus "
+            f"PTU + spillover {_money(hybrid_monthly_usd, summary.pricing_currency)} per month "
+            f"({_money(abs(difference), summary.pricing_currency)} {direction} on PTU)."
+        )
+    if spillover_percent is not None:
+        reasons.append(f"{spillover_percent:.1f}% of observed buckets would spill over the selected PTU capacity.")
+    if state == "insufficient_evidence":
+        reasons.append(
+            f"Only {summary.active_buckets:,} active five-minute buckets were observed; "
+            f"{MINIMUM_ACTIVE_BUCKETS} are required before a recommendation is issued."
+        )
+    return reasons
+
+
+def _what_would_change(*, state: DashboardState, summary: PtuDashboardSummary, capacity: _Capacity | None) -> list[str]:
+    items: list[str] = []
+    if state in {"ptu_recommended", "borderline", "payg_recommended"}:
+        items.append("Sustained throughput moving above or below the plotted break-even changes the economic result.")
+        items.append("A materially different peak-to-average ratio changes the PTU size and the spillover share.")
+    if state == "insufficient_evidence":
+        items.append(
+            f"Collecting at least {MINIMUM_ACTIVE_BUCKETS} active five-minute buckets across a representative window "
+            "enables sizing and a cost curve."
+        )
+    if state == "pricing_unavailable":
+        items.append("Supplying exact PAYG prices for this model and deployment mode enables break-even and hybrid cost.")
+    if state == "capacity_unavailable":
+        items.append("Publishing or configuring exact PTU capacity for this model and version enables sizing.")
+    if state == "ptu_not_applicable":
+        items.append("If this model later gains an Azure PTU offer, the same evidence can be re-scored.")
+    if summary.rate_limit_percent is None:
+        items.append("Request-outcome telemetry would confirm whether PAYG quota pressure is present.")
+    elif summary.rate_limit_percent > 1:
+        items.append("Reducing HTTP 429 pressure through quota increases would weaken the capacity-pressure signal.")
+    if capacity is not None and summary.deployment_mode.casefold() not in {"global", "regional"}:
+        items.append("Recording the deployment mode as Global or Regional enables sizing and pricing.")
+    return items
+
+
+def _next_steps(*, state: DashboardState, summary: PtuDashboardSummary, suggested_ptu: int | None) -> list[str]:
+    if state == "ptu_recommended" and suggested_ptu is not None:
+        return [
+            f"Validate {suggested_ptu:,} PTU against a production-representative load test before committing.",
+            "Confirm regional capacity availability and quota for the selected deployment mode.",
+            "Plan PAYG spillover for peaks above the reserved capacity.",
+        ]
+    if state == "borderline":
+        return [
+            "Collect a longer window that includes at least one full business cycle.",
+            "Compare the modeled PAYG and PTU + spillover run rates against your actual invoice.",
+            "Re-run this report before committing to a reservation.",
+        ]
+    if state == "payg_recommended":
+        return [
+            "Stay on pay-as-you-go and re-evaluate when sustained throughput grows.",
+            "Track HTTP 429 pressure as an early signal that dedicated capacity is needed.",
+        ]
+    if state == "pricing_unavailable":
+        return [
+            "Add an exact customer price for this model and deployment mode in `.tokenlens.yml`.",
+            "Re-run the report to unlock break-even and hybrid economics.",
+        ]
+    if state == "capacity_unavailable":
+        return ["Confirm the exact model version and its PTU capacity with Azure before sizing."]
+    if state == "ptu_not_applicable":
+        return ["Use the applicable consumption or marketplace purchasing model for this publisher."]
+    return [
+        "Instrument the application once with the TokenLens SDK wrapper, or collect Azure Monitor metrics.",
+        f"Collect at least {MINIMUM_ACTIVE_BUCKETS} active five-minute buckets across a representative window.",
+        "Re-run the report once a representative window is available.",
+    ]
+
+
+def _data_quality_notes(*, summary: PtuDashboardSummary, missing: list[str]) -> list[str]:
+    labels = {
+        "cached_tokens": "Cached-token metric unavailable for this source.",
+        "request_outcomes": "Request-outcome metric unavailable; success, 429, and failure counts cannot be shown.",
+        "request_totals": (
+            "Request-count metric unavailable for some buckets, so the HTTP 429 rate is withheld: its "
+            "denominator is incomplete. The observed 429 count is still shown."
+        ),
+        "failed_requests": "Other-failure counts are unavailable; success is never derived as total minus 429.",
+        "latency": "No latency evidence was supplied for this deployment.",
+        "pricing": f"Pricing covers {summary.pricing_coverage_tokens_percent:.1f}% of observed tokens.",
+        "timestamp": "Some events had no usable timestamp and were excluded from the time series.",
+    }
+    notes = [labels[item] for item in missing if item in labels]
+    if summary.smoke_test_window:
+        notes.append("This window looks like a manual smoke test rather than representative production traffic.")
+    if summary.partial_days:
+        notes.append(f"{summary.partial_days} of {summary.complete_days + summary.partial_days} observed day(s) are partial.")
+    return notes
+
+
+def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost_resolver: CostResolver | None = None) -> PtuDeploymentAssessment:
     summary = deployment.summary
     input_tpm, output_tpm, filtered_records, observed_days, observed_buckets = _series(records)
     tpm = [input_value + output_value for input_value, output_value in zip(input_tpm, output_tpm)]
     capacity = _capacity_for(summary.model_name)
+    publisher = infer_publisher(summary.model_name)
     dimensions, metrics = _dimensions(filtered_records, tpm, observed_buckets, capacity)
-    recommendation = _recommendation(dimensions, capacity is not None)
+    recommendation = _recommendation(dimensions, capacity is not None, publisher)
     average_tpm = mean(tpm) if tpm else 0
     p95_tpm = _percentile(tpm, 95)
     total_tokens = sum(record.usage.input_tokens + record.usage.output_tokens for record in filtered_records)
@@ -271,10 +1155,22 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis) -> P
     hybrid_monthly = None
     break_even = None
     spillover_percent = None
+    throughput_series = None
+    cost_curve = None
     economic_result: Literal["PTU lower", "PAYG lower", "Unavailable"] = "Unavailable"
     note = "Exact supported model capacity is required for PTU sizing."
 
     mode = summary.deployment_mode.casefold()
+    sufficient_evidence = observed_buckets >= MINIMUM_ACTIVE_BUCKETS
+    if capacity is None:
+        eligibility_status: EligibilityStatus = "ptu_not_applicable" if publisher and publisher != "microsoft" else "model_capacity_unavailable"
+    elif mode not in {"global", "regional"}:
+        eligibility_status = "deployment_mode_unavailable"
+    elif not sufficient_evidence:
+        eligibility_status = "eligible_insufficient_evidence"
+    else:
+        eligibility_status = "eligible_sufficient_evidence"  # may be downgraded to pricing_unavailable below
+
     if capacity and mode in {"global", "regional"}:
         regional = mode == "regional"
         minimum = capacity.regional_min_ptu if regional else capacity.global_min_ptu
@@ -288,16 +1184,17 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis) -> P
         cached_rate = summary.cached_input_price_per_million
         cached_tokens = summary.cached_tokens
         fresh_tokens = max(0, summary.input_tokens - cached_tokens)
-        if (
+        pricing_ready = (
             summary.input_price_per_million is not None
             and summary.output_price_per_million is not None
             and (not cached_tokens or cached_rate is not None)
             and total_tokens
             and summary.pricing_currency == "USD"
             and summary.pricing_complete
-            and filtered_records
+            and bool(filtered_records)
             and all(record.observed_cost_usd is None for record in filtered_records)
-        ):
+        )
+        if pricing_ready:
             blended = (
                 sum(max(0, record.usage.input_tokens - record.usage.cached_tokens) for record in filtered_records) * summary.input_price_per_million
                 + sum(record.usage.cached_tokens for record in filtered_records) * (cached_rate or 0)
@@ -341,6 +1238,18 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis) -> P
             if recommendation == "PTU recommended" and economic_result == "PAYG lower":
                 recommendation = "Borderline"
                 note = "Operational signals favor PTU, but the observed PAYG run rate is lower; validate the non-cost value before committing."
+            if eligibility_status == "eligible_sufficient_evidence":
+                throughput_series = _throughput_series(tpm, bucket_minutes=5, ptu_capacity_tpm=ptu_capacity_tpm)
+                cost_curve = _cost_curve(
+                    weighted_tpm=weighted_tpm,
+                    average_tpm=average_tpm,
+                    selected_ptu=suggested_ptu,
+                    capacity_tpm=ptu_capacity_tpm,
+                    reserved_monthly=reserved_monthly,
+                    blended_rate=blended,
+                    payg_monthly_usd=payg_monthly,
+                    hybrid_monthly_usd=hybrid_monthly,
+                )
         else:
             suggested_ptu = p95_sized_ptu if filtered_records else None
             if suggested_ptu is not None:
@@ -348,14 +1257,55 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis) -> P
                 hourly_monthly = suggested_ptu * hourly_rate * 720
                 reserved_monthly = hourly_monthly * 0.35
             note = "Timestamped request evidence is required for PTU economics." if not filtered_records else "Workload fit is available; USD PAYG model pricing is required for break-even and hybrid cost."
+            if eligibility_status == "eligible_sufficient_evidence":
+                eligibility_status = "pricing_unavailable"
+                if suggested_ptu is not None:
+                    throughput_series = _throughput_series(tpm, bucket_minutes=5, ptu_capacity_tpm=ptu_capacity_tpm)
     elif capacity:
         note = "Workload fit is available; deployment mode must be Global or Regional before PTU sizing and economics."
+
+    if eligibility_status == "eligible_insufficient_evidence":
+        note = (
+            f"{observed_buckets} of the required {MINIMUM_ACTIVE_BUCKETS} active five-minute buckets were observed; "
+            "TokenLens shows the observed workload evidence but withholds a PTU recommendation and cost curve until "
+            "there is enough sustained activity to size and cost dedicated capacity."
+        )
+    elif eligibility_status == "ptu_not_applicable":
+        note = (
+            f"{publisher.title() if publisher else 'This publisher'}'s models are billed through Foundry's "
+            "consumption/marketplace offer; Azure PTU capacity purchasing does not apply to this model."
+        )
+
+    dashboard = _dashboard(
+        records=filtered_records,
+        deployment=deployment,
+        capacity=capacity,
+        publisher=publisher,
+        eligibility_status=eligibility_status,
+        recommendation=recommendation,
+        weighted_tpm=(
+            [input_value + output_value * capacity.output_ratio for input_value, output_value in zip(input_tpm, output_tpm)]
+            if capacity
+            else tpm
+        ),
+        observed_days=observed_days,
+        active_buckets=observed_buckets,
+        throughput_series=throughput_series,
+        cost_curve=cost_curve,
+        suggested_ptu=suggested_ptu,
+        payg_monthly_usd=payg_monthly,
+        hybrid_monthly_usd=hybrid_monthly,
+        spillover_percent=spillover_percent,
+        dimensions=dimensions,
+        cost_resolver=cost_resolver,
+    )
 
     return PtuDeploymentAssessment(
         deployment_name=summary.deployment_name,
         model_name=summary.model_name,
         deployment_mode=summary.deployment_mode,
         eligible=capacity is not None,
+        eligibility_status=eligibility_status,
         recommendation=recommendation,
         economic_result=economic_result,
         data_points=len(tpm),
@@ -376,11 +1326,19 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis) -> P
         break_even_tpm=break_even,
         spillover_percent=spillover_percent,
         dimensions=dimensions,
+        throughput_series=throughput_series,
+        cost_curve=cost_curve,
+        dashboard=dashboard,
         note=note,
     )
 
 
-def analyze_ptu(records: list[TraceRecord], deployments: list[DeploymentAnalysis]) -> PtuPortfolioAssessment:
+def analyze_ptu(
+    records: list[TraceRecord],
+    deployments: list[DeploymentAnalysis],
+    *,
+    cost_resolver: CostResolver | None = None,
+) -> PtuPortfolioAssessment:
     grouped: dict[tuple[str, str, str, str, str], list[TraceRecord]] = defaultdict(list)
     for record in records:
         grouped[
@@ -405,6 +1363,7 @@ def analyze_ptu(records: list[TraceRecord], deployments: list[DeploymentAnalysis
                 [],
             ),
             deployment,
+            cost_resolver,
         )
         for deployment in deployments
     ]
@@ -413,7 +1372,7 @@ def analyze_ptu(records: list[TraceRecord], deployments: list[DeploymentAnalysis
         borderline_deployments=sum(item.recommendation == "Borderline" for item in assessments),
         payg_deployments=sum(item.recommendation == "PAYG recommended" for item in assessments),
         insufficient_deployments=sum(
-            item.recommendation in {"Insufficient evidence", "Model not supported"}
+            item.recommendation in {"Insufficient evidence", "Model not supported", "PTU not applicable"}
             for item in assessments
         ),
         deployments=assessments,
