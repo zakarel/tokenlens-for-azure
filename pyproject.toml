@@ -29,7 +29,7 @@ tokenlens-azure = "tokenlens.cli:app"
 where = ["src"]
 
 [tool.setuptools.package-data]
-tokenlens = ["assets/*.png", "assets/*.py"]
+tokenlens = ["assets/*.png", "assets/*.py", "assets/*.yml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -8,6 +8,7 @@ from importlib.resources import files
 from pathlib import Path
 
 from .models import AnalysisReport, DeploymentAnalysis, Finding
+from .economics import TaskEconomicsReport
 from .presentation import (
     additional_opportunities,
     chart_label,
@@ -27,7 +28,9 @@ def _without_internal(value: object) -> object:
     return value
 
 
-def report_json(report: AnalysisReport) -> str:
+def report_json(report: AnalysisReport | TaskEconomicsReport) -> str:
+    if isinstance(report, TaskEconomicsReport):
+        return report.model_dump_json(indent=2) + "\n"
     return json.dumps(_without_internal(report.model_dump(mode="json")), indent=2, ensure_ascii=False) + "\n"
 
 
@@ -264,6 +267,8 @@ def _analytics_deployment_sections(report: AnalysisReport) -> str:
 
 
 def report_html(report: AnalysisReport) -> str:
+    if isinstance(report.task_economics, TaskEconomicsReport):
+        return task_economics_html(report.task_economics, overview_report=report)
     summary = report.summary
     overview = overview_findings(report)
     additional = additional_opportunities(report)
@@ -284,12 +289,13 @@ def report_html(report: AnalysisReport) -> str:
 <div class="meta">Generated<strong>{_escape(report.generated_at)}</strong> · Source<strong>{_escape(report.source)}</strong> · Offline synthetic example</div></header>
 <div class="tabs"><div class="tab-list" role="tablist" aria-label="Report views">
 <button class="tab" id="overview-tab" role="tab" aria-selected="true" aria-controls="overview-panel" tabindex="0">Overview</button>
-<button class="tab" id="usage-tab" role="tab" aria-selected="false" aria-controls="usage-panel" tabindex="-1">Usage analytics</button></div>
+<button class="tab" id="task-tab" role="tab" aria-selected="false" aria-controls="task-panel" tabindex="-1">Task economics</button>
+<button class="tab" id="usage-tab" role="tab" aria-selected="false" aria-controls="usage-panel" tabindex="-1">Usage &amp; diagnostics</button></div>
 <section class="tab-panel overview active" id="overview-panel" role="tabpanel" aria-labelledby="overview-tab">
 <section class="metrics"><div class="card"><div class="label">Requests</div><div class="value">{summary.requests_analyzed:,}</div><div class="sub">{summary.retries:,} retries observed</div></div>
 <div class="card"><div class="label">Total tokens</div><div class="value">{summary.total_tokens:,}</div><div class="sub">{summary.input_tokens:,} input · {summary.output_tokens:,} output</div></div>
 <div class="card"><div class="label">Deployments</div><div class="value">{len(report.deployments):,}</div><div class="sub">Separate workload routes</div></div>
-<div class="card"><div class="label">Addressable range</div><div class="value accent">{summary.addressable_min_percent:.1f}–{summary.addressable_max_percent:.1f}%</div><div class="sub">{summary.addressable_min_tokens:,}–{summary.addressable_max_tokens:,} tokens</div></div>
+<div class="card"><div class="label">Optimisation scenarios</div><div class="value accent">{len(report.report_metadata.get("scenarios", [])):,}</div><div class="sub">Independent ranges · not additive</div></div>
 <div class="card"><div class="label">Material findings</div><div class="value">{len(overview):,}</div><div class="sub">{summary.findings:,} total in analytics</div></div></section>
 <section class="overview-grid"><section class="panel"><div class="panel-head"><div><h2>Portfolio usage</h2><small>Token share by deployment</small></div><a href="#usage" data-tab-link="usage">View analytics →</a></div><div class="portfolio">{_deployment_rows(report)}</div></section>
 <aside class="panel"><div class="panel-head"><div><h2>Azure actions</h2><small>Prioritized for a first decision</small></div></div><div class="actions"><ol>{_overview_actions(actions)}</ol></div></aside></section>
@@ -304,26 +310,31 @@ def report_html(report: AnalysisReport) -> str:
 <section class="panel analytics-section"><div class="panel-head"><div><h2>All findings</h2><small>Material and lower-impact opportunities are retained for investigation.</small></div></div><div class="finding-list">{_finding_cards(report.findings)}</div></section>
 <section class="panel analytics-section additional"><div class="panel-head"><div><h2>Additional opportunities</h2><small>{len(additional):,} lower-impact finding(s) retained outside Overview.</small></div></div>{_finding_cards(additional)}</section>
 <section class="analytics-section"><div class="panel-head"><div><h2>Deployment details</h2><small>Expand a deployment for its findings and token breakdown.</small></div></div><div class="details-list">{_analytics_deployment_sections(report)}</div></section>
-<footer>tokenlens-for-azure · created by Tzahi Ariel</footer></section></div></main>
+<footer>tokenlens-for-azure · created by Tzahi Ariel</footer></section>
+<section class="tab-panel task" id="task-panel" role="tabpanel" aria-labelledby="task-tab">
+<section class="panel"><div class="panel-head"><div><h2>Task economics</h2><small>No explicit task telemetry was supplied.</small></div></div>
+<p class="empty">Request efficiency was measured successfully. Add explicit <code>task_id</code>, <code>task_type</code>, <code>execution_strategy</code>, and <code>strategy_version</code> events to unlock cost per solved task, cleanup, and strategy comparisons. Run <code>tokenlens-azure instrument --language python</code> for a safe starter.</p></section>
+</section></div></main>
 <script>
 document.documentElement.classList.add("js");
 (function() {{
   const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
   const panels = Array.from(document.querySelectorAll('[role="tabpanel"]'));
   function activate(name, moveFocus) {{
-    const selected = name === "usage" ? tabs[1] : tabs[0];
+    const selected = name === "task" ? tabs[1] : name === "usage" ? tabs[2] : tabs[0];
     tabs.forEach(tab => {{ const active = tab === selected; tab.setAttribute("aria-selected", active); tab.tabIndex = active ? 0 : -1; }});
     panels.forEach(panel => panel.classList.toggle("active", panel.id === selected.getAttribute("aria-controls")));
     if (moveFocus) selected.focus();
-    if (history.replaceState) history.replaceState(null, "", "#" + (name === "usage" ? "usage" : "overview"));
+    if (history.replaceState) history.replaceState(null, "", "#" + name);
   }}
-  tabs.forEach((tab, index) => tab.addEventListener("click", () => activate(index ? "usage" : "overview", false)));
+  tabs.forEach((tab, index) => tab.addEventListener("click", () => activate(["overview", "task", "usage"][index], false)));
   tabs.forEach((tab, index) => tab.addEventListener("keydown", event => {{
-    if (event.key === "ArrowRight" || event.key === "ArrowLeft") {{ event.preventDefault(); activate(index ? "overview" : "usage", true); }}
+    if (event.key === "ArrowRight" || event.key === "ArrowLeft") {{ event.preventDefault(); activate(["overview", "task", "usage"][(index + (event.key === "ArrowRight" ? 1 : 2)) % 3], true); }}
     if (event.key === "Home" || event.key === "End") {{ event.preventDefault(); activate(event.key === "Home" ? "overview" : "usage", true); }}
   }}));
   document.querySelectorAll("[data-tab-link]").forEach(link => link.addEventListener("click", event => {{ event.preventDefault(); activate(link.dataset.tabLink, false); }}));
   if (location.hash.toLowerCase() === "#usage") activate("usage", false);
+  if (location.hash.toLowerCase() === "#task") activate("task", false);
   if (location.hash.toLowerCase() === "#overview") activate("overview", false);
 }})();
 </script></body></html>"""
@@ -346,3 +357,103 @@ def write_output(content: str, output: str | None) -> None:
         destination.write_text(content, encoding="utf-8")
     else:
         print(content, end="")
+
+
+def task_economics_html(
+    report: TaskEconomicsReport,
+    *,
+    overview_report: AnalysisReport | None = None,
+) -> str:
+    """Render the self-contained task economics experience from report data."""
+    def money(value: float | None) -> str:
+        return "Unresolved" if value is None else f"${value:.6f}"
+
+    def pct(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.1f}%"
+
+    cohorts = report.task_types
+    strategies = report.execution_strategies
+    max_cost = max((item.cost_per_solved_task_usd or item.cost_per_observed_task_usd or 0 for item in cohorts), default=1) or 1
+    bars = []
+    for index, item in enumerate(cohorts):
+        value = item.cost_per_solved_task_usd or item.cost_per_observed_task_usd or 0
+        width = max(2, value / max_cost * 100) if value else 2
+        bars.append(
+            f'<div class="bar-row"><span>{_escape(item.task_type)}</span><div class="bar-track"><i style="width:{width:.2f}%"></i></div>'
+            f'<strong>{_escape(money(item.cost_per_solved_task_usd or item.cost_per_observed_task_usd))}</strong></div>'
+        )
+    composition_rows = "".join(
+        f"<tr><th scope=\"row\">{_escape(item.task_type)}</th><td>{item.fresh_input_tokens:,}</td><td>{item.cached_input_tokens:,}</td>"
+        f"<td>{item.cache_write_tokens:,}</td><td>{item.output_tokens:,}</td><td>{_escape(money(item.observed_tool_cost_usd))}</td>"
+        f"<td>{_escape(money(item.observed_cleanup_spend_usd))}</td></tr>"
+        for item in cohorts
+    )
+    strategy_points = []
+    for index, item in enumerate(strategies):
+        x = 48 + (item.cost_per_solved_task_usd or 0) / max(
+            1, max((s.cost_per_solved_task_usd or 0 for s in strategies), default=1)
+        ) * 560
+        y = 230 - (item.eventual_success_rate or 0) / 100 * 180
+        strategy_points.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{max(5, min(18, (item.closed_tasks or 1) ** .5)):.1f}" '
+            f'tabindex="0" aria-label="{_escape(item.execution_strategy)} version {_escape(item.strategy_version)}, '
+            f'{pct(item.eventual_success_rate)} success, {money(item.cost_per_solved_task_usd)} cost per solved task">'
+            f'<title>{_escape(item.execution_strategy)} v{_escape(item.strategy_version)}</title></circle>'
+        )
+    cohort_rows = "".join(
+        f"<tr><th scope=\"row\">{_escape(item.task_type)}</th><td>{item.maturity_label}</td><td>{item.attempted_tasks:,}</td>"
+        f"<td>{item.closed_tasks:,}</td><td>{item.solved_tasks:,}</td><td>{pct(item.success_rate)}</td>"
+        f"<td>{_escape(money(item.cost_per_observed_task_usd))}</td><td>{_escape(money(item.cost_per_solved_task_usd))}</td>"
+        f"<td>{_escape(money(item.observed_cleanup_spend_usd))}</td><td>{item.pricing.coverage_percent:.1f}%</td></tr>"
+        for item in cohorts
+    )
+    strategy_rows = "".join(
+        f"<tr><th scope=\"row\">{_escape(item.task_type)}</th><td>{_escape(item.execution_strategy)}</td><td>{_escape(item.strategy_version)}</td>"
+        f"<td>{'Provisional' if item.provisional else 'Ranked'}</td><td>{item.closed_tasks:,}</td><td>{pct(item.eventual_success_rate)}</td><td>{pct(item.attempt_success_rate)}</td>"
+        f"<td>{_escape(money(item.cost_per_task_usd))}</td><td>{_escape(money(item.cost_per_solved_task_usd))}</td>"
+        f"<td>{_escape(money(item.p50_cost_usd))} / {_escape(money(item.p90_cost_usd))}</td><td>{_escape(', '.join(item.model_composition) or 'n/a')}</td></tr>"
+        for item in strategies
+    )
+    scenario_rows = "".join(
+        f"<li><strong>{_escape(item.label)}</strong> · "
+        f"{_escape(str(item.min_value) + '–' + str(item.max_value) + ' ' + item.unit) if item.min_value is not None else 'Simulation required'}"
+        f"<small>{_escape(item.note)}</small></li>"
+        for item in report.scenarios
+    ) or "<li>No independent scenarios available.</li>"
+    if overview_report is not None:
+        overview_summary = overview_report.summary
+        overview_content = f"""<section class="metrics"><div class="kpi"><span>Requests</span><b>{overview_summary.requests_analyzed:,}</b><p>{overview_summary.total_tokens:,} total tokens</p></div>
+<div class="kpi"><span>Deployments</span><b>{len(overview_report.deployments):,}</b><p>Consumption routes</p></div>
+<div class="kpi"><span>Optimisation scenarios</span><b>{len(overview_report.report_metadata.get("scenarios", [])):,}</b><p>Independent ranges · not additive</p></div>
+<div class="kpi"><span>Findings</span><b>{len(overview_report.findings):,}</b><p>Usage diagnostics</p></div></section>
+<section class="grid"><article class="panel overview-list"><h2>Portfolio usage</h2><p>Token share by deployment</p>{_deployment_rows(overview_report)}</article>
+<article class="panel overview-list"><h2>Azure actions</h2><p>Prioritized for a first decision</p><ol>{_overview_actions(top_recommendations(overview_findings(overview_report)))}</ol></article></section>
+<section class="panel overview-list"><h2>Material findings</h2><p>Independent scenarios are retained; no aggregate range is summed.</p>{_finding_cards(overview_findings(overview_report), compact=True)}</section>"""
+    else:
+        overview_content = '<div class="panel fallback"><h2>Consumption Overview</h2><p>Legacy request/deployment overview remains available when request telemetry is supplied.</p></div>'
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TokenLens for Azure — Task economics</title>
+<style>
+:root{{--bg:#11213b;--surface:#172a49;--surface2:#1d3559;--border:#35527a;--text:#f3f7ff;--muted:#b5c5dc;--accent:#73c7ff;--green:#57d68b;--amber:#ffc857}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI",Arial,sans-serif}}main{{max-width:1320px;margin:auto;padding:22px}}header{{display:flex;justify-content:space-between;gap:18px;border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:14px}}h1{{font-size:22px;margin:0}}h2{{font-size:17px;margin:0}}h3{{font-size:13px;margin:0}}p{{margin:0;color:var(--muted)}}.meta{{color:var(--muted);font-size:11px;text-align:right}}.tabs{{display:flex;gap:5px;border-bottom:1px solid var(--border);margin-bottom:14px}}button{{font:700 12px inherit;color:var(--muted);background:transparent;border:1px solid transparent;padding:9px 14px;border-radius:8px 8px 0 0;cursor:pointer}}button[aria-selected=true]{{color:var(--text);background:var(--surface);border-color:var(--border)}}button:focus-visible,svg circle:focus-visible{{outline:3px solid var(--amber);outline-offset:3px}}.panel,.kpi,.chart{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px}}.metrics{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:12px}}.kpi b{{display:block;font-size:22px;color:var(--accent);margin-top:4px}}.kpi span,.label{{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}.chart-head{{display:flex;justify-content:space-between;gap:8px;margin-bottom:10px}}.bar-row{{display:grid;grid-template-columns:150px 1fr 100px;align-items:center;gap:8px;margin:9px 0;font-size:11px}}.bar-track{{height:12px;background:var(--surface2);border-radius:8px;overflow:hidden}}.bar-track i{{display:block;height:100%;background:var(--accent);border-radius:8px}}.overview-list{{padding:14px}}.overview-list h2{{margin-bottom:3px}}.overview-list > p{{margin-bottom:10px}}.overview-list .portfolio-row{{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);font-size:11px}}.overview-list .portfolio-row small{{display:block;color:var(--muted)}}.overview-list .portfolio-bar{{height:8px;background:var(--surface2);border-radius:8px;overflow:hidden}}.overview-list .portfolio-bar span{{display:block;height:100%;background:var(--accent)}}.overview-list .portfolio-value{{text-align:right}}.overview-list ol{{margin:0;padding-left:20px}}.overview-list li{{padding:5px 0;color:var(--muted)}}svg{{width:100%;height:auto;background:var(--surface2);border-radius:8px}}.axis{{stroke:var(--border);stroke-width:1}}svg text{{fill:var(--muted);font-size:10px}}svg circle{{fill:var(--green);stroke:var(--text);stroke-width:1}}table{{width:100%;border-collapse:collapse;font-size:11px;display:block;overflow-x:auto}}caption{{text-align:left;color:var(--muted);padding:0 0 6px}}th,td{{padding:7px;border-bottom:1px solid var(--border);white-space:nowrap;text-align:right}}th:first-child,td:first-child{{text-align:left}}thead th{{color:var(--muted);font-size:9px;text-transform:uppercase}}.table-panel{{margin-bottom:12px}}.scenario-list{{margin:0;padding-left:20px}}.scenario-list li{{padding:6px 0;border-bottom:1px solid var(--border)}}.scenario-list small{{display:block;color:var(--muted)}}.fallback{{padding:24px;text-align:center}}@media(max-width:900px){{.metrics,.grid{{grid-template-columns:1fr 1fr}}.bar-row{{grid-template-columns:110px 1fr 90px}}}}@media(max-width:600px){{main{{padding:14px}}header{{display:block}}.meta{{text-align:left;margin-top:7px}}.metrics,.grid{{grid-template-columns:1fr}}}}@media print{{body{{background:#fff;color:#11213b}}.panel,.kpi,.chart{{background:#fff;border-color:#9aa8ba}}.tabs{{display:none}}}}
+</style></head><body><main>
+<header><div><h1>TokenLens for Azure · Task economics</h1><p>Explicit task telemetry · offline report · synthetic-safe output</p></div>
+<div class="meta">Attempted tasks <strong>{report.total_attempted_tasks:,}</strong><br>Cost coverage <strong>{report.pricing.coverage_percent:.1f}%</strong></div></header>
+<nav class="tabs" role="tablist" aria-label="Report views">
+<button id="overview-tab" role="tab" aria-selected="false" aria-controls="overview-panel" tabindex="-1">Overview</button>
+<button id="task-tab" role="tab" aria-selected="true" aria-controls="task-panel" tabindex="0">Task economics</button>
+<button id="usage-tab" role="tab" aria-selected="false" aria-controls="usage-panel" tabindex="-1">Usage &amp; diagnostics</button></nav>
+<section id="overview-panel" role="tabpanel" aria-labelledby="overview-tab" hidden>{overview_content}</section>
+<section id="task-panel" role="tabpanel" aria-labelledby="task-tab">
+<section class="metrics"><div class="kpi"><span>Attempted tasks</span><b>{report.total_attempted_tasks:,}</b><p>Open and closed activity</p></div><div class="kpi"><span>Solved tasks</span><b>{report.total_solved_tasks:,}</b><p>Explicit final outcomes</p></div><div class="kpi"><span>Success rate</span><b>{pct(sum(item.solved_tasks for item in cohorts) / sum(item.closed_tasks for item in cohorts) * 100 if sum(item.closed_tasks for item in cohorts) else None)}</b><p>Closed-task denominator</p></div><div class="kpi"><span>Cost coverage</span><b>{report.pricing.coverage_percent:.1f}%</b><p>Resolved billable events</p></div><div class="kpi"><span>Cleanup spend</span><b>{money(sum(item.observed_cleanup_spend_usd or 0 for item in cohorts) if any(item.observed_cleanup_spend_usd is not None for item in cohorts) else None)}</b><p>Observed only</p></div></section>
+<section class="grid"><article class="chart"><div class="chart-head"><div><h2>Cost per solved task</h2><p>Unresolved monetary cohorts are omitted from dollar comparisons.</p></div></div>{''.join(bars) or '<p>No resolved monetary cohorts.</p>'}</article>
+<article class="chart"><div class="chart-head"><div><h2>Success versus cost</h2><p>Each point is an execution strategy/version; bubble size is closed-task volume.</p></div></div><svg viewBox="0 0 660 270" role="img" aria-labelledby="scatter-title"><title id="scatter-title">Success versus cost per solved task</title><line class="axis" x1="48" y1="230" x2="620" y2="230"/><line class="axis" x1="48" y1="24" x2="48" y2="230"/>{''.join(strategy_points)}<text x="270" y="258">cost per solved task →</text><text x="5" y="30">success</text></svg></article></section>
+<section class="panel table-panel"><h2>Strategy cost composition</h2><p>Fresh input, cached input, cache writes, output/reasoning, observed tools, and observed cleanup are kept separate; unresolved dollars remain visible as unresolved.</p><table><caption>Accessible composition data by task type</caption><thead><tr><th>Task type</th><th>Fresh input tokens</th><th>Cached input tokens</th><th>Cache writes</th><th>Output/reasoning tokens</th><th>Observed tools</th><th>Observed cleanup</th></tr></thead><tbody>{composition_rows or '<tr><td colspan="7">No composition data.</td></tr>'}</tbody></table></section>
+<section class="panel table-panel"><h2>Task-type economics</h2><table><caption>Progressive maturity and cost metrics by explicit task type</caption><thead><tr><th>Task type</th><th>Maturity</th><th>Attempted</th><th>Closed</th><th>Solved</th><th>Success</th><th>Cost/task</th><th>Cost/solved</th><th>Cleanup</th><th>Coverage</th></tr></thead><tbody>{cohort_rows or '<tr><td colspan="10">No task cohorts.</td></tr>'}</tbody></table></section>
+<section class="panel table-panel"><h2>Execution strategies</h2><table><caption>Equivalent task types only; thresholds are {report.thresholds.get("provisional_closed_tasks", 30)} provisional and {report.thresholds.get("ranked_closed_tasks", 100)} ranked closed tasks</caption><thead><tr><th>Task type</th><th>Strategy</th><th>Version</th><th>Maturity</th><th>Closed</th><th>Eventual success</th><th>Attempt success</th><th>Cost/task</th><th>Cost/solved</th><th>P50 / P90</th><th>Composition</th></tr></thead><tbody>{strategy_rows or '<tr><td colspan="11">No strategy comparisons.</td></tr>'}</tbody></table></section>
+<section class="panel"><h2>Independent optimisation scenarios</h2><p>Scenarios are alternatives or partially overlapping levers. They are not summed.</p><ul class="scenario-list">{scenario_rows}</ul></section>
+</section>
+<section id="usage-panel" role="tabpanel" aria-labelledby="usage-tab" hidden><div class="panel fallback"><h2>Usage &amp; diagnostics</h2><p>Request/token diagnostics remain available offline; no raw event values are rendered here.</p>{_model_table(overview_report) if overview_report is not None else ""}</div></section>
+<script>(function(){{const tabs=[...document.querySelectorAll('[role=tab]')],panels=[...document.querySelectorAll('[role=tabpanel]')];function activate(i,focus){{tabs.forEach((t,n)=>{{const on=n===i;t.setAttribute('aria-selected',on);t.tabIndex=on?0:-1;panels[n].hidden=!on}});if(focus)tabs[i].focus();if(history.replaceState)history.replaceState(null,'','#'+tabs[i].id.replace('-tab',''))}}tabs.forEach((tab,i)=>{{tab.addEventListener('click',()=>activate(i,false));tab.addEventListener('keydown',e=>{{if(e.key==='ArrowRight'||e.key==='ArrowLeft'){{e.preventDefault();activate((i+(e.key==='ArrowRight'?1:tabs.length-1))%tabs.length,true)}}if(e.key==='Home'){{e.preventDefault();activate(0,true)}}if(e.key==='End'){{e.preventDefault();activate(tabs.length-1,true)}}}})}});const hash=location.hash.toLowerCase();if(hash==='#overview')activate(0,false);if(hash==='#task')activate(1,false);if(hash==='#usage')activate(2,false);}})();</script>
+</main></body></html>"""

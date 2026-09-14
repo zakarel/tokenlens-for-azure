@@ -8,11 +8,74 @@ from typing import Any, TextIO
 
 from pydantic import ValidationError
 
+from .events import TaskEvent, parse_event, validate_event_stream
 from .models import TraceRecord, Usage
 
 
 class InputError(ValueError):
     """Raised when a JSONL record cannot be normalized."""
+
+
+def iter_events(
+    source: TextIO,
+    *,
+    source_name: str = "stdin",
+    aliases: dict[str, str] | None = None,
+) -> Iterator[TaskEvent]:
+    """Read only schema-v2 task events and report file/line without raw values."""
+    for line_number, line in enumerate(source, 1):
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise InputError(f"Invalid JSON in {source_name} on line {line_number}: {exc.msg}") from exc
+        if not isinstance(raw, dict) or raw.get("schema_version") != 2:
+            continue
+        try:
+            yield parse_event(raw, aliases=aliases)
+        except (ValidationError, ValueError) as exc:
+            # Pydantic errors can include user values. Keep diagnostics structural.
+            error_count = len(getattr(exc, "errors", lambda: [])())
+            raise InputError(
+                f"Invalid task event in {source_name} on line {line_number} ({error_count or 'schema'} validation error)"
+            ) from exc
+
+
+def load_task_events_many(
+    paths: Iterable[str],
+    *,
+    aliases: dict[str, str] | None = None,
+) -> tuple[list[TaskEvent], str]:
+    """Load v2 JSONL events from files/directories/globs in deterministic order."""
+    expanded: list[Path] = []
+    for value in paths:
+        if value == "-":
+            import sys
+
+            events = list(iter_events(sys.stdin, aliases=aliases))
+            return validate_event_stream(events), "stdin"
+        path = Path(value)
+        matches = [Path(item) for item in glob.glob(value, recursive=True)] if any(char in value for char in "*?[") else [path]
+        for match in matches:
+            if match.is_dir():
+                expanded.extend(sorted(item for item in match.glob("*.jsonl") if item.is_file()))
+            elif match.is_file():
+                expanded.append(match)
+    unique = list(dict.fromkeys(expanded))
+    if not unique:
+        raise InputError(f"Input file not found: {', '.join(paths)}")
+    events: list[TaskEvent] = []
+    for path in unique:
+        with path.open("r", encoding="utf-8") as source:
+            events.extend(iter_events(source, source_name=str(path), aliases=aliases))
+    try:
+        return validate_event_stream(events), ", ".join(str(path) for path in unique)
+    except ValueError as exc:
+        raise InputError(str(exc)) from exc
+
+
+load_events = load_task_events_many
 
 
 def _content(value: Any) -> str:

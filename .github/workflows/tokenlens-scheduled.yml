@@ -28,6 +28,8 @@ jobs:
           TOKENLENS_TRACE_INPUT: ${{ inputs.trace-path || vars.TOKENLENS_TRACE_INPUT }}
         run: |
           test -n "${TOKENLENS_TRACE_INPUT}"
+          # TOKENLENS_TRACE_INPUT may point to rotated v2 event JSONL files.
+          # Keep enough lookback to join late task results and human reviews.
           tokenlens-azure analyze "${TOKENLENS_TRACE_INPUT}" --format html --output-dir reports
           tokenlens-azure analyze "${TOKENLENS_TRACE_INPUT}" --format json --output-dir reports
       - uses: actions/upload-artifact@v4

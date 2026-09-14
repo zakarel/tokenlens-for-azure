@@ -76,8 +76,9 @@ class AnalysisSummary(BaseModel):
     info_findings: int
     addressable_min_tokens: int
     addressable_max_tokens: int
-    addressable_min_percent: float
-    addressable_max_percent: float
+    addressable_min_percent: float = 0
+    addressable_max_percent: float = 0
+    addressable_aggregation: Literal["largest_individual_opportunity", "not_combined_due_to_overlap"] = "largest_individual_opportunity"
     average_tokens_per_request: float = 0
     average_latency_ms: float | None = None
 
@@ -108,3 +109,4 @@ class AnalysisReport(BaseModel):
     deployments: list[DeploymentAnalysis] = Field(default_factory=list)
     rules: list[dict[str, Any]]
     report_metadata: dict[str, Any] = Field(default_factory=dict)
+    task_economics: Any | None = None
