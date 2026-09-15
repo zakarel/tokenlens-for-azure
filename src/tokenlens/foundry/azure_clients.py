@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 from datetime import timedelta
 from typing import Any, Iterable, Sequence
 
@@ -31,6 +32,17 @@ def credential() -> Any:
     from azure.identity import DefaultAzureCredential
 
     return DefaultAzureCredential(exclude_interactive_browser_credential=True)
+
+
+def metrics_endpoint_for_location(location: str) -> str:
+    """Return the regional QueryMetrics endpoint for an Azure location."""
+    normalized = re.sub(r"[\s_-]+", "", location.strip().casefold())
+    if not normalized or not re.fullmatch(r"[a-z0-9]+", normalized):
+        raise CollectorError(
+            "The Foundry account location could not be converted to an Azure Monitor "
+            "regional endpoint. Pass TOKENLENS_METRICS_ENDPOINT explicitly."
+        )
+    return f"https://{normalized}.metrics.monitor.azure.com"
 
 
 class AzureMonitorMetricsClient:
@@ -152,6 +164,15 @@ class AzureResourceClient:
                 "capacity": getattr(sku, "capacity", None) if sku else None,
             }
 
+    def get_account(self, resource_group: str, account: str) -> dict[str, Any]:
+        """Return the selected account metadata needed for regional collection."""
+        selected = self._client.accounts.get(resource_group, account)
+        return {
+            "name": getattr(selected, "name", account),
+            "kind": getattr(selected, "kind", ""),
+            "location": getattr(selected, "location", ""),
+        }
+
     def list_metric_definitions(self, resource: str) -> Iterable[str]:
         if not has_package("azure.mgmt.monitor"):
             raise CollectorError("azure-mgmt-monitor is not installed. " + MONITOR_EXTRA_HINT)
@@ -178,5 +199,6 @@ __all__ = [
     "AzureResourceClient",
     "credential",
     "has_package",
+    "metrics_endpoint_for_location",
     "resource_uri",
 ]

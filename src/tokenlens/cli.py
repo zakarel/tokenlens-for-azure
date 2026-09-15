@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import webbrowser
 from importlib.resources import files
@@ -497,25 +498,61 @@ def collect_app_insights(
     typer.echo(f"dropped-events={writer.dropped_events}")
 
 
-def _foundry_clients(subscription_id: str):
-    from .foundry.azure_clients import AzureMonitorMetricsClient, AzureResourceClient
+def _foundry_resource_client(subscription_id: str):
+    from .foundry.azure_clients import AzureResourceClient
     from .foundry.monitor import CollectorError
 
     try:
-        return AzureResourceClient.create(subscription_id), AzureMonitorMetricsClient.create()
+        return AzureResourceClient.create(subscription_id)
     except CollectorError as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+def _foundry_metrics_client(endpoint: str):
+    from .foundry.azure_clients import AzureMonitorMetricsClient
+    from .foundry.monitor import CollectorError
+
+    try:
+        return AzureMonitorMetricsClient.create(endpoint=endpoint)
+    except CollectorError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _azure_cli_subscription() -> str | None:
+    """Read the Azure CLI's explicitly selected subscription without scanning."""
+    if not shutil.which("az"):
+        return None
+    try:
+        result = subprocess.run(
+            ["az", "account", "show", "--query", "id", "-o", "tsv"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    subscription = result.stdout.strip()
+    return subscription if result.returncode == 0 and subscription else None
 
 
 def _resolved_subscription(explicit: str | None, settings: dict) -> str:
     foundry = settings.get("foundry", {}) if isinstance(settings.get("foundry", {}), dict) else {}
     env_name = str(foundry.get("subscription_id_env") or "AZURE_SUBSCRIPTION_ID")
-    subscription = explicit or os.getenv(env_name)
+    configured = explicit or os.getenv(env_name)
+    if configured:
+        return configured
+    subscription = _azure_cli_subscription()
     if not subscription:
         raise typer.BadParameter(
-            f"No subscription selected. Pass --subscription or set {env_name}. "
-            "TokenLens never scans every accessible subscription."
+            f"No subscription selected. Pass --subscription, set {env_name}, or run "
+            "`az account set --subscription <name-or-id>`. TokenLens uses only the "
+            "Azure CLI's selected subscription and never scans every accessible subscription."
         )
+    typer.echo(
+        "subscription-source=azure-cli-active "
+        "(verify with `az account show`; change with `az account set --subscription ...`)"
+    )
     return subscription
 
 
@@ -532,7 +569,7 @@ def list_foundry_resources(
     settings = _load_config(config)
     subscription_id = _resolved_subscription(subscription, settings)
     typer.echo("azure-access=this command queries Azure Resource Manager")
-    resources, _ = _foundry_clients(subscription_id)
+    resources = _foundry_resource_client(subscription_id)
     for account in resources.list_accounts(subscription_id, resource_group):
         typer.echo(f"account={account['name']} resource-group={account['resource_group']} kind={account['kind']}")
 
@@ -548,7 +585,7 @@ def list_foundry_deployments(
     settings = _load_config(config)
     subscription_id = _resolved_subscription(subscription, settings)
     typer.echo("azure-access=this command queries Azure Resource Manager")
-    resources, _ = _foundry_clients(subscription_id)
+    resources = _foundry_resource_client(subscription_id)
     for deployment in resources.list_deployments(subscription_id, resource_group, account):
         typer.echo(
             f"deployment={deployment['name']} model={deployment['model']} "
@@ -601,11 +638,23 @@ def collect_foundry_metrics(
     subscription_id = _resolved_subscription(subscription, settings)
     lookback = days or int(monitor_settings.get("lookback_days", 14))
     typer.echo("azure-access=this command queries Azure Monitor metrics")
-    resources, metrics_client = _foundry_clients(subscription_id)
+    resources = _foundry_resource_client(subscription_id)
     from .foundry.monitor import resource_uri
 
     uri = resource_uri(subscription_id, resource_group, account)
     try:
+        account_metadata = resources.get_account(resource_group, account)
+        from .foundry.azure_clients import metrics_endpoint_for_location
+
+        configured_endpoint = (
+            monitor_settings.get("metrics_endpoint")
+            or os.getenv("TOKENLENS_METRICS_ENDPOINT")
+        )
+        metrics_endpoint = str(
+            configured_endpoint
+            or metrics_endpoint_for_location(str(account_metadata.get("location") or ""))
+        )
+        metrics_client = _foundry_metrics_client(metrics_endpoint)
         available = list(resources.list_metric_definitions(uri))
         result = collect_metrics(
             metrics_client=metrics_client,
@@ -713,11 +762,50 @@ def connect_foundry(
         typer.echo("next: tokenlens-azure list-foundry-resources --subscription <subscription-id>")
 
 
+def _smoke_endpoint(api: str, explicit: str | None) -> str:
+    """Resolve and validate the endpoint for one provider-specific smoke test."""
+    if api == "anthropic":
+        endpoint = explicit or (
+            os.getenv("FOUNDRY_ENDPOINT")
+            or os.getenv("AZURE_AI_PROJECT_ENDPOINT")
+            or os.getenv("AZURE_OPENAI_ENDPOINT")
+        )
+        if not endpoint:
+            raise typer.BadParameter(
+                "Pass --endpoint or set FOUNDRY_ENDPOINT before smoke testing."
+            )
+        endpoint = endpoint.rstrip("/")
+        if endpoint.endswith(".services.ai.azure.com"):
+            endpoint += "/anthropic"
+        if ".services.ai.azure.com" not in endpoint or not endpoint.endswith("/anthropic"):
+            raise typer.BadParameter(
+                "Claude smoke tests require a Foundry services endpoint, for example "
+                "https://RESOURCE.services.ai.azure.com or "
+                "https://RESOURCE.services.ai.azure.com/anthropic."
+            )
+        return endpoint
+    endpoint = explicit or (
+        os.getenv("AZURE_OPENAI_ENDPOINT")
+        or os.getenv("FOUNDRY_ENDPOINT")
+        or os.getenv("AZURE_AI_PROJECT_ENDPOINT")
+    )
+    if not endpoint:
+        raise typer.BadParameter(
+            "Pass --endpoint or set AZURE_OPENAI_ENDPOINT before smoke testing."
+        )
+    return endpoint
+
+
 @app.command("smoke-test-foundry")
 def smoke_test_foundry(
     deployment: str = typer.Option(..., "--deployment", help="Deployment name to call exactly once."),
     prompt: str = typer.Option("Reply with the single word: ok.", "--prompt", help="Prompt for the single test call."),
     api: str = typer.Option("openai", "--api", help="openai (Chat Completions/Responses) or anthropic (Messages)."),
+    endpoint: str | None = typer.Option(
+        None,
+        "--endpoint",
+        help="Provider endpoint. Overrides AZURE_OPENAI_ENDPOINT or FOUNDRY_ENDPOINT.",
+    ),
     output_dir: str = typer.Option("foundry-traces", "--output-dir", help="Private directory for the captured record."),
     max_output_tokens: int = typer.Option(64, "--max-output-tokens", help="Bound on the single response."),
     yes: bool = typer.Option(False, "--yes", help="Skip the billable-request confirmation."),
@@ -734,27 +822,11 @@ def smoke_test_foundry(
         typer.echo("cancelled=no request was made")
         return
     writer = TelemetryWriter(TelemetryConfig.from_env(output_dir=Path(output_dir)))
+    api = api.casefold()
+    if api not in {"openai", "anthropic"}:
+        raise typer.BadParameter("api must be openai or anthropic")
+    resolved_endpoint = _smoke_endpoint(api, endpoint)
     if api == "anthropic":
-        endpoint = (
-            os.getenv("FOUNDRY_ENDPOINT")
-            or os.getenv("AZURE_AI_PROJECT_ENDPOINT")
-            or os.getenv("AZURE_OPENAI_ENDPOINT")
-        )
-    else:
-        endpoint = (
-            os.getenv("AZURE_OPENAI_ENDPOINT")
-            or os.getenv("FOUNDRY_ENDPOINT")
-            or os.getenv("AZURE_AI_PROJECT_ENDPOINT")
-        )
-    if not endpoint:
-        expected = "FOUNDRY_ENDPOINT" if api == "anthropic" else "AZURE_OPENAI_ENDPOINT"
-        raise typer.BadParameter(f"Set {expected} before smoke testing.")
-    if api == "anthropic":
-        if ".services.ai.azure.com" not in endpoint or not endpoint.rstrip("/").endswith("/anthropic"):
-            raise typer.BadParameter(
-                "Claude smoke tests require FOUNDRY_ENDPOINT ending in "
-                "/anthropic, for example https://RESOURCE.services.ai.azure.com/anthropic."
-            )
         if not _has_package("anthropic") or not _has_package("azure.identity"):
             raise typer.BadParameter(
                 "Install tokenlens-azure[foundry-claude] to smoke test a Claude deployment."
@@ -770,7 +842,7 @@ def smoke_test_foundry(
         client = instrument_anthropic_foundry(
             AnthropicFoundry(
                 azure_ad_token_provider=token_provider,
-                base_url=endpoint,
+                base_url=resolved_endpoint,
             ),
             writer=writer,
         )
@@ -792,7 +864,7 @@ def smoke_test_foundry(
         )
         client = instrument_openai(
             AzureOpenAI(
-                azure_endpoint=endpoint,
+                azure_endpoint=resolved_endpoint,
                 azure_ad_token_provider=token_provider,
                 api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
             ),
@@ -803,8 +875,6 @@ def smoke_test_foundry(
             messages=[{"role": "user", "content": prompt}],
             max_completion_tokens=max_output_tokens,
         )
-    else:
-        raise typer.BadParameter("api must be openai or anthropic")
     typer.echo(f"trace-file={writer.current_path().resolve()}")
     typer.echo(f"records-written={writer.written_events} dropped={writer.dropped_events}")
     typer.echo("note=one call per deployment cannot support PTU analysis; collect Azure Monitor metrics for that")
