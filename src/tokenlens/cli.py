@@ -734,10 +734,27 @@ def smoke_test_foundry(
         typer.echo("cancelled=no request was made")
         return
     writer = TelemetryWriter(TelemetryConfig.from_env(output_dir=Path(output_dir)))
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("FOUNDRY_ENDPOINT") or os.getenv("AZURE_AI_PROJECT_ENDPOINT")
-    if not endpoint:
-        raise typer.BadParameter("Set AZURE_OPENAI_ENDPOINT or FOUNDRY_ENDPOINT before smoke testing.")
     if api == "anthropic":
+        endpoint = (
+            os.getenv("FOUNDRY_ENDPOINT")
+            or os.getenv("AZURE_AI_PROJECT_ENDPOINT")
+            or os.getenv("AZURE_OPENAI_ENDPOINT")
+        )
+    else:
+        endpoint = (
+            os.getenv("AZURE_OPENAI_ENDPOINT")
+            or os.getenv("FOUNDRY_ENDPOINT")
+            or os.getenv("AZURE_AI_PROJECT_ENDPOINT")
+        )
+    if not endpoint:
+        expected = "FOUNDRY_ENDPOINT" if api == "anthropic" else "AZURE_OPENAI_ENDPOINT"
+        raise typer.BadParameter(f"Set {expected} before smoke testing.")
+    if api == "anthropic":
+        if ".services.ai.azure.com" not in endpoint or not endpoint.rstrip("/").endswith("/anthropic"):
+            raise typer.BadParameter(
+                "Claude smoke tests require FOUNDRY_ENDPOINT ending in "
+                "/anthropic, for example https://RESOURCE.services.ai.azure.com/anthropic."
+            )
         if not _has_package("anthropic") or not _has_package("azure.identity"):
             raise typer.BadParameter(
                 "Install tokenlens-azure[foundry-claude] to smoke test a Claude deployment."
