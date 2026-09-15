@@ -8,6 +8,7 @@ construct a credential.
 from __future__ import annotations
 
 import importlib.util
+import os
 from datetime import timedelta
 from typing import Any, Iterable, Sequence
 
@@ -39,9 +40,21 @@ class AzureMonitorMetricsClient:
         self._client = client
 
     @classmethod
-    def create(cls, credential_object: Any | None = None) -> "AzureMonitorMetricsClient":
+    def create(
+        cls,
+        credential_object: Any | None = None,
+        *,
+        endpoint: str | None = None,
+    ) -> "AzureMonitorMetricsClient":
         if has_package("azure.monitor.querymetrics"):
             from azure.monitor.querymetrics import MetricsClient as _Client  # type: ignore[import-not-found]
+            metrics_endpoint = endpoint or os.getenv("TOKENLENS_METRICS_ENDPOINT")
+            if not metrics_endpoint:
+                raise CollectorError(
+                    "TOKENLENS_METRICS_ENDPOINT is required for azure-monitor-querymetrics, "
+                    "for example https://eastus2.metrics.monitor.azure.com."
+                )
+            return cls(_Client(metrics_endpoint, credential_object or credential()))
         elif has_package("azure.monitor.query"):
             from azure.monitor.query import MetricsQueryClient as _Client  # type: ignore[import-not-found]
         else:
@@ -61,6 +74,17 @@ class AzureMonitorMetricsClient:
     ) -> Any:
         # ``page_token`` is accepted for interface parity; the Azure SDK pages
         # internally and returns a complete response object.
+        if hasattr(self._client, "query_resources"):
+            results = self._client.query_resources(
+                resource_ids=[resource],
+                metric_namespace="Microsoft.CognitiveServices/accounts",
+                metric_names=list(metric_names),
+                timespan=timespan,
+                granularity=granularity if isinstance(granularity, timedelta) else timedelta(minutes=5),
+                aggregations=list(aggregations),
+                filter=filter,
+            )
+            return {"metrics": getattr(results[0], "metrics", []) if results else []}
         return self._client.query_resource(
             resource,
             metric_names=list(metric_names),
