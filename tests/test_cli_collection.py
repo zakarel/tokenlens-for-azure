@@ -127,12 +127,56 @@ def test_imported_telemetry_analyzes_offline(tmp_path, monkeypatch):
 def test_collect_requires_an_explicit_subscription(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AZURE_SUBSCRIPTION_ID", raising=False)
+    monkeypatch.setattr("tokenlens.cli._azure_cli_subscription", lambda: None)
     result = runner.invoke(
         app,
         ["collect-foundry-metrics", "--resource-group", "rg", "--account", "acct"],
     )
     assert result.exit_code != 0
     assert "subscription" in result.output.casefold()
+
+
+def test_collect_uses_the_azure_cli_selected_subscription(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AZURE_SUBSCRIPTION_ID", raising=False)
+    monkeypatch.setattr(
+        "tokenlens.cli._azure_cli_subscription",
+        lambda: "00000000-0000-0000-0000-000000000000",
+    )
+    captured: dict = {}
+
+    class StubResources:
+        def get_account(self, resource_group, account):
+            return {"location": "eastus2"}
+
+        def list_metric_definitions(self, uri):
+            return ["InputTokens"]
+
+    monkeypatch.setattr("tokenlens.cli._foundry_resource_client", lambda subscription: StubResources())
+    monkeypatch.setattr("tokenlens.cli._foundry_metrics_client", lambda endpoint: object())
+
+    def fake_collect(**kwargs):
+        captured.update(kwargs)
+        from tokenlens.foundry.monitor import CollectionResult
+
+        return CollectionResult(records=[], window_start=None, window_end=None)
+
+    monkeypatch.setattr("tokenlens.foundry.monitor.collect_metrics", fake_collect)
+    result = runner.invoke(
+        app,
+        [
+            "collect-foundry-metrics",
+            "--resource-group",
+            "rg",
+            "--account",
+            "acct",
+            "--output-dir",
+            "metrics",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "subscription-source=azure-cli-active" in result.output
+    assert captured["subscription_id"] == "00000000-0000-0000-0000-000000000000"
 
 
 def test_collect_rejects_unsupported_granularity(tmp_path, monkeypatch):
@@ -173,6 +217,27 @@ def test_smoke_test_rejects_an_unknown_api(tmp_path, monkeypatch):
         ["smoke-test-foundry", "--deployment", "d", "--api", "cohere-native", "--yes"],
     )
     assert result.exit_code != 0
+
+
+def test_claude_smoke_endpoint_normalizes_services_base_and_ignores_stale_openai(monkeypatch):
+    from tokenlens.cli import _smoke_endpoint
+
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://old-resource.openai.azure.com/")
+    monkeypatch.setenv("FOUNDRY_ENDPOINT", "https://example-resource.services.ai.azure.com/")
+    assert (
+        _smoke_endpoint("anthropic", None)
+        == "https://example-resource.services.ai.azure.com/anthropic"
+    )
+
+
+def test_explicit_smoke_endpoint_overrides_provider_environment(monkeypatch):
+    from tokenlens.cli import _smoke_endpoint
+
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://old-resource.openai.azure.com/")
+    assert (
+        _smoke_endpoint("openai", "https://new-resource.openai.azure.com/")
+        == "https://new-resource.openai.azure.com/"
+    )
 
 
 def test_import_otel_is_idempotent_and_reports_existing_records(tmp_path, monkeypatch):
@@ -233,11 +298,11 @@ def test_collect_passes_the_deployment_mode_when_no_deployment_is_named(tmp_path
     captured: dict = {}
 
     class StubResources:
+        def get_account(self, resource_group, account):
+            return {"location": "eastus2"}
+
         def list_metric_definitions(self, uri):
             return ["ProcessedPromptTokens", "GeneratedTokens", "AzureOpenAIRequests"]
-
-    def fake_clients(subscription_id):
-        return StubResources(), object()
 
     def fake_collect(**kwargs):
         captured.update(kwargs)
@@ -245,7 +310,8 @@ def test_collect_passes_the_deployment_mode_when_no_deployment_is_named(tmp_path
 
         return CollectionResult(records=[], window_start=None, window_end=None)
 
-    monkeypatch.setattr("tokenlens.cli._foundry_clients", fake_clients)
+    monkeypatch.setattr("tokenlens.cli._foundry_resource_client", lambda subscription_id: StubResources())
+    monkeypatch.setattr("tokenlens.cli._foundry_metrics_client", lambda endpoint: object())
     monkeypatch.setattr("tokenlens.foundry.monitor.collect_metrics", fake_collect)
     result = runner.invoke(
         app,

@@ -26,6 +26,7 @@ from tokenlens.foundry.monitor import (
     resource_uri,
     supported_metrics,
 )
+from tokenlens.foundry.azure_clients import metrics_endpoint_for_location
 from tokenlens.ingest import iter_records
 from tokenlens.pricing import PriceEntry, PricingCatalog
 from tokenlens.telemetry import record_json
@@ -46,6 +47,13 @@ WINDOW = CollectionWindow(
     end=datetime(2026, 9, 14, tzinfo=UTC),
     granularity_minutes=5,
 )
+
+
+def test_metrics_endpoint_is_derived_from_the_account_location():
+    assert (
+        metrics_endpoint_for_location("East US 2")
+        == "https://eastus2.metrics.monitor.azure.com"
+    )
 
 
 class FakeStatusError(Exception):

@@ -189,8 +189,18 @@ py -m venv .venv
 .\.venv\Scripts\tokenlens-azure.exe --help
 ```
 
-For Foundry capture, install the optional dependencies with
-`.venv/bin/python -m pip install -e ".[foundry]"`. Activating with
+For the complete Foundry smoke-test and Azure Monitor collection workflow,
+install all provider and collector extras before running `doctor`:
+
+```bash
+.venv/bin/python -m pip install -e ".[foundry,foundry-claude,foundry-monitor]"
+.venv/bin/tokenlens-azure doctor
+```
+
+`doctor` should report the Azure OpenAI, Claude, and Foundry Monitor capabilities
+as ready. A `collector-extras=missing` message means collection is not ready;
+run the installation command above inside the same virtual environment.
+Activating with
 `. .venv/bin/activate` (POSIX) or `.venv\Scripts\Activate.ps1` (PowerShell) is
 an optional convenience only.
 
@@ -261,30 +271,43 @@ collect Azure Monitor aggregates once per window.
 
 #### 1. Smoke test one deployment
 
+Pass the endpoint directly so switching providers does not depend on stale shell
+environment variables.
+
+**Azure OpenAI / Microsoft models:**
+
 ```bash
 az login
 .venv/bin/tokenlens-azure doctor
-export AZURE_OPENAI_ENDPOINT="https://YOUR-RESOURCE.openai.azure.com/"
-.venv/bin/tokenlens-azure smoke-test-foundry --deployment YOUR_DEPLOYMENT
+.venv/bin/tokenlens-azure smoke-test-foundry \
+  --deployment YOUR_DEPLOYMENT \
+  --api openai \
+  --endpoint "https://YOUR-RESOURCE.openai.azure.com/"
 ```
 
 This makes **exactly one billable request** and says so before running. It
 proves connectivity and normalization. It cannot support PTU analysis: one call
 per deployment is not a representative workload. Claude deployments use
 `--api anthropic` and the Messages API; they are never routed through OpenAI
-chat completions. For Claude, set the endpoint to the Anthropic Foundry base
-URL and rely on the Entra credential chain:
+chat completions.
+
+**Claude on Foundry:**
 
 ```bash
-unset AZURE_OPENAI_ENDPOINT
-export FOUNDRY_ENDPOINT="https://YOUR-RESOURCE.services.ai.azure.com/anthropic"
 .venv/bin/tokenlens-azure smoke-test-foundry \
   --deployment YOUR_CLAUDE_DEPLOYMENT \
-  --api anthropic
+  --api anthropic \
+  --endpoint "https://YOUR-RESOURCE.services.ai.azure.com"
 ```
 
 The Claude smoke-test path requests an Entra token for
-`https://ai.azure.com/.default`; no Anthropic API key is required.
+`https://ai.azure.com/.default`; no Anthropic API key is required. TokenLens
+accepts either the resource base URL above or the full URL ending in
+`/anthropic` and normalizes it automatically.
+
+The OpenAI smoke test uses `max_completion_tokens`, which is required by modern
+models such as GPT-5.6 Luna. The Claude path uses the native `max_tokens`
+Messages API field.
 
 #### 2. Collect application request telemetry
 
@@ -388,8 +411,9 @@ Claude on Foundry) that have no dedicated token-metric policy.
 
 ```bash
 az login
+.venv/bin/python -m pip install -e ".[foundry-monitor]"
 .venv/bin/tokenlens-azure connect-foundry
-.venv/bin/tokenlens-azure list-foundry-resources --subscription SUBSCRIPTION_ID
+.venv/bin/tokenlens-azure doctor
 .venv/bin/tokenlens-azure collect-foundry-metrics \
   --resource-group RESOURCE_GROUP \
   --account ACCOUNT \
@@ -398,6 +422,26 @@ az login
   --deployment-mode global
 .venv/bin/tokenlens-azure analyze local-traces/foundry-metrics --format html --open
 ```
+
+When `--subscription` and `AZURE_SUBSCRIPTION_ID` are absent, TokenLens uses the
+active Azure CLI subscription and prints
+`subscription-source=azure-cli-active` before contacting Azure. Azure CLI can
+choose a default automatically after login, so verify it and select the intended
+subscription before collection:
+
+```bash
+az account show --query "{name:name,id:id}" -o table
+az account set --subscription "SUBSCRIPTION NAME OR ID"
+```
+
+You may still pass `--subscription` or set `AZURE_SUBSCRIPTION_ID` for
+noninteractive automation. TokenLens never scans every accessible subscription.
+
+The collector reads the Foundry account location and automatically selects the
+matching regional Azure Monitor endpoint, such as
+`https://eastus2.metrics.monitor.azure.com`. Set
+`TOKENLENS_METRICS_ENDPOINT` only as an advanced override for sovereign clouds
+or an unusual endpoint.
 
 `collect-foundry-metrics` contacts Azure Monitor and collects five-minute
 aggregate counters only: token volume, request counts, HTTP 429 counts, and
@@ -411,14 +455,27 @@ unrestricted collection where deployment names are discovered from the returned
 metric dimensions. Metrics the resource does not expose are reported as missing,
 never substituted with zero.
 
-Discovery is scoped to one explicitly selected subscription — TokenLens never
-scans every accessible subscription.
+Discovery is scoped to the explicitly passed, configured, or Azure CLI-selected
+subscription.
 
 `connect-foundry` asks at most four questions, writes a credential-free
 `.tokenlens.yml`, and creates private output directories. `doctor` reports
 offline-analyzer readiness, each optional extra, credential availability,
 configuration validity, and output-directory permissions without ever making an
 inference call.
+
+#### First-run error guide
+
+| Message | Meaning and fix |
+|---|---|
+| `collector-extras=missing` | Install `.[foundry-monitor]` in the same virtual environment, then rerun `doctor`. |
+| `Missing credentials` from Claude | Run `az login`; use `--api anthropic`. TokenLens passes the Entra token provider automatically. |
+| Claude `404 Resource not found` | Use the Foundry services endpoint with `--endpoint https://RESOURCE.services.ai.azure.com`; do not use the OpenAI endpoint. |
+| Claude endpoint must end in `/anthropic` | Current versions append `/anthropic` automatically when the services base URL is supplied. |
+| `max_tokens is not supported` | Update TokenLens; the OpenAI smoke path now uses `max_completion_tokens`. |
+| `No subscription selected` | Run `az account set --subscription ...`, pass `--subscription`, or set `AZURE_SUBSCRIPTION_ID`. |
+| `missing ... credential` from QueryMetrics | Update TokenLens; the collector now constructs the regional client with `DefaultAzureCredential`. |
+| Azure Monitor `status 400` | Update TokenLens; metrics are queried separately so incompatible dimension combinations do not abort collection. |
 
 #### Privacy model
 
