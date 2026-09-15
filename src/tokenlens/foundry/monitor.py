@@ -206,7 +206,11 @@ def _metric_value(entry: Any, aggregation: str) -> float | None:
 
 
 def _entry_timestamp(entry: Any) -> datetime | None:
-    value = entry.get("timeStamp") if isinstance(entry, dict) else getattr(entry, "timestamp", None)
+    value = (
+        entry.get("timeStamp")
+        if isinstance(entry, dict)
+        else getattr(entry, "timestamp", None) or getattr(entry, "time_stamp", None)
+    )
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=UTC)
     if isinstance(value, str):
@@ -228,7 +232,9 @@ def _iter_series(response: Any) -> Iterable[tuple[str, dict[str, str], Any]]:
         series = metric.get("timeseries") if isinstance(metric, dict) else getattr(metric, "timeseries", [])
         for item in series or []:
             raw_dimensions = (
-                item.get("metadata_values") if isinstance(item, dict) else getattr(item, "metadata_values", None)
+                item.get("metadata_values")
+                if isinstance(item, dict)
+                else getattr(item, "metadata_values", None) or getattr(item, "metadatavalues", None)
             ) or []
             dimensions: dict[str, str] = {}
             for dimension in raw_dimensions:
