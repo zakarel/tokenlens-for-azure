@@ -276,6 +276,7 @@ chat completions. For Claude, set the endpoint to the Anthropic Foundry base
 URL and rely on the Entra credential chain:
 
 ```bash
+unset AZURE_OPENAI_ENDPOINT
 export FOUNDRY_ENDPOINT="https://YOUR-RESOURCE.services.ai.azure.com/anthropic"
 .venv/bin/tokenlens-azure smoke-test-foundry \
   --deployment YOUR_CLAUDE_DEPLOYMENT \
