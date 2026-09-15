@@ -801,7 +801,7 @@ def smoke_test_foundry(
         client.chat.completions.create(
             model=deployment,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_output_tokens,
+            max_completion_tokens=max_output_tokens,
         )
     else:
         raise typer.BadParameter("api must be openai or anthropic")
