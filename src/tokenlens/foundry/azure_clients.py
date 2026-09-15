@@ -75,16 +75,30 @@ class AzureMonitorMetricsClient:
         # ``page_token`` is accepted for interface parity; the Azure SDK pages
         # internally and returns a complete response object.
         if hasattr(self._client, "query_resources"):
-            results = self._client.query_resources(
-                resource_ids=[resource],
-                metric_namespace="Microsoft.CognitiveServices/accounts",
-                metric_names=list(metric_names),
-                timespan=timespan,
-                granularity=granularity if isinstance(granularity, timedelta) else timedelta(minutes=5),
-                aggregations=list(aggregations),
-                filter=filter,
-            )
-            return {"metrics": getattr(results[0], "metrics", []) if results else []}
+            metrics: list[Any] = []
+            for metric_name in metric_names:
+                aggregation = "Average" if metric_name.casefold() in {"latency", "normalizedtimetofirstbyte"} else "Total"
+                try:
+                    results = self._client.query_resources(
+                        resource_ids=[resource],
+                        metric_namespace="Microsoft.CognitiveServices/accounts",
+                        metric_names=[metric_name],
+                        timespan=timespan,
+                        granularity=granularity if isinstance(granularity, timedelta) else timedelta(minutes=5),
+                        aggregations=[aggregation],
+                        filter=filter,
+                    )
+                except Exception as exc:
+                    # Some Azure metrics exist only at account/API scope and
+                    # reject a deployment dimension filter. Preserve the
+                    # deployment-scoped metrics and let the collector report
+                    # the unsupported field as missing.
+                    if getattr(exc, "status_code", None) == 400:
+                        continue
+                    raise
+                if results:
+                    metrics.extend(getattr(results[0], "metrics", []) or [])
+            return {"metrics": metrics}
         return self._client.query_resource(
             resource,
             metric_names=list(metric_names),
