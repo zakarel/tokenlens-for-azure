@@ -19,6 +19,10 @@ from tokenlens.cli import app
 from tokenlens.foundry_workflow.configuration import customer_catalog_path, run_state_path
 
 from test_foundry_workflow import (  # noqa: F401 - shared synthetic doubles
+    ACCOUNT_A,
+    ACCOUNT_B,
+    DEPLOYMENT_A,
+    DEPLOYMENT_B,
     PRICED_MODEL,
     SUBSCRIPTION,
     UNPRICED_MODEL,
@@ -187,18 +191,91 @@ def test_configure_reports_detected_metadata_and_stores_no_credential(cli):
     assert "credentials-stored=none" in result.output
 
 
-def test_refresh_reuses_saved_settings_and_is_idempotent(cli):
+def test_refresh_reuses_saved_settings_in_a_new_isolated_run(cli):
     assert runner.invoke(app, COLLECT_ARGS).exit_code == 0
-    first = runner.invoke(app, ["foundry", "refresh", "--no-open"])
-    assert first.exit_code == 0, first.output
-    assert "records-written=0" in first.output
-    assert "already-present=8" in first.output
+    first_run = next(Path("local-traces/foundry-metrics/runs").iterdir())
+    refreshed = runner.invoke(app, ["foundry", "refresh", "--no-open"])
+    assert refreshed.exit_code == 0, refreshed.output
+    # A refresh is a new run: it re-collects the window into its own directory
+    # rather than appending to — or re-reading — the previous run.
+    assert "records-written=8" in refreshed.output
+    assert "already-present=0" in refreshed.output
+    assert "run-directory=local-traces/foundry-metrics/runs/run-" in refreshed.output
+    runs = sorted(item.name for item in Path("local-traces/foundry-metrics/runs").iterdir())
+    assert len(runs) == 2
+    # The earlier run is still on disk: history is never deleted.
+    assert first_run.name in runs
 
 
 def test_refresh_without_configuration_fails_with_an_actionable_error(cli):
     result = runner.invoke(app, ["foundry", "refresh"])
     assert result.exit_code == foundry_cli.EXIT_FAILED
     assert "foundry configure" in result.output
+
+
+def test_all_subscriptions_collects_every_account_noninteractively(cli, monkeypatch):
+    from tokenlens.foundry_workflow.models import SubscriptionOption
+    from tokenlens.foundry_workflow.orchestration import WorkflowServices
+
+    resources = {
+        "a" * 36: StubResources(accounts=[ACCOUNT_A], deployments=[DEPLOYMENT_A]),
+        "b" * 36: StubResources(accounts=[ACCOUNT_B], deployments=[DEPLOYMENT_B]),
+    }
+
+    def _services() -> WorkflowServices:
+        return WorkflowServices(
+            resource_client=lambda subscription: resources[subscription],
+            metrics_client=lambda endpoint: {"endpoint": endpoint},
+            collect=cli["collect"],
+            subscriptions=lambda: [
+                SubscriptionOption(subscription_id="a" * 36, name="Production Subscription"),
+                SubscriptionOption(subscription_id="b" * 36, name="Sandbox Subscription"),
+            ],
+            open_report=lambda path: True,
+            now=lambda: datetime(2026, 9, 15, tzinfo=UTC),
+            missing_packages=lambda: [],
+        )
+
+    monkeypatch.setattr(foundry_cli, "_services", _services)
+    result = runner.invoke(app, ["foundry", "collect", "--all-subscriptions", "--days", "14"])
+    assert result.exit_code == 0, result.output
+    assert "2 / 2 deployments succeeded" in result.output
+    assert "accounts=alpha-account, beta-account" in result.output
+    assert "alpha-prod" in result.output and "beta-prod" in result.output
+    # Neither subscription identifier is ever printed or written to the repo.
+    assert "a" * 36 not in result.output and "b" * 36 not in result.output
+    assert "a" * 36 not in Path(".tokenlens.yml").read_text(encoding="utf-8")
+
+
+def test_an_explicit_deployment_option_still_narrows_an_automated_run(cli):
+    result = runner.invoke(
+        app,
+        [
+            "foundry",
+            "collect",
+            "--subscription",
+            SUBSCRIPTION,
+            "--resource-group",
+            "example-rg",
+            "--account",
+            "example-foundry-account",
+            "--deployment",
+            "reasoning-prod",
+            "--days",
+            "14",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "1 / 1 deployments succeeded" in result.output
+    assert "coding-prod" not in result.output
+
+
+def test_collect_reports_the_run_directory_and_withheld_pricing(cli):
+    result = runner.invoke(app, COLLECT_ARGS + ["--deployment", "compact-prod"])
+    assert result.exit_code == 0, result.output
+    assert "run-directory=local-traces/foundry-metrics/runs/run-" in result.output
+    assert "pricing-withheld=compact-prod" in result.output
+    assert "pricing-remediation=tokenlens-azure pricing set-rate --model MODEL" in result.output
 
 
 def test_status_reports_coverage_without_leaking_identifiers(cli):
@@ -208,6 +285,9 @@ def test_status_reports_coverage_without_leaking_identifiers(cli):
     assert "configured=True" in result.output
     assert "account=example-foundry-account" in result.output
     assert "deployments=reasoning-prod, coding-prod" in result.output
+    assert "scope=account" in result.output
+    assert "accounts=example-foundry-account" in result.output
+    assert "last-run-directory=local-traces/foundry-metrics/runs/run-" in result.output
     assert "lookback-days=14" in result.output
     assert "collection-status=succeeded" in result.output
     assert "pricing-resolved=2/2" in result.output

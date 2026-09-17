@@ -300,6 +300,13 @@ def test_reruns_are_idempotent_through_deterministic_bucket_keys():
     assert len(dedupe(first.records + second.records)) == 50
 
 
+def test_same_named_deployments_in_different_accounts_have_distinct_event_ids():
+    first = collect(FakeMetricsClient(bucket_pages(1)), account="example-account-a")
+    second = collect(FakeMetricsClient(bucket_pages(1)), account="example-account-b")
+    assert first.records[0].event_id != second.records[0].event_id
+    assert len(dedupe(first.records + second.records)) == 2
+
+
 def test_collection_without_any_known_metric_is_an_error():
     with pytest.raises(CollectorError):
         collect(FakeMetricsClient([{"metrics": []}]), available_metrics=["SomeUnrelatedMetric"])

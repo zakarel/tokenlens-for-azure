@@ -160,7 +160,7 @@ def test_sparse_three_call_trace_has_no_curve_and_states_insufficient_evidence()
 
     rendered = report_html(report)
     assert "100 active five-minute buckets" in rendered
-    assert "consumption/marketplace offer" in rendered
+    assert "partner/Marketplace models billed per token or in provider credit units" in rendered
     # No invented economics for the sparse three-call trace.
     assert 'class="columns ptu-cost-explorer' not in rendered.split("smoke-a", 1)[0]
 

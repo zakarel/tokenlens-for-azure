@@ -127,7 +127,10 @@ def test_dated_model_versions_require_literal_or_explicit_alias_matches():
     assert may.deployments[0].summary.input_price_per_million == 1
     assert august.deployments[0].summary.input_price_per_million == 3
     assert alias.deployments[0].summary.input_price_per_million == 3
-    assert may.ptu_analysis.deployments[0].recommendation == "Model not supported"
+    # An exact dated model absent from the verified PTU capacity catalog is a
+    # missing-capacity state, never a claim that Azure does not support it.
+    assert may.ptu_analysis.deployments[0].recommendation == "Capacity data required"
+    assert may.ptu_analysis.deployments[0].eligibility_status == "model_capacity_unavailable"
 
     combined = analyze(
         [
@@ -205,7 +208,7 @@ def test_cached_input_uses_cached_rate_and_unknown_model_is_not_guessed():
     )
     assert unknown.summary.estimated_cost_usd is None
     assert unknown.summary.pricing_coverage_requests_percent == 0
-    assert unknown.ptu_analysis.deployments[0].recommendation == "Model not supported"
+    assert unknown.ptu_analysis.deployments[0].recommendation == "Capacity data required"
 
 
 def test_ptu_uses_five_minute_series_without_unknown_model_fallback():

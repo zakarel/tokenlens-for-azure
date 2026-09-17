@@ -18,6 +18,7 @@ from tokenlens import foundry_cli
 from tokenlens.cli import app
 from tokenlens.events import parse_event
 from tokenlens.foundry_workflow.orchestration import WorkflowServices
+from tokenlens.foundry_workflow import prompts as prompts_module
 from tokenlens.foundry_workflow.prompts import Choice, ScriptedPrompter, TyperPrompter, ascii_only, symbol
 from tokenlens.reports import report_html
 from tokenlens.tasks import reconstruct_tasks
@@ -221,7 +222,101 @@ def test_a_scripted_answer_must_be_one_of_the_offered_choices():
         prompter.select("Pick one", [Choice("a", "First"), Choice("b", "Second")])
 
 
-def test_multiselect_requires_at_least_one_selection():
-    prompter = ScriptedPrompter([[]])
-    with pytest.raises(AssertionError):
-        prompter.multiselect("Select deployments", [Choice("a", "First")], minimum=1)
+def test_the_multiselect_ui_is_gone_along_with_its_a_for_all_shortcut():
+    """Every discovered deployment is collected, so nothing is multi-selected."""
+    for prompter in (ScriptedPrompter([]), TyperPrompter(interactive=True)):
+        assert not hasattr(prompter, "multiselect")
+    source = Path(prompts_module.__file__).read_text(encoding="utf-8")
+    assert "multiselect" not in source
+    assert "'a' for all" not in source
+
+
+def test_plain_output_is_used_whenever_colour_or_unicode_is_unavailable(monkeypatch):
+    from tokenlens.foundry_workflow.prompts import plain_output, rich_enabled
+
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert plain_output() is True
+    assert rich_enabled() is False
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TOKENLENS_ASCII", "1")
+    assert plain_output() is True
+    assert rich_enabled() is False
+    monkeypatch.delenv("TOKENLENS_ASCII", raising=False)
+    monkeypatch.setenv("TOKENLENS_PLAIN", "1")
+    assert plain_output() is True
+
+
+def test_panels_and_tables_degrade_to_linear_text(monkeypatch):
+    import typer
+    from typer.testing import CliRunner as _Runner
+
+    prompter = TyperPrompter(interactive=True, rich=False)
+    inner = typer.Typer()
+
+    @inner.command()
+    def run() -> None:
+        prompter.panel("Pricing readiness", ["reasoning-prod OK", "compact-prod !"])
+        prompter.table(
+            "Deployments discovered in scope",
+            ["Deployment", "Model"],
+            [["reasoning-prod", "phi-4"]],
+            caption="All 1 deployment(s) are collected.",
+        )
+
+    result = _Runner().invoke(inner, [])
+    assert result.exit_code == 0
+    assert "Pricing readiness" in result.output
+    assert "reasoning-prod OK" in result.output
+    assert "  Deployment · Model" in result.output
+    assert "  reasoning-prod · phi-4" in result.output
+    assert "All 1 deployment(s) are collected." in result.output
+
+
+def test_rich_rendering_stays_accessible_and_never_crashes():
+    """The polished layout carries the same text, symbols, and numbers."""
+    from rich.console import Console
+
+    from tokenlens.foundry_workflow.prompts import PHASES, WorkflowProgress
+
+    console = Console(record=True, force_terminal=True, width=100, color_system="truecolor")
+    prompter = TyperPrompter(interactive=True, rich=True)
+    prompter._console = console
+    prompter.step(1, 4, "Azure subscription scope")
+    prompter._render([Choice("all", "All accessible subscriptions", "Every readable account", selected=True)])
+    prompter.table(
+        "Deployments discovered in scope",
+        ["Deployment", "Pricing"],
+        [["reasoning-prod", "Exact public rate"]],
+        caption="All 1 deployment(s) are collected.",
+    )
+    prompter.panel("Why cost is withheld", ["No exact rate for compact-prod."], tone="warning")
+    with WorkflowProgress(prompter, deployments=1) as progress:
+        progress.phase(PHASES[0], "1 account(s)")
+        progress.item("reasoning-prod", "collected")
+        progress.finish()
+    text = console.export_text()
+    assert "Step 1/4" in text
+    assert "Azure subscription scope" in text
+    assert "1." in text and "All accessible subscriptions" in text
+    assert "reasoning-prod" in text and "Exact public rate" in text
+    assert "All 1 deployment(s) are collected." in text
+    assert "Why cost is withheld" in text
+    # Progress is a real Rich bar, and each deployment is still stated in text.
+    assert "Discovering Azure resources" in text
+    assert "reasoning-prod · collected" in text
+
+
+def test_progress_falls_back_to_deterministic_lines_without_rich():
+    from tokenlens.foundry_workflow.prompts import PHASES, WorkflowProgress
+
+    prompter = ScriptedPrompter([])
+    with WorkflowProgress(prompter, deployments=2, enabled=False) as progress:
+        progress.phase(PHASES[0], "1 account(s)")
+        progress.item("reasoning-prod", "collected")
+        progress.item("coding-prod", "failed")
+        progress.finish()
+    assert prompter.transcript == [
+        f"phase=1/{len(PHASES)} {PHASES[0]} · 1 account(s)",
+        "✓ reasoning-prod · collected",
+        "✕ coding-prod · failed",
+    ]

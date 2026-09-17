@@ -44,7 +44,7 @@ def status_payload(*, path: str | None = None) -> dict[str, Any]:
     state = load_run_state()
     missing = missing_collector_packages()
     customer = load_customer_catalog()
-    readiness = pricing_readiness(config.foundry.deployments, customer_catalog=customer)
+    readiness = pricing_readiness(config.foundry.all_deployments, customer_catalog=customer)
     resolved = [item for item in readiness if item.resolved]
     return {
         "configuration": safe_display_path(config_path(path)),
@@ -53,14 +53,17 @@ def status_payload(*, path: str | None = None) -> dict[str, Any]:
         # The subscription ID is an Azure identifier: only its shortened form is
         # printed unless the user asks for the full value elsewhere.
         "subscription": _short(config.foundry.subscription_id),
+        "scope": config.foundry.scope,
+        "accounts": [item.account for item in config.foundry.targets],
         "resource-group": config.foundry.resource_group or "not configured",
         "account": config.foundry.account or "not configured",
         "region": config.foundry.region or "not configured",
-        "deployments": [item.name for item in config.foundry.deployments],
+        "deployments": config.foundry.deployment_names,
         "lookback-days": config.collection.lookback_days,
         "analysis-goal": config.collection.analysis_goal,
         "last-collection": state.last_collection or "never",
         "collection-status": state.collection_status,
+        "last-run-directory": state.run_directory or "none",
         "last-report": state.report or "none",
         "model-identity-coverage-percent": state.identity_coverage_percent,
         "pricing-coverage-percent": state.pricing_coverage_percent,
@@ -120,7 +123,7 @@ def workloads_payload(config: FoundryWorkflowConfig | None = None, *, path: str 
         if mapping.allocation == "shared"
         for deployment in mapping.deployments
     }
-    known = {canonical_workload_id(item.name) for item in config.foundry.deployments}
+    known = {canonical_workload_id(item.name) for item in config.foundry.all_deployments}
     stale = sorted(
         deployment
         for mapping in mappings
@@ -132,14 +135,14 @@ def workloads_payload(config: FoundryWorkflowConfig | None = None, *, path: str 
     return {
         "technical-workloads": len(technical),
         "technical-coverage": (
-            f"{len([item for item in technical if not item.stale])}/{len(config.foundry.deployments)} deployments"
+            f"{len([item for item in technical if not item.stale])}/{len(config.foundry.all_deployments)} deployments"
         ),
         "business-workloads": len(business),
         "business-identity-configured": f"{len(dedicated | shared)}/{len(known)} deployments",
         "shared-deployments-needing-request-tags": sorted(shared),
         "deployments-needing-configuration": sorted(
             item.name
-            for item in config.foundry.deployments
+            for item in config.foundry.all_deployments
             if canonical_workload_id(item.name) not in (dedicated | shared)
         ),
         "stale-mappings": stale,

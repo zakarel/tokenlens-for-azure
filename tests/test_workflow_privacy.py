@@ -109,7 +109,8 @@ def test_the_report_never_exposes_a_subscription_endpoint_or_request_id(cli):
 
 def test_collected_telemetry_is_contentless(cli):
     assert runner.invoke(app, COLLECT_ARGS).exit_code == 0
-    written = list(Path("local-traces/foundry-metrics").glob("*.jsonl"))
+    # Each run writes into its own directory beneath the configured output dir.
+    written = list(Path("local-traces/foundry-metrics").rglob("*.jsonl"))
     assert written
     for path in written:
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -219,3 +220,17 @@ def test_local_output_directories_are_created_private(cli):
     metrics_dir = Path("local-traces/foundry-metrics")
     assert metrics_dir.is_dir()
     assert metrics_dir.stat().st_mode & 0o077 == 0
+    run_dir = next((metrics_dir / "runs").iterdir())
+    assert run_dir.stat().st_mode & 0o077 == 0
+
+
+def test_the_run_directory_is_a_safe_relative_path(cli):
+    assert runner.invoke(app, COLLECT_ARGS).exit_code == 0
+    line = next(
+        item for item in runner.invoke(app, ["foundry", "status"]).output.splitlines()
+        if item.startswith("last-run-directory=")
+    )
+    value = line.split("=", 1)[1]
+    assert value.startswith("local-traces/foundry-metrics/runs/run-")
+    assert str(Path.home()) not in value
+    assert SUBSCRIPTION not in value
