@@ -109,11 +109,12 @@ def test_combined_report_keeps_brand_tabs_and_usage_charts():
 
     rendered = report_html(report.model_copy(update={"task_economics": TaskEconomicsReport()}))
     assert 'alt="TokenLens for Azure logo"' in rendered
-    assert rendered.count('<button class="tab"') == 4
+    assert rendered.count('<button class="tab"') == 5
     # Full labels stay in the accessibility tree; short labels are shown on
     # narrow viewports so a tab never wraps onto two lines.
     assert "<span class=\"tab-full\">Overview</span>" in rendered
     assert "<span class=\"tab-full\">Cost analysis</span>" in rendered
+    assert "<span class=\"tab-full\">Workloads</span>" in rendered
     assert "<span class=\"tab-full\">Usage &amp; diagnostics</span>" in rendered
     assert "<span class=\"tab-full\">PTU advisor</span>" in rendered
     assert "<span class=\"tab-short\" aria-hidden=\"true\">Cost</span>" in rendered

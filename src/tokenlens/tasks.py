@@ -61,6 +61,8 @@ class TaskTrajectory:
     task_type: str
     execution_strategy: str
     strategy_version: str
+    #: Explicit business workload label when instrumentation supplied one.
+    workload: str | None = None
     attempts: list[TaskAttempt] = field(default_factory=list)
     reviews: list[TaskReview] = field(default_factory=list)
     task_result: TaskResultEvent | None = None
@@ -162,6 +164,10 @@ def reconstruct_tasks(
             task_type=metadata.task_type or "",
             execution_strategy=metadata.execution_strategy or "",
             strategy_version=metadata.strategy_version or "",
+            workload=next(
+                (event.workload for event in task_events if event.workload),
+                None,
+            ),
             first_timestamp=min(event.timestamp for event in task_events),
         )
         attempts: dict[str, TaskAttempt] = {}

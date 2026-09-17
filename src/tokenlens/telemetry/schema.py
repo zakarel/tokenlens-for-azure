@@ -193,6 +193,12 @@ class MetricBucketRecord(_Canonical):
     deployment_mode: str = "unknown"
     scope: ResourceScope = Field(default_factory=ResourceScope)
     metrics: BucketMetrics = Field(default_factory=BucketMetrics)
+    #: Business workload identity for this bucket. Azure Monitor aggregates may
+    #: carry one only from an explicit *dedicated* deployment mapping — a shared
+    #: deployment's aggregate is never attributed to a workload.
+    workload: str | None = None
+    workload_source: Literal["deployment_mapping"] | None = None
+    allocation_confidence: Literal["exact_dedicated_deployment"] | None = None
     missing_metrics: list[str] = Field(default_factory=list)
     #: Canonical field -> the exact source metric that populated it. Provenance
     #: is recorded per field because one bucket is coalesced from several metric

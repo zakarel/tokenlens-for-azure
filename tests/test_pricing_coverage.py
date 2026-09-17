@@ -173,8 +173,13 @@ def test_removing_one_rate_produces_exact_partial_coverage_not_rounded_to_full()
     assert "no-exact-model-mode-price" in report.summary.unresolved_reasons
 
     rendered = report_html(report)
-    assert "Unresolved (excluded)" in rendered
-    assert "pricing-audit" in rendered
+    # Partial coverage keeps a hatched unpriced segment and one concise warning
+    # rather than a paragraph repeated in every card.
+    assert "Unpriced</span>" in rendered
+    assert "Partial estimate" in rendered
+    # The remediation command appears once, not in every card.
+    assert rendered.count("tokenlens-azure foundry pricing") <= 1
+    assert rendered.count("pricing-audit") <= 1
     assert MINISTRAL_LIKE_MODEL in rendered
 
 
@@ -188,8 +193,10 @@ def test_zero_coverage_cost_panel_shows_explicit_empty_state_not_zero_bars():
     assert report.summary.estimated_cost_usd is None
     assert report.summary.unresolved_requests == 3
     rendered = report_html(report)
-    assert "No priced components yet" in rendered
+    assert "No costs to chart until pricing is configured." in rendered
     assert "cost-empty" in rendered
+    # The old copy stated a fact about the tool, not what the user must do.
+    assert "No priced components yet" not in rendered
     # A genuinely zero-cost panel must never render three zero-width bars
     # that could be mistaken for a resolved $0 cost.
     assert 'style="width:0.0%' not in rendered
@@ -203,7 +210,9 @@ def test_unresolved_models_table_lists_reason_and_suggested_override_key():
         generated_at="2026-09-14T13:00:00Z",
     )
     rendered = report_html(report)
-    assert "Unresolved models" in rendered
+    # One remediation disclosure carries the affected models and the exact key.
+    assert 'id="resolve-pricing"' in rendered
+    assert "Suggested override key" in rendered
     for model in (MICROSOFT_MODEL, CLAUDE_LIKE_MODEL, MINISTRAL_LIKE_MODEL):
         assert model in rendered
 

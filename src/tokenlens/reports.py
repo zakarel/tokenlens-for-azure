@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-from .models import AnalysisReport, DeploymentAnalysis, Finding, RuleEvaluation
+from .models import AnalysisReport, AvailabilityState, DeploymentAnalysis, Finding, RuleEvaluation
 from .economics import TaskEconomicsReport
 from .ptu import ELIGIBILITY_STATUS_LABELS, PtuCostCurve, PtuDeploymentAssessment, PtuPortfolioAssessment, PtuThroughputSeries
 from .ptu_report import (
@@ -648,36 +648,176 @@ def _status_badge(item) -> str:
     return f"Unresolved · {_escape(reasons)}"
 
 
+def _availability_badge(state: AvailabilityState) -> str:
+    """One shared renderer. Colour never carries meaning on its own."""
+    reason = f'<span class="state-reason">{_escape(state.reason)}</span>' if state.reason else ""
+    return (
+        f'<span class="state state-{state.tone}">'
+        f'<span class="state-symbol" aria-hidden="true">{_escape(state.symbol)}</span>'
+        f'<span class="state-label">{_escape(state.label)}</span></span>{reason}'
+    )
+
+
+def _identity_missing(item) -> bool:
+    return (item.model_name or "unknown").strip().casefold() in {"", "unknown", "none"}
+
+
+def _model_pricing_state(item) -> AvailabilityState:
+    """Separate a collection identity failure from a missing rate."""
+    if _identity_missing(item):
+        return AvailabilityState(
+            status="missing_blocking",
+            label="Model identity missing",
+            reason="Recollect or enrich this slice before any rate can apply",
+            action_id="identity",
+        )
+    if item.estimated_cost_usd is not None and not item.unresolved_requests:
+        return AvailabilityState(status="available", label="Priced")
+    if item.estimated_cost_usd is not None:
+        return AvailabilityState(
+            status="partial",
+            label="Partly priced",
+            reason=f"{item.unresolved_tokens:,} tokens excluded",
+            action_id="pricing",
+        )
+    if item.pricing_status == "currency_mismatch":
+        return AvailabilityState(
+            status="missing_actionable",
+            label="Currency mismatch",
+            reason="TokenLens never converts currencies",
+            action_id="currency",
+        )
+    return AvailabilityState(
+        status="missing_actionable",
+        label="Exact rate missing",
+        reason=", ".join(_unresolved_reason_label(r) for r in item.unresolved_reasons) or None,
+        action_id="pricing",
+    )
+
+
+def _cost_state(report: AnalysisReport) -> dict[str, object]:
+    """Derive the single decision state for the whole Cost analysis tab."""
+    summary = report.summary
+    models = model_rollups(report)
+    identity_missing = [item for item in models if _identity_missing(item)]
+    needs_price = [
+        item
+        for item in models
+        if not _identity_missing(item) and (item.estimated_cost_usd is None or item.unresolved_requests)
+    ]
+    identity_tokens = sum(item.total_tokens for item in identity_missing)
+    coverage = summary.pricing_coverage_tokens_percent
+    if summary.estimated_cost_usd is not None and not summary.unresolved_tokens:
+        banner = AvailabilityState(status="available", label="Pricing complete")
+    elif summary.estimated_cost_usd is not None:
+        banner = AvailabilityState(
+            status="partial",
+            label=f"Partial estimate · {coverage:.0f}% of tokens priced",
+            reason=(
+                f"{summary.unresolved_tokens:,} tokens across {len(needs_price)} model(s) are not priced."
+            ),
+            action_id="pricing",
+        )
+    elif identity_missing and not needs_price:
+        banner = AvailabilityState(
+            status="missing_blocking",
+            label="Model identity missing",
+            reason=(
+                f"{len(identity_missing)} telemetry slice(s) must be recollected or enriched before "
+                "pricing."
+            ),
+            action_id="identity",
+        )
+    else:
+        banner = AvailabilityState(
+            status="missing_actionable",
+            label="Pricing setup required",
+            reason=(
+                f"{summary.unresolved_tokens:,} tokens across {len(needs_price)} model(s) are not "
+                "priced, so cost totals are withheld."
+            ),
+            action_id="pricing",
+        )
+    return {
+        "banner": banner,
+        "models": models,
+        "identity_missing": identity_missing,
+        "needs_price": needs_price,
+        "identity_tokens": identity_tokens,
+    }
+
+
+#: One remediation panel per report. The command never repeats in a card.
+_REMEDIATION = {
+    "pricing": (
+        "Resolve pricing",
+        "Add an exact contracted rate, or keep usage analysis without cost.",
+        "tokenlens-azure foundry pricing",
+    ),
+    "identity": (
+        "Fix collection identity",
+        "The model and version must resolve before any rate can apply.",
+        "tokenlens-azure foundry collect --days 14",
+    ),
+    "currency": (
+        "Choose one reporting currency",
+        "TokenLens never converts currencies; align the catalog and the report.",
+        "tokenlens-azure pricing verify",
+    ),
+}
+
+
+def _remediation_panel(state: AvailabilityState, models) -> str:
+    action = state.action_id
+    if action is None:
+        return ""
+    title, detail, command = _REMEDIATION[action]
+    affected = [
+        item
+        for item in models
+        if (_model_pricing_state(item).action_id == action)
+    ]
+    rows = "".join(
+        f"<li><strong>{_escape(_model_label(item))}</strong>"
+        f"<span>{_escape(item.deployment_mode.title())} · {item.total_tokens:,} tokens · "
+        f"{_escape(_model_pricing_state(item).label)}</span>"
+        + (
+            f"<span>Suggested override key: <code>{_escape(', '.join(item.suggested_override_keys) or item.canonical_model_key)}</code></span>"
+            if action == "pricing" and not _identity_missing(item)
+            else ""
+        )
+        + "</li>"
+        for item in affected
+    )
+    return (
+        f'<details class="remediation" id="resolve-pricing"><summary>{_escape(title)}</summary>'
+        f'<div class="detail-body"><p class="muted">{_escape(detail)}</p>'
+        f'<ul class="remediation-list">{rows or "<li>No model is affected.</li>"}</ul>'
+        f'<p class="muted">Run:</p><pre><code>{_escape(command)}</code></pre></div></details>'
+    )
+
+
 def _cost_composition(report: AnalysisReport) -> str:
+    """Three honest states: nothing priced, partly priced, fully priced."""
     summary = report.summary
     if summary.estimated_cost_usd is None:
-        reasons = ", ".join(_unresolved_reason_label(r) for r in summary.unresolved_reasons) or "no exact model/mode price"
-        overrides = ", ".join(summary.suggested_override_keys)
-        headline, reason = _pricing_status_copy(summary)
-        unit = "metric bucket" if summary.analysis_unit == "metric_buckets" else "request"
-        plural = "" if summary.unresolved_requests == 1 else "s"
-        # The remediation depends on *why* pricing failed: identity, catalog
-        # coverage, and currency policy are different problems.
-        action = (
-            '<a href="#tab=usage" data-tab-link="usage">Fix collection identity first: the model and version must resolve before any rate can apply</a>'
-            if summary.pricing_status == "identity_unresolved"
-            else f'<a href="#tab=cost" data-tab-link="cost">Run <code>tokenlens-azure pricing-audit</code>{f" (suggested keys: {_escape(overrides)})" if overrides else ""} or add a customer catalog override</a>'
-            if summary.pricing_status == "catalog_missing"
-            else '<a href="#tab=cost" data-tab-link="cost">Configure a reporting currency; TokenLens never converts currencies</a>'
-        )
         return (
-            f'<div class="cost-empty"><strong>No priced components yet · {_escape(headline)}</strong>'
-            f'<span>{_escape(reason)}</span>'
-            f'<span>{summary.unresolved_requests:,} unresolved {unit}{plural} / {summary.unresolved_tokens:,} tokens · {_escape(reasons)}</span>'
-            f'<span>Token volume and observed counts remain visible below even though no rate resolved.</span>'
-            f'{action}</div>'
+            '<div class="cost-empty"><strong>No costs to chart until pricing is configured.</strong>'
+            f'<span>{summary.unresolved_tokens:,} tokens remain unpriced.</span>'
+            '<a href="#resolve-pricing" data-open-remediation="1">Resolve pricing</a></div>'
         )
     components = [
-        ("Fresh input", summary.fresh_input_cost_usd, "var(--accent)"),
-        ("Cached input", summary.cached_input_cost_usd, "var(--amber)"),
-        ("Output", summary.output_cost_usd, "var(--green)"),
+        ("Fresh input", summary.fresh_input_cost_usd, "var(--accent)", summary.input_tokens - summary.cached_tokens),
+        ("Cached input", summary.cached_input_cost_usd, "var(--amber)", summary.cached_tokens),
+        ("Output", summary.output_cost_usd, "var(--green)", summary.output_tokens),
     ]
-    priced = [(label, value, color) for label, value, color in components if value is not None]
+    # A component with no tokens is omitted rather than drawn as a zero-width
+    # bar that reads as a resolved $0 cost.
+    priced = [
+        (label, value, color)
+        for label, value, color, tokens in components
+        if value is not None and (value > 0 or tokens > 0)
+    ]
     max_component = max((value for _, value, _ in priced), default=0) or 1
     rows = [
         f'<div class="cost-bar"><span>{_escape(label)}</span><div class="cost-track"><i style="width:{value / max_component * 100:.1f}%;background:{color}"></i></div><strong>{_escape(_money(value, currency=summary.pricing_currency))}</strong></div>'
@@ -691,116 +831,635 @@ def _cost_composition(report: AnalysisReport) -> str:
     if summary.unresolved_tokens:
         excluded_share = summary.unresolved_tokens / max(1, summary.total_tokens) * 100
         rows.append(
-            '<div class="cost-bar partial"><span>Unresolved (excluded)</span>'
+            '<div class="cost-bar partial"><span>Unpriced</span>'
             f'<div class="cost-track"><i class="excluded" style="width:{excluded_share:.1f}%"></i></div>'
             f'<strong>{summary.unresolved_tokens:,} tokens</strong></div>'
+        )
+        rows.append(
+            '<p class="cost-note">'
+            + _availability_badge(
+                AvailabilityState(
+                    status="partial",
+                    label=f"Partial estimate · {summary.pricing_coverage_tokens_percent:.0f}% of tokens priced",
+                )
+            )
+            + "</p>"
         )
     return "".join(rows)
 
 
-def _unresolved_models_section(report: AnalysisReport) -> str:
-    models = [item for item in model_rollups(report) if item.unresolved_requests]
-    if not models:
-        return ""
-    rows = "".join(
-        f'<div class="unresolved-row"><div><strong>{_escape(_model_label(item))}</strong>'
-        f'<span>{_escape(item.deployment_mode.title())} · {item.unresolved_requests:,} unresolved of '
-        f'{_escape(f"{item.requests:,} requests" if item.requests is not None else f"{item.active_buckets:,} active buckets")}</span></div>'
-        f'<div><strong>{item.unresolved_tokens:,} tokens excluded</strong>'
-        f'<span>{_escape(", ".join(_unresolved_reason_label(r) for r in item.unresolved_reasons) or "no exact model/mode price")}</span></div>'
-        f'<div><strong>Suggested override key</strong><span><code>{_escape(", ".join(item.suggested_override_keys) or item.canonical_model_key)}</code></span></div></div>'
-        for item in models
+def _pricing_provenance(report: AnalysisReport, models) -> str:
+    """Two lines by default; everything technical is collapsed behind a disclosure."""
+    summary = report.summary
+    pricing = report.report_metadata.get("pricing", {})
+    matched = summary.estimated_cost_usd is not None
+    catalogs = pricing.get("catalogs_consulted") or []
+    if not matched:
+        headline = f"No catalog entry matched · {len(catalogs)} catalog{'' if len(catalogs) == 1 else 's'} checked"
+    else:
+        retrieved = pricing.get("retrieved_at")
+        headline = f"{_escape(pricing.get('catalog_selected') or 'Selected catalog')}" + (
+            f" · Retrieved {_escape(_human_timestamp(str(retrieved)))}" if retrieved else ""
+        )
+    details: list[str] = [
+        f"<li>Catalogs consulted: {_escape(', '.join(catalogs) or 'None')}</li>",
+        f"<li>Catalog entry selected: {_escape(pricing.get('catalog_selected') or 'None — no exact entry matched')}</li>",
+    ]
+    if matched:
+        source_url = pricing.get("source_url", "")
+        source_link = (
+            f'<a href="{_escape(source_url)}">Published pricing source</a>'
+            if isinstance(source_url, str) and source_url.startswith("https://")
+            else "No source URL recorded"
+        )
+        details.extend(
+            [
+                f"<li>Publisher: {_escape(summary.pricing_publisher or 'Unresolved')}</li>",
+                f"<li>Billing basis: {_escape(_billing_basis_label(summary.pricing_billing_basis))}</li>",
+                f"<li>Currency policy: one reporting currency ({_escape(summary.pricing_currency)}), no conversion</li>",
+                f"<li>Retrieved: {_escape(str(pricing.get('retrieved_at') or 'not recorded'))}</li>",
+                f"<li>{source_link}</li>",
+            ]
+        )
+    customer_catalog = pricing.get("customer_catalog_name")
+    if customer_catalog:
+        details.append(f"<li>Customer override catalog: {_escape(customer_catalog)}</li>")
+    if any((item.pricing_publisher or "").casefold() == "anthropic" for item in models):
+        details.append(
+            "<li>Claude-family billing basis is a CCU-derived dollar-equivalent estimate, not an "
+            "Azure token meter.</li>"
+        )
+    details.append(
+        "<li>Rates are applied as an analysis-date estimate. Agreements, private offers, regions, "
+        "and later prices may differ.</li>"
     )
-    return f"""<section class="panel table-panel"><h2>Unresolved models</h2>
-      <p>Run <code>tokenlens-azure pricing-audit INPUT</code> for the same detail without generating a report, or add each key below to a customer catalog (see <code>examples/customer-pricing-overrides-example.yml</code>).</p>
-      <div class="unresolved-list">{rows}</div></section>"""
+    return f"""<article class="chart-card"><h2>Pricing source</h2>
+      <p class="provenance-headline">{headline}</p>
+      <details class="provenance-details"><summary>Technical pricing details</summary>
+      <ul class="detail-list">{''.join(details)}</ul></details></article>"""
+
+
+def _how_pricing_works() -> str:
+    return (
+        '<details class="how-pricing"><summary>How pricing works</summary><div class="detail-body">'
+        "<p class=\"muted\">Costs use observed values first, then an exact customer rate, then an exact "
+        "entry in a verified catalog. No rate is ever taken from a related model, a model family, or a "
+        "currency conversion.</p>"
+        "<p class=\"muted\">Unmatched models keep their token volume, their unresolved reason, and their "
+        "remediation path. They are never folded into a total.</p></div></details>"
+    )
+
+
+def _cost_view_rows(report: AnalysisReport, view: str) -> str:
+    """One scannable table per cost view. Unavailable is never rendered as $0."""
+    portfolio = getattr(report, "workloads", None)
+    summary = report.summary
+    if view == "workload" and portfolio is not None:
+        scope = "business" if portfolio.workload_identity_coverage_percent > 0 else "technical"
+        rollups = portfolio.business_workloads if scope == "business" else portfolio.workloads
+        rows = []
+        for item in rollups:
+            state = _workload_pricing_state(item)
+            cost = (
+                _money(item.estimated_cost, currency=item.pricing_currency)
+                if item.estimated_cost is not None
+                else "Unavailable"
+            )
+            rows.append(
+                f'<tr><th scope="row">{_escape(item.workload_name)}<small>{_escape(_workload_badge_text(item))}</small></th>'
+                f"<td>{item.pricing_coverage_percent:.0f}%</td>"
+                f"<td>{_escape(cost)}</td><td>{_availability_badge(state)}</td></tr>"
+            )
+        body = "".join(rows) or '<tr><td colspan="4">No workload traffic observed.</td></tr>'
+        return f'<table class="data-table"><caption>Cost by workload</caption><thead><tr><th scope="col">Workload</th><th scope="col">Coverage</th><th scope="col">Cost</th><th scope="col">Status</th></tr></thead><tbody>{body}</tbody></table>'
+    if view == "component":
+        components = [
+            ("Fresh input", summary.fresh_input_cost_usd, summary.input_tokens - summary.cached_tokens),
+            ("Cached input", summary.cached_input_cost_usd, summary.cached_tokens),
+            ("Output", summary.output_cost_usd, summary.output_tokens),
+        ]
+        rows = []
+        for label, value, tokens in components:
+            state = (
+                AvailabilityState(status="available", label="Priced")
+                if value is not None
+                else AvailabilityState(
+                    status="missing_actionable", label="Exact rate missing", action_id="pricing"
+                )
+            )
+            rows.append(
+                f'<tr><th scope="row">{_escape(label)}<small>{max(0, tokens):,} tokens</small></th>'
+                f"<td>{summary.pricing_coverage_tokens_percent:.0f}%</td>"
+                f"<td>{_escape(_money(value, currency=summary.pricing_currency) if value is not None else 'Unavailable')}</td>"
+                f"<td>{_availability_badge(state)}</td></tr>"
+            )
+        return f'<table class="data-table"><caption>Cost by token component</caption><thead><tr><th scope="col">Component</th><th scope="col">Coverage</th><th scope="col">Cost</th><th scope="col">Status</th></tr></thead><tbody>{"".join(rows)}</tbody></table>'
+    items = deployment_rollups(report) if view == "deployment" else model_rollups(report)
+    rows = []
+    for item in items:
+        state = _model_pricing_state(item)
+        name = item.deployment_name if view == "deployment" else _model_label(item)
+        secondary = (
+            f"{item.model_name} · {item.deployment_mode.title()}"
+            if view == "deployment"
+            else f"{item.deployment_mode.title()} · {_billing_basis_label(item.pricing_billing_basis)}"
+        )
+        cost = (
+            _money(item.estimated_cost_usd, currency=item.pricing_currency)
+            if item.estimated_cost_usd is not None
+            else "Unavailable"
+        )
+        detail = (
+            f"<tr class=\"row-detail\"><td colspan=\"4\"><details><summary>Provenance and remediation</summary>"
+            f"<ul class=\"detail-list\"><li>Tokens: {item.total_tokens:,} ({item.input_tokens:,} input / "
+            f"{item.cached_tokens:,} cached / {item.output_tokens:,} output)</li>"
+            f"<li>Rates I/C/O: {_rate(item.input_price_per_million, currency=item.pricing_currency)} / "
+            f"{_rate(item.cached_input_price_per_million, currency=item.pricing_currency)} / "
+            f"{_rate(item.output_price_per_million, currency=item.pricing_currency)}</li>"
+            f"<li>Source: {_escape(_pricing_source_label(item.pricing_source))}</li>"
+            + (
+                f"<li>Suggested override key: <code>{_escape(', '.join(item.suggested_override_keys) or item.canonical_model_key)}</code></li>"
+                if item.unresolved_requests and not _identity_missing(item)
+                else ""
+            )
+            + "</ul></details></td></tr>"
+        )
+        rows.append(
+            f'<tr><th scope="row">{_escape(name)}<small>{_escape(secondary)}</small></th>'
+            f"<td>{item.pricing_coverage_requests_percent:.0f}%</td>"
+            f"<td>{_escape(cost)}</td><td>{_availability_badge(state)}</td></tr>{detail}"
+        )
+    caption = "Cost by deployment" if view == "deployment" else "Cost by model"
+    heading = "Deployment" if view == "deployment" else "Model"
+    body = "".join(rows) or f'<tr><td colspan="4">No {heading.casefold()} usage observed.</td></tr>'
+    return f'<table class="data-table"><caption>{caption}</caption><thead><tr><th scope="col">{heading}</th><th scope="col">Coverage</th><th scope="col">Cost</th><th scope="col">Status</th></tr></thead><tbody>{body}</tbody></table>'
+
+
+def _cost_view_toggle(report: AnalysisReport) -> str:
+    portfolio = getattr(report, "workloads", None)
+    has_workloads = portfolio is not None and bool(portfolio.workloads)
+    default = "workload" if has_workloads else "deployment"
+    views = [
+        ("workload", "Workload"),
+        ("deployment", "Deployment"),
+        ("model", "Model"),
+        ("component", "Token component"),
+    ]
+    if not has_workloads:
+        views = views[1:]
+    buttons = "".join(
+        f'<button type="button" class="view-tab" data-cost-view="{value}" '
+        f'aria-pressed="{"true" if value == default else "false"}">{_escape(label)}</button>'
+        for value, label in views
+    )
+    panels = "".join(
+        f'<div class="cost-view" data-cost-panel="{value}"{"" if value == default else " hidden"}>'
+        f'<div class="table-scroll">{_cost_view_rows(report, value)}</div></div>'
+        for value, _label in views
+    )
+    note = ""
+    if has_workloads and portfolio.workload_identity_coverage_percent <= 0:
+        note = (
+            '<p class="muted">Showing deployment-backed technical workloads. Configure business '
+            "workload names with <code>tokenlens-azure foundry workloads configure</code> to see "
+            "application, agent, and process cost.</p>"
+        )
+    return (
+        '<section class="panel table-panel"><div class="view-toggle" role="group" aria-label="Cost view">'
+        f'<span class="label">View by</span>{buttons}</div>{note}{panels}</section>'
+    )
 
 
 def _cost_analysis_panel(report: AnalysisReport) -> str:
     summary = report.summary
-    models = model_rollups(report)
-    deployments = deployment_rollups(report)
+    state = _cost_state(report)
+    banner: AvailabilityState = state["banner"]  # type: ignore[assignment]
+    models = state["models"]
+    identity_missing = state["identity_missing"]
+    needs_price = state["needs_price"]
     priced_models = [item for item in models if item.estimated_cost_usd is not None]
     top_model = max(priced_models, key=lambda item: item.estimated_cost_usd or 0, default=None)
-    composition = _cost_composition(report)
-    model_rows = "".join(
-        f"<tr><th scope=\"row\">{_escape(_model_label(item))}</th><td>{_escape(item.deployment_mode.title())}</td>"
-        f"<td>{_escape(f'{item.requests:,}' if item.requests is not None else 'Unavailable')}</td><td>{item.total_tokens:,}</td><td>{_escape(_billing_basis_label(item.pricing_billing_basis))}</td>"
-        f"<td>{_rate(item.input_price_per_million, currency=item.pricing_currency)} / "
-        f"{_rate(item.cached_input_price_per_million, currency=item.pricing_currency)} / {_rate(item.output_price_per_million, currency=item.pricing_currency)}</td>"
-        f"<td>{_money(item.estimated_cost_usd, currency=item.pricing_currency)}</td><td>{item.pricing_coverage_requests_percent:.1f}%</td>"
-        f"<td>{_status_badge(item)}</td></tr>"
-        for item in models
-    )
-    deployment_rows = "".join(
-        f"<tr><th scope=\"row\">{_escape(item.deployment_name)}</th><td>{_escape(item.model_name)}</td>"
-        f"<td>{_escape(item.deployment_mode.title())}</td><td>{item.total_tokens:,}</td>"
-        f"<td>{_escape(_billing_basis_label(item.pricing_billing_basis))}</td>"
-        f"<td>{_money(item.estimated_cost_usd, currency=item.pricing_currency)}</td><td>{item.pricing_coverage_requests_percent:.1f}%</td>"
-        f"<td>{_status_badge(item)}</td></tr>"
-        for item in deployments
-    )
     pricing = report.report_metadata.get("pricing", {})
-    source_url = pricing.get("source_url", "")
-    source_link = (
-        f'<a href="{_escape(source_url)}">Microsoft Foundry pricing</a>'
-        if isinstance(source_url, str) and source_url.startswith("https://")
-        else "No source URL applies until a catalog entry matches"
+    matched = summary.estimated_cost_usd is not None
+    cost_display = (
+        _money(summary.estimated_cost_usd, currency=summary.pricing_currency) if matched else "Unavailable"
     )
-    # A CCU caveat only belongs in a report that actually contains Claude traffic.
-    claude_note = (
-        " Claude-family billing basis is a CCU-derived dollar-equivalent estimate, not an Azure token meter."
-        if any((item.pricing_publisher or "").casefold() == "anthropic" for item in models)
+    cards = [
+        f'<div class="card"><div class="label">Estimated cost</div>'
+        f'<div class="value{"" if matched else " cost-name"}">{_escape(cost_display)}</div>'
+        f'<div class="sub">{_availability_badge(banner if not matched else AvailabilityState(status="available", label=f"{summary.pricing_coverage_tokens_percent:.0f}% priced"))}</div></div>',
+        f'<div class="card"><div class="label">Pricing coverage</div><div class="value">{summary.pricing_coverage_tokens_percent:.0f}%</div>'
+        f'<div class="sub">{summary.total_tokens - summary.unresolved_tokens:,} of {summary.total_tokens:,} tokens</div></div>',
+        f'<div class="card"><div class="label">Unpriced tokens</div><div class="value cost-name">{summary.unresolved_tokens:,}</div>'
+        f'<div class="sub">{_escape("Excluded from the total" if summary.unresolved_tokens else "Every observed token is priced")}</div></div>',
+        f'<div class="card"><div class="label">Models requiring pricing</div><div class="value cost-name">{len(needs_price):,}</div>'
+        f'<div class="sub">{_escape(f"{len(identity_missing):,} separate identity failure(s)" if identity_missing else "No identity failures")}</div></div>',
+    ]
+    # Conditional cards appear only when they carry information.
+    if top_model is not None:
+        cards.append(
+            f'<div class="card"><div class="label">Highest cost model</div>'
+            f'<div class="value cost-name">{_escape(_model_label(top_model))}</div>'
+            f'<div class="sub">{_money(top_model.estimated_cost_usd, currency=top_model.pricing_currency)}</div></div>'
+        )
+    if matched and pricing.get("retrieved_at"):
+        cards.append(
+            f'<div class="card"><div class="label">Pricing snapshot</div>'
+            f'<div class="value cost-name">{_escape(str(pricing.get("retrieved_at")))}</div>'
+            f'<div class="sub">{_escape(summary.pricing_currency)} · matched catalog entry</div></div>'
+        )
+    if matched and summary.pricing_billing_basis:
+        cards.append(
+            f'<div class="card"><div class="label">Rate source</div>'
+            f'<div class="value cost-name">{_escape(_pricing_source_label(summary.pricing_source))}</div>'
+            f'<div class="sub">{_escape(_billing_basis_label(summary.pricing_billing_basis))}</div></div>'
+        )
+    identity_banner = ""
+    if identity_missing and banner.action_id != "identity":
+        identity_banner = (
+            '<section class="state-banner state-banner-danger">'
+            + _availability_badge(
+                AvailabilityState(
+                    status="missing_blocking",
+                    label="Model identity missing",
+                    reason=(
+                        f"{len(identity_missing)} telemetry slice(s) must be recollected or enriched "
+                        f"before pricing. {state['identity_tokens']:,} tokens are affected."
+                    ),
+                )
+            )
+            + "</section>"
+        )
+    action_label = _REMEDIATION[banner.action_id][0] if banner.action_id else ""
+    action_link = (
+        f'<a class="banner-action" href="#resolve-pricing" data-open-remediation="1">{_escape(action_label)}</a>'
+        if banner.action_id
         else ""
     )
-    customer_catalog = pricing.get("customer_catalog_name")
-    customer_note = (
-        f'<span>Customer override: <strong>{_escape(customer_catalog)}</strong></span>'
-        if customer_catalog
-        else ""
-    )
-    status_headline, status_reason = _pricing_status_copy(summary)
-    cost_sub = (
-        f"{summary.pricing_coverage_tokens_percent:.1f}% of observed tokens priced"
-        if summary.estimated_cost_usd is not None
-        else status_reason
-    )
-    basis_label = _pricing_source_label(summary.pricing_source) if summary.estimated_cost_usd is not None else "Unresolved"
-    unresolved_sub = (
-        f"{summary.unresolved_tokens:,} tokens excluded from the total"
-        if summary.unresolved_tokens
-        else "None · every observed token is priced"
-    )
-    # A pricing snapshot date is only meaningful when an entry actually matched;
-    # otherwise it implies the catalog priced this workload.
-    reference_date = pricing.get("retrieved_at") if summary.estimated_cost_usd is not None else None
-    top_model_label = _model_label(top_model) if top_model else ("Unavailable · " + status_headline)
-    return f"""<section class="metrics cost-metrics">
-      <div class="card"><div class="label">Priced cost</div><div class="value">{_money(summary.estimated_cost_usd, currency=summary.pricing_currency)}</div><div class="sub">{_escape(cost_sub)}</div></div>
-      <div class="card"><div class="label">Priced token coverage</div><div class="value">{summary.pricing_coverage_tokens_percent:.1f}%</div><div class="sub">{summary.total_tokens - summary.unresolved_tokens:,} of {summary.total_tokens:,} tokens</div></div>
-      <div class="card"><div class="label">Unpriced tokens</div><div class="value cost-name">{summary.unresolved_tokens:,}</div><div class="sub">{_escape(unresolved_sub)}</div></div>
-      <div class="card"><div class="label">Rate source</div><div class="value cost-name">{_escape(basis_label)}</div><div class="sub">{_escape(summary.pricing_billing_basis and _billing_basis_label(summary.pricing_billing_basis) or "No billing basis selected")}</div></div>
-      <div class="card"><div class="label">Highest cost model</div><div class="value cost-name">{_escape(top_model_label)}</div><div class="sub">{_money(top_model.estimated_cost_usd, currency=top_model.pricing_currency) if top_model else _escape(status_reason)}</div></div>
-      <div class="card"><div class="label">Pricing snapshot</div><div class="value cost-name">{_escape(reference_date or "Not applied")}</div><div class="sub">{_escape(summary.pricing_currency)} estimate · {_escape("matched catalog entry" if reference_date else "no catalog entry matched")}</div></div>
-    </section>
-    <p class="analytics-intro">Costs use observed values first, then exact customer or bundled reference prices. Unmatched models remain visible with volume, unresolved reason, and a remediation path — they are never folded into a misleading "Pricing unavailable" total when other calls are priced.</p>
-    <section class="grid"><article class="chart-card"><h2>Cost composition</h2><p>Components reconcile only when every covered call has token rates; excluded tokens are shown separately, never as a zero-cost bar.</p>{composition}</article>
-    <article class="chart-card"><h2>Pricing provenance</h2><p>Catalogs consulted and the entry actually selected are reported separately.</p>
-      <div class="provenance"><strong>Catalogs consulted: {_escape(", ".join(pricing.get("catalogs_consulted") or []) or "None")}</strong>
-      <span>Catalog entry selected: <strong>{_escape(pricing.get("catalog_selected") or "None — no exact entry matched")}</strong></span>
-      <span>Unresolved reason: {_escape(status_reason if summary.estimated_cost_usd is None or summary.unresolved_tokens else "None")}</span>
-      <span>Retrieved {_escape(reference_date or "not applied — no entry matched")} · {_escape(pricing.get("currency") or "USD")}</span>
-      {customer_note}
-      <span>Publisher: {_escape(summary.pricing_publisher or "Unresolved")} · Billing basis: {_escape(_billing_basis_label(summary.pricing_billing_basis))}</span>
-      <span>{source_link}</span><small>This analysis-date pricing snapshot is applied as an estimate, including to older traces. No currency conversion is performed. Agreements, offers, regions, and later prices may differ.{claude_note}</small></div></article></section>
-    <section class="panel table-panel"><h2>Cost by model and deployment mode</h2><p>Rates are input / cached input / output per 1M tokens.</p>
-      <div class="table-scroll"><table class="data-table"><caption>Model pricing and analyzed cost</caption><thead><tr><th>Model</th><th>Mode</th><th>Requests</th><th>Tokens</th><th>Billing basis</th><th>Reference rates</th><th>Est. cost</th><th>Coverage</th><th>Source/status</th></tr></thead>
-      <tbody>{model_rows or '<tr><td colspan="9">No model usage observed.</td></tr>'}</tbody></table></div></section>
-    <section class="panel table-panel"><h2>Cost by deployment</h2>
-      <div class="table-scroll"><table class="data-table"><caption>Deployment cost rollup</caption><thead><tr><th>Deployment</th><th>Model</th><th>Mode</th><th>Tokens</th><th>Billing basis</th><th>Est. cost</th><th>Coverage</th><th>Source/status</th></tr></thead>
-      <tbody>{deployment_rows or '<tr><td colspan="8">No deployments observed.</td></tr>'}</tbody></table></div></section>
-    {_unresolved_models_section(report)}
+    return f"""<section class="state-banner state-banner-{banner.tone}">{_availability_badge(banner)}{action_link}</section>
+    {identity_banner}
+    {_remediation_panel(banner, models)}
+    <section class="metrics cost-metrics">{''.join(cards)}</section>
+    <section class="grid"><article class="chart-card"><h2>Cost composition</h2>{_cost_composition(report)}</article>
+    {_pricing_provenance(report, models)}</section>
+    {_cost_view_toggle(report)}
+    {_how_pricing_works()}
     <footer>tokenlens-for-azure · created by Tzahi Ariel</footer>"""
+
+
+
+def _workload_badge_text(item) -> str:
+    """The visible badge that tells technical defaults from configured business rows."""
+    if item.workload_scope == "technical":
+        status = {
+            "needs_configuration": "Needs configuration",
+            "partially_configured": "Partly configured",
+            "configured": "Configured",
+        }.get(item.configuration_status, "Needs configuration")
+        return f"Technical · {status}"
+    if item.workload_id == "unassigned":
+        return "Unassigned · request tagging required"
+    return "Business · Configured"
+
+
+def _workload_pricing_state(item) -> AvailabilityState:
+    total = item.total_tokens or 0
+    # A blocking identity failure is only claimed when the whole rollup is
+    # unidentified. A mixed rollup reports the rate problem and names the
+    # affected slice, because the two have different remediations.
+    if total and item.identity_unresolved_tokens >= total:
+        return AvailabilityState(
+            status="missing_blocking",
+            label="Model identity missing",
+            reason="Recollect or enrich this slice before any rate can apply",
+            action_id="identity",
+        )
+    if item.estimated_cost is not None and not item.unpriced_tokens:
+        return AvailabilityState(status="available", label="Priced")
+    if item.estimated_cost is not None:
+        return AvailabilityState(
+            status="partial",
+            label=f"Partly priced · {item.pricing_coverage_percent:.0f}%",
+            reason=f"{item.unpriced_tokens:,} tokens excluded",
+            action_id="pricing",
+        )
+    if not total:
+        return AvailabilityState(
+            status="not_measured",
+            label="No traffic in this window",
+        )
+    return AvailabilityState(
+        status="missing_actionable",
+        label="Exact rate missing",
+        reason=(
+            f"{item.identity_unresolved_tokens:,} of these tokens also need collection identity"
+            if item.identity_unresolved_tokens
+            else None
+        ),
+        action_id="pricing",
+    )
+
+
+def _workload_value(value, *, currency: str = "USD", precision: int = 4) -> str:
+    return _money(value, currency=currency, precision=precision) if value is not None else "Unavailable"
+
+
+def _workload_rows(rollups, *, scope: str) -> str:
+    rows = []
+    for item in rollups:
+        tasks = item.tasks
+        cost_per_request = (
+            _money(item.cost_per_request, currency=item.pricing_currency, precision=6)
+            if item.cost_per_request is not None
+            else "Not measured"
+        )
+        cost_per_solved = (
+            _money(tasks.cost_per_solved_task, currency=item.pricing_currency, precision=6)
+            if tasks is not None and tasks.cost_per_solved_task is not None
+            else "Not measured"
+        )
+        requests = f"{item.requests:,}" if item.requests is not None else "Not measured"
+        detail = (
+            '<tr class="row-detail"><td colspan="9"><details><summary>Workload detail</summary>'
+            f'<ul class="detail-list">'
+            f'<li>Deployments: {_escape(", ".join(item.deployments) or "none")}</li>'
+            f'<li>Models: {_escape(", ".join(item.models) or "none")}</li>'
+            f'<li>Token mix: {item.input_tokens or 0:,} input / {item.cached_tokens or 0:,} cached / {item.output_tokens or 0:,} output</li>'
+            f'<li>Allocation: {_escape(item.allocation_confidence.replace("_", " "))} · source {_escape(item.identity_source.replace("_", " "))}</li>'
+            f'<li>Daily cost: average {_workload_value(item.average_daily_cost, currency=item.pricing_currency)} · '
+            f'P50 {_workload_value(item.p50_daily_cost, currency=item.pricing_currency)} · '
+            f'P90 {_workload_value(item.p90_daily_cost, currency=item.pricing_currency)} over {item.active_days:,} active day(s)</li>'
+            + (
+                f'<li>Partial days in window: {_escape(", ".join(item.partial_days[:5]))}</li>'
+                if item.partial_days
+                else ""
+            )
+            + (
+                f'<li>Task economics: {tasks.attempted_tasks:,} attempted · {tasks.solved_tasks or 0:,} solved · '
+                f'retries per task {tasks.retries_per_task if tasks.retries_per_task is not None else "not measured"} · '
+                f'model calls per task {tasks.model_calls_per_task if tasks.model_calls_per_task is not None else "not measured"}</li>'
+                if tasks is not None and tasks.measured
+                else '<li>Task economics: Not measured — task identity and outcomes were not collected</li>'
+            )
+            + "</ul></details></td></tr>"
+        )
+        rows.append(
+            f'<tr><th scope="row">{_escape(item.workload_name)}<small>{_escape(_workload_badge_text(item))}</small></th>'
+            f"<td>{_escape(item.workload_type.replace('_', ' '))}</td>"
+            f"<td>{_escape(', '.join(item.deployments) or 'none')}</td>"
+            f"<td>{_escape(requests)}</td>"
+            f"<td>{item.total_tokens or 0:,}</td>"
+            f"<td>{_escape(_workload_value(item.estimated_cost, currency=item.pricing_currency))}</td>"
+            f"<td>{_escape(cost_per_request)}</td>"
+            f"<td>{_escape(cost_per_solved)}</td>"
+            f"<td>{_availability_badge(_workload_pricing_state(item))}</td></tr>{detail}"
+        )
+    empty = f'<tr><td colspan="9">No {scope} workload traffic observed.</td></tr>'
+    return "".join(rows) or empty
+
+
+def _workload_cost_chart(rollups) -> str:
+    priced = [item for item in rollups if item.estimated_cost is not None and item.estimated_cost > 0]
+    if not priced:
+        tokens = [item for item in rollups if (item.total_tokens or 0) > 0]
+        if not tokens:
+            return '<p class="muted">No workload traffic was observed in this window.</p>'
+        largest = max(item.total_tokens or 0 for item in tokens) or 1
+        bars = "".join(
+            f'<div class="bar-row"><span>{_escape(item.workload_name)}</span>'
+            f'<div class="bar-track"><i style="width:{(item.total_tokens or 0) / largest * 100:.1f}%"></i></div>'
+            f"<strong>{item.total_tokens or 0:,} tokens</strong></div>"
+            for item in tokens
+        )
+        return (
+            '<p class="muted">Cost is unavailable, so workloads are compared by token volume.</p>'
+            + bars
+        )
+    largest = max(item.estimated_cost or 0 for item in priced) or 1
+    return "".join(
+        f'<div class="bar-row"><span>{_escape(item.workload_name)}</span>'
+        f'<div class="bar-track"><i style="width:{(item.estimated_cost or 0) / largest * 100:.1f}%"></i></div>'
+        f"<strong>{_escape(_money(item.estimated_cost, currency=item.pricing_currency))}</strong></div>"
+        for item in priced
+    )
+
+
+def _workload_daily_trend(rollups, *, currency: str = "USD") -> str:
+    """Daily cost trend. One workload gets a trend instead of a 100% share chart."""
+    days: dict[str, dict[str, float]] = {}
+    for item in rollups:
+        for day, value in item.daily_costs:
+            days.setdefault(day, {})[item.workload_name] = value
+    if not days:
+        return '<p class="muted">Daily cost requires at least one resolved rate. Not measured.</p>'
+    ordered = sorted(days)
+    names = sorted({name for values in days.values() for name in values})
+    header = "".join(f"<th scope=\"col\">{_escape(name)}</th>" for name in names)
+    rows = "".join(
+        f'<tr><th scope="row">{_escape(day)}</th>'
+        + "".join(
+            f"<td>{_escape(_money(days[day].get(name), currency=currency)) if days[day].get(name) is not None else 'Not measured'}</td>"
+            for name in names
+        )
+        + "</tr>"
+        for day in ordered
+    )
+    return (
+        '<table class="data-table"><caption>Daily cost by workload · partial days are listed in each '
+        f'workload detail</caption><thead><tr><th scope="col">Day</th>{header}</tr></thead>'
+        f"<tbody>{rows}</tbody></table>"
+    )
+
+
+def _workloads_panel(report: AnalysisReport) -> str:
+    portfolio = getattr(report, "workloads", None)
+    if portfolio is None or not portfolio.workloads:
+        return (
+            '<section class="panel"><div class="empty">Workload economics needs at least one resolved '
+            "deployment. Collect Azure Monitor metrics with <code>tokenlens-azure foundry collect</code> "
+            "or instrument requests with a <code>workload</code> tag.</div></section>"
+            "<footer>tokenlens-for-azure · created by Tzahi Ariel</footer>"
+        )
+    has_business = portfolio.workload_identity_coverage_percent > 0
+    default_scope = "business" if has_business else "technical"
+    business_rows = [
+        item for item in portfolio.business_workloads if item.workload_id != "unassigned"
+    ]
+    unassigned = next(
+        (item for item in portfolio.business_workloads if item.workload_id == "unassigned"), None
+    )
+    needs_configuration = [
+        item for item in portfolio.workloads if item.configuration_status == "needs_configuration"
+    ]
+    scoped = portfolio.business_workloads if has_business else portfolio.workloads
+    top = max(
+        (item for item in scoped if item.estimated_cost is not None),
+        key=lambda item: item.estimated_cost or 0,
+        default=None,
+    )
+    intro = ""
+    if not has_business:
+        intro = (
+            '<section class="state-banner state-banner-info">'
+            + _availability_badge(
+                AvailabilityState(
+                    status="not_applicable",
+                    label="Showing deployment-backed technical workloads",
+                    reason=(
+                        "Configure business workload names to see application, agent, and process cost. "
+                        f"{len(needs_configuration)} deployment(s) need configuration."
+                    ),
+                )
+            )
+            + '<code class="banner-action">tokenlens-azure foundry workloads configure</code></section>'
+        )
+    cards = [
+        f'<div class="card"><div class="label">Priced workload cost</div>'
+        f'<div class="value{"" if portfolio.priced_cost is not None else " cost-name"}">'
+        f'{_escape(_workload_value(portfolio.priced_cost, currency=portfolio.reporting_currency))}</div>'
+        f'<div class="sub">{portfolio.pricing_coverage_percent:.0f}% of tokens priced</div></div>',
+        f'<div class="card"><div class="label">Technical deployment coverage</div>'
+        f'<div class="value">{portfolio.technical_workload_coverage_percent:.0f}%</div>'
+        f'<div class="sub">{len(portfolio.workloads):,} technical workload(s)</div></div>',
+        f'<div class="card"><div class="label">Business identity coverage</div>'
+        f'<div class="value">{portfolio.workload_identity_coverage_percent:.0f}%</div>'
+        f'<div class="sub">{len(business_rows):,} business workload(s)</div></div>',
+        f'<div class="card"><div class="label">Unpriced tokens</div>'
+        f'<div class="value cost-name">{portfolio.unpriced_tokens:,}</div>'
+        f'<div class="sub">of {portfolio.total_tokens:,} observed tokens</div></div>',
+    ]
+    if top is not None:
+        cards.append(
+            f'<div class="card"><div class="label">Highest cost workload</div>'
+            f'<div class="value cost-name">{_escape(top.workload_name)}</div>'
+            f'<div class="sub">{_escape(_money(top.estimated_cost, currency=top.pricing_currency))}</div></div>'
+        )
+    unassigned_section = ""
+    if unassigned is not None:
+        unassigned_section = (
+            '<section class="state-banner state-banner-warning">'
+            + _availability_badge(
+                AvailabilityState(
+                    status="missing_actionable",
+                    label="Unassigned workload",
+                    reason=(
+                        (
+                            f"{_money(unassigned.estimated_cost, currency=unassigned.pricing_currency)} "
+                            f"({unassigned.total_tokens or 0:,} tokens)"
+                            if unassigned.estimated_cost is not None
+                            else f"{unassigned.total_tokens or 0:,} tokens"
+                        )
+                        + " cannot be attributed to a business workload."
+                        " Tag requests with tokenlens.workload or map a dedicated deployment."
+                    ),
+                )
+            )
+            + "</section>"
+        )
+    readiness_rows = "".join(
+        f'<tr><th scope="row">{_escape(item.workload_name)}</th>'
+        f'<td>{_availability_badge(AvailabilityState(status="available", label="Exact") if item.allocation_confidence != "unallocated" else AvailabilityState(status="missing_actionable", label="Unassigned"))}</td>'
+        f"<td>{_availability_badge(_workload_pricing_state(item))}</td>"
+        f"<td>{_escape(_workload_result(item))}</td></tr>"
+        for item in (portfolio.business_workloads if has_business else portfolio.workloads)
+    )
+    scope_tabs = (
+        '<div class="view-toggle" role="group" aria-label="Workload scope"><span class="label">Workload scope</span>'
+        f'<button type="button" class="view-tab" data-workload-scope="business" aria-pressed="{"true" if has_business else "false"}">Business</button>'
+        f'<button type="button" class="view-tab" data-workload-scope="technical" aria-pressed="{"false" if has_business else "true"}">Technical deployments</button></div>'
+    )
+    table_header = (
+        '<thead><tr><th scope="col">Workload</th><th scope="col">Type</th><th scope="col">Deployments</th>'
+        '<th scope="col">Requests</th><th scope="col">Tokens</th><th scope="col">Est. cost</th>'
+        '<th scope="col">Cost/request</th><th scope="col">Cost/solved task</th>'
+        '<th scope="col">Pricing</th></tr></thead>'
+    )
+    business_panel = (
+        f'<div class="workload-scope" data-workload-panel="business"{"" if default_scope == "business" else " hidden"}>'
+        f'<div class="table-scroll"><table class="data-table"><caption>Business workload portfolio</caption>'
+        f'{table_header}<tbody>{_workload_rows(portfolio.business_workloads, scope="business")}</tbody></table></div></div>'
+    )
+    technical_panel = (
+        f'<div class="workload-scope" data-workload-panel="technical"{"" if default_scope == "technical" else " hidden"}>'
+        f'<div class="table-scroll"><table class="data-table"><caption>Technical deployment workloads</caption>'
+        f'{table_header}<tbody>{_workload_rows(portfolio.workloads, scope="technical")}</tbody></table></div></div>'
+    )
+    stale = (
+        f'<p class="muted">Stale deployments retained for reconciliation: '
+        f'{_escape(", ".join(portfolio.stale_deployments))}</p>'
+        if portfolio.stale_deployments
+        else ""
+    )
+    shared = (
+        f'<p class="muted">Shared deployments without request tags: '
+        f'{_escape(", ".join(portfolio.shared_deployments_without_tags))}. Azure Monitor can report '
+        "deployment cost, but not cost per workload.</p>"
+        if portfolio.shared_deployments_without_tags
+        else ""
+    )
+    return f"""{intro}{unassigned_section}
+    <section class="metrics">{''.join(cards)}</section>
+    <section class="panel table-panel">{scope_tabs}{business_panel}{technical_panel}{shared}{stale}</section>
+    <section class="grid"><article class="chart-card"><h2>Estimated cost by workload</h2>
+      <p>Unavailable cost is never drawn as zero.</p>{_workload_cost_chart(scoped)}</article>
+    <article class="chart-card"><h2>Daily cost trend</h2>
+      <div class="table-scroll">{_workload_daily_trend(scoped, currency=portfolio.reporting_currency)}</div></article></section>
+    <section class="panel table-panel"><h2>Workload readiness</h2>
+      <p class="muted">Identity and pricing are separate dimensions with separate remediations.</p>
+      <div class="table-scroll"><table class="data-table"><caption>Identity versus pricing readiness</caption>
+      <thead><tr><th scope="col">Workload</th><th scope="col">Identity</th><th scope="col">Pricing</th><th scope="col">Result</th></tr></thead>
+      <tbody>{readiness_rows or '<tr><td colspan="4">No workload observed.</td></tr>'}</tbody></table></div></section>
+    {_workload_task_section(report)}
+    <footer>tokenlens-for-azure · created by Tzahi Ariel</footer>"""
+
+
+def _workload_result(item) -> str:
+    if item.allocation_confidence == "unallocated":
+        return (
+            "Cost known; workload allocation unavailable"
+            if item.estimated_cost is not None
+            else "Usage only; cost and allocation unavailable"
+        )
+    if item.estimated_cost is not None and not item.unpriced_tokens:
+        return "Full workload economics"
+    if item.estimated_cost is not None:
+        return "Partial workload economics"
+    return "Usage only; cost unavailable"
+
+
+def _workload_task_section(report: AnalysisReport) -> str:
+    """Task economics drills down beneath workloads when task evidence exists."""
+    portfolio = getattr(report, "workloads", None)
+    measured = [
+        item
+        for item in ((portfolio.business_workloads + portfolio.workloads) if portfolio else [])
+        if item.tasks is not None and item.tasks.measured
+    ]
+    if not measured:
+        return (
+            '<section class="panel table-panel"><h2>Task economics</h2>'
+            f'<p class="muted">{_availability_badge(AvailabilityState(status="not_measured", label="Not measured", reason="Task identity and outcomes were not collected. Workload economics remains available."))}</p>'
+            "</section>"
+        )
+    rows = "".join(
+        f'<tr><th scope="row">{_escape(item.workload_name)}</th>'
+        f"<td>{item.tasks.attempted_tasks or 0:,}</td><td>{item.tasks.closed_tasks or 0:,}</td>"
+        f"<td>{item.tasks.solved_tasks or 0:,}</td>"
+        f"<td>{_escape(_workload_value(item.tasks.cost_per_attempted_task, currency=item.pricing_currency, precision=6))}</td>"
+        f"<td>{_escape(_workload_value(item.tasks.cost_per_solved_task, currency=item.pricing_currency, precision=6))}</td>"
+        f"<td>{_escape(_workload_value(item.tasks.cost_per_correct_task, currency=item.pricing_currency, precision=6))}</td>"
+        f"<td>{_escape(_workload_value(item.tasks.failed_trajectory_cost, currency=item.pricing_currency))}</td></tr>"
+        for item in measured
+    )
+    return (
+        '<section class="panel table-panel"><h2>Task economics by workload</h2>'
+        '<p class="muted">Cost per business task requires explicit task identity and outcomes.</p>'
+        '<div class="table-scroll"><table class="data-table"><caption>Task economics drill-down</caption>'
+        '<thead><tr><th scope="col">Workload</th><th scope="col">Attempted</th><th scope="col">Closed</th>'
+        '<th scope="col">Solved</th><th scope="col">Cost/attempted</th><th scope="col">Cost/solved</th>'
+        '<th scope="col">Cost/correct</th><th scope="col">Failed spend</th></tr></thead>'
+        f"<tbody>{rows}</tbody></table></div></section>"
+    )
 
 
 def _ptu_throughput_chart(series: PtuThroughputSeries) -> tuple[str, str]:
@@ -1026,6 +1685,7 @@ def report_html(report: AnalysisReport) -> str:
     hidden_count = max(0, len(report.findings) - len(overview))
     config = report.report_metadata.get("materiality", {})
     cost_panel = _cost_analysis_panel(report)
+    workloads_panel = _workloads_panel(report)
     ptu_panel = _ptu_panel(report)
     banner = _data_quality_banner(report)
     pricing_headline, pricing_reason = _pricing_status_copy(summary)
@@ -1045,9 +1705,10 @@ def report_html(report: AnalysisReport) -> str:
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TokenLens for Azure — Report</title>
 <style>
-:root{{--bg:#11213b;--surface:#172a49;--surface-2:#1d3559;--border:#35527a;--text:#f3f7ff;--muted:#b5c5dc;--soft:#d2deee;--accent:#73c7ff;--green:#57d68b;--amber:#ffc857;--pink:#ff8fa3;--shadow:0 12px 30px rgba(0,0,0,.22)}}
+:root{{--bg:#11213b;--surface:#172a49;--surface-2:#1d3559;--border:#35527a;--text:#f3f7ff;--muted:#b5c5dc;--soft:#d2deee;--accent:#73c7ff;--green:#57d68b;--amber:#ffc857;--pink:#ff8fa3;--shadow:0 12px 30px rgba(0,0,0,.22);--status-success-fg:#8bf0b6;--status-success-bg:rgba(87,214,139,.16);--status-warning-fg:#ffd98a;--status-warning-bg:rgba(255,200,87,.16);--status-danger-fg:#ffb4c2;--status-danger-bg:rgba(255,143,163,.18);--status-info-fg:#a9dbff;--status-info-bg:rgba(115,199,255,.16);--status-neutral-fg:#ccd9ea;--status-neutral-bg:rgba(181,197,220,.14)}}
 *{{box-sizing:border-box}}html,body{{min-height:100%}}html{{background:var(--bg)}}body{{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:14px/1.4 "Segoe UI",Aptos,Calibri,Arial,sans-serif}}main{{width:100%;min-height:100vh;margin:0;padding:clamp(16px,1.5vw,28px)}}header{{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:14px}}.logo{{width:min(275px,55vw);height:auto;display:block}}.meta{{text-align:right;color:var(--muted);font-size:12px;line-height:1.5}}.meta strong{{color:var(--text);font-size:12px;margin-left:5px}}h1,h2,h3,p{{margin:0}}h2{{font-size:17px;letter-spacing:-.02em}}h3{{font-size:14px}}small,.muted{{display:block;color:var(--muted);font-size:12px}}.card,.panel,.chart-card,.kpi,.chart{{background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow)}}.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px}}.card,.kpi{{padding:11px 13px;min-height:76px}}.kpi b{{display:block;font-size:22px;color:var(--accent);margin-top:4px}}.kpi span,.label{{color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}}.value{{font-size:22px;font-weight:700;letter-spacing:-.04em;margin-top:4px}}.sub{{font-size:12px;color:var(--muted);margin-top:2px}}.accent{{color:var(--accent)}}.overview-grid{{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(280px,.9fr);gap:12px;margin-bottom:12px}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}.panel-head{{padding:11px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:baseline;gap:12px}}.panel-head a,.tab{{color:var(--link,var(--accent));font-weight:700}}.portfolio{{padding:0 14px}}.portfolio-row{{display:grid;grid-template-columns:1.15fr 2fr 145px;gap:12px;align-items:center;padding:9px 0;border-bottom:1px solid var(--border)}}.portfolio-row:last-child{{border-bottom:0}}.portfolio-row strong{{font-size:12px}}.portfolio-row small{{margin-top:1px;font-size:12px}}.portfolio-bar{{height:9px;border-radius:9px;background:var(--surface-2);overflow:hidden}}.portfolio-bar span{{height:100%;display:block;background:var(--accent);border-radius:9px}}.portfolio-value{{text-align:right}}.portfolio-value strong{{display:block;font-size:12px}}.portfolio-value small{{font-size:12px}}.actions{{padding:9px 14px 10px}}.actions ol{{padding:0 0 0 20px;margin:0}}.actions li{{padding:5px 0 5px 2px;border-bottom:1px solid var(--border)}}.actions li:last-child{{border-bottom:0}}.actions li strong,.actions li span{{display:block;font-size:12px}}.actions li span{{color:var(--muted);font-size:12px;margin-top:1px}}.finding-panel{{margin-bottom:12px}}.finding-list{{display:grid;grid-template-columns:repeat(3,1fr)}}.finding-card{{display:grid;grid-template-columns:52px minmax(0,1.3fr) minmax(86px,.8fr);gap:9px;align-items:start;padding:10px 12px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}}.finding-card:nth-child(3n){{border-right:0}}.finding-card:last-child{{border-bottom:0}}.finding-rule{{font:700 12px Consolas,monospace;border-left:4px solid var(--accent);padding-left:6px;color:var(--soft)}}.finding-card.high .finding-rule{{border-color:var(--pink)}}.finding-card.medium .finding-rule{{border-color:var(--amber)}}.finding-card.low .finding-rule{{border-color:var(--accent)}}.finding-copy strong,.finding-impact strong,.finding-action strong{{display:block;font-size:12px}}.finding-copy span,.finding-impact span,.finding-action span{{display:block;color:var(--muted);font-size:12px;margin-top:2px}}.finding-impact strong{{color:var(--accent)}}.finding-action{{grid-column:2 / -1}}.finding-action strong{{color:var(--green)}}.tabs{{margin-top:4px}}.tab-list{{display:flex;gap:5px;border-bottom:1px solid var(--border);margin-bottom:14px;position:sticky;top:0;z-index:6;background:var(--bg);overflow-x:auto;scrollbar-width:none;max-width:100%}}.tab-list::-webkit-scrollbar{{display:none}}.tab{{border:1px solid transparent;border-bottom:0;border-radius:8px 8px 0 0;background:transparent;padding:10px 13px;color:var(--muted);cursor:pointer;font:700 13px inherit;white-space:nowrap;min-height:44px;flex:0 0 auto}}.tab-short{{display:none}}.tab[aria-selected="true"]{{color:var(--text);background:var(--surface);border-color:var(--border)}}.tab:focus-visible,.donut-segment:focus-visible,.columns rect:focus-visible,summary:focus-visible{{outline:3px solid var(--amber);outline-offset:2px}}.js .tab-panel:not(.active){{display:none}}.tab-panel{{min-height:200px}}.analytics-intro{{color:var(--muted);font-size:12px;margin-bottom:12px}}.chart-grid{{display:grid;grid-template-columns:1fr 1.35fr;gap:12px;margin-bottom:12px}}.chart-card,.chart{{padding:14px;min-width:0}}.chart-card h2,.chart h2{{margin-bottom:3px}}.chart-card > p,.chart p{{color:var(--muted);font-size:12px;margin-bottom:10px}}.bar-row{{display:grid;grid-template-columns:150px 1fr 100px;align-items:center;gap:8px;margin:9px 0;font-size:12px}}.bar-track{{height:12px;background:var(--surface-2);border-radius:8px;overflow:hidden}}.bar-track i{{display:block;height:100%;background:var(--accent);border-radius:8px}}.donut-wrap{{display:flex;align-items:center;gap:12px;min-height:220px}}.donut{{width:220px;max-width:42%;overflow:visible}}.donut-total{{fill:var(--text);font-size:16px;font-weight:700}}.donut-label{{fill:var(--muted);font-size:12px}}.columns{{width:100%;height:auto;min-height:220px;overflow:visible}}.columns .axis,.axis{{stroke:var(--border);stroke-width:1}}.axis-label{{fill:var(--soft);font-size:12px}}.axis-value{{fill:var(--muted);font-size:12px}}svg text{{fill:var(--muted)}}svg circle{{fill:var(--green);stroke:var(--text);stroke-width:1}}.legend{{display:grid;gap:4px;min-width:130px}}.legend-row{{font-size:12px;color:var(--soft)}}.swatch{{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:0}}.data-table,.task table{{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px;color:var(--soft)}}.data-table caption,.task caption{{text-align:left;color:var(--muted);font-size:12px;margin-bottom:4px}}.data-table th,.data-table td,.task th,.task td{{padding:5px 6px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}}.data-table th:first-child,.data-table td:first-child,.task th:first-child,.task td:first-child{{text-align:left}}.data-table thead th,.task thead th{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}}.table-panel{{padding:14px;margin-bottom:12px;overflow:auto}}.table-scroll{{max-width:100%;overflow-x:auto}}.chart-card .data-table,.table-panel .data-table{{max-width:none}}.scenario-list{{margin:0;padding-left:20px}}.scenario-list li{{padding:6px 0;border-bottom:1px solid var(--border)}}.scenario-list small{{display:block;color:var(--muted)}}.analytics-section{{margin-bottom:12px}}.analytics-section > .panel-head{{margin-bottom:0}}.details-list{{display:grid;gap:7px}}.deployment-details{{background:var(--surface);border:1px solid var(--border);border-radius:9px;overflow:hidden}}summary{{cursor:pointer;padding:10px 13px;list-style-position:inside}}summary span{{color:var(--muted);font-size:12px;margin-left:10px}}.detail-body{{border-top:1px solid var(--border);padding:10px 13px}}.mini-stats{{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-bottom:7px}}.mini-stats strong{{color:var(--text);margin-left:3px}}.detail-body .finding-card{{background:var(--surface-2);border:1px solid var(--border);border-radius:7px;margin-top:6px;grid-template-columns:52px minmax(0,1.3fr) minmax(86px,.8fr)}}.additional{{border-left:3px solid var(--amber)}}.empty{{padding:12px 14px;color:var(--muted);font-size:12px}}footer{{text-align:center;color:var(--muted);font-size:11px;letter-spacing:.04em;margin-top:12px}}@media(max-width:960px){{main{{padding:16px}}.metrics{{grid-template-columns:repeat(3,1fr)}}.overview-grid,.chart-grid,.grid{{grid-template-columns:1fr}}.finding-list{{grid-template-columns:1fr}}.finding-card,.finding-card:nth-child(3n){{border-right:0}}.donut-wrap{{justify-content:center}}}}@media(max-width:620px){{header{{display:block}}.meta{{text-align:left;margin-top:8px;font-size:12px}}.tab-full{{display:none}}.tab-short{{display:inline}}.tab{{padding:11px 14px;font-size:13px}}.single-usage-grid{{grid-template-columns:1fr 1fr}}.metrics{{grid-template-columns:repeat(2,1fr)}}.portfolio-row{{grid-template-columns:1fr 100px}}.portfolio-bar{{grid-column:1 / -1;grid-row:2}}.portfolio-value{{text-align:right}}.donut-wrap{{display:block}}.donut{{display:block;max-width:220px;margin:auto}}.data-table{{display:block;overflow-x:auto}}summary span{{display:block;margin:3px 0 0 21px}}}}@media print{{@page{{size:landscape;margin:.35in}}body{{background:#fff;color:#11213b;font-size:11px}}main{{max-width:none;padding:0}}header{{border-color:#9aa8ba}}.card,.panel,.chart-card,.kpi,.chart,.deployment-details{{box-shadow:none;background:#fff;border-color:#9aa8ba}}.metrics{{gap:5px}}.value{{font-size:16px}}.overview{{min-height:6.8in;page-break-after:always}}.usage{{page-break-before:always}}.tab-list{{display:none}}.js .tab-panel:not(.active){{display:block}}.finding-card,.portfolio-row{{border-color:#b8c2cf}}.finding-copy span,.finding-impact span,.finding-action span,.analytics-intro,.data-table caption,small,.muted{{color:#46556b}}.data-table th,.data-table td{{border-color:#b8c2cf}}footer{{color:#46556b}}}}
 .donut-segment,.donut-track{{fill:none}}.cost-name{{font-size:15px;line-height:1.2}}.cost-bar{{display:grid;grid-template-columns:130px 1fr 110px;gap:9px;align-items:center;margin:12px 0;font-size:12px}}.cost-track{{height:14px;background:var(--surface-2);border-radius:8px;overflow:hidden;display:flex}}.cost-track i.excluded,.cost-track i.covered.partial{{background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.4) 0 5px,rgba(255,255,255,.08) 5px 10px);background-color:var(--muted)}}.cost-bar.partial span{{color:var(--amber)}}.cost-empty{{display:grid;gap:6px;padding:14px;border:1px dashed var(--border);border-radius:9px;background:var(--surface-2)}}.cost-empty strong{{font-size:13px}}.cost-empty span{{font-size:12px;color:var(--muted)}}.cost-empty a{{font-size:12px;font-weight:700}}.unresolved-list{{display:grid;gap:8px;margin-top:8px}}.unresolved-row{{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:8px;padding:8px 10px;border:1px solid var(--border);border-left:3px solid var(--amber);border-radius:7px;background:var(--surface-2);font-size:12px}}.unresolved-row strong{{display:block;font-size:12px}}.unresolved-row span{{display:block;color:var(--muted);font-size:12px;margin-top:2px}}.cost-track i{{display:block;height:100%;border-radius:8px}}.cost-bar strong{{text-align:right}}.provenance{{display:grid;gap:7px;font-size:12px}}.provenance{{font-size:12px}}.provenance span,.provenance small{{color:var(--muted)}}a{{color:var(--accent)}}.ptu-list{{display:grid;gap:12px}}.ptu-card{{padding:14px}}.ptu-head{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:11px}}.ptu-recommendation{{color:var(--accent);font-size:14px}}.dimension-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-bottom:11px}}.dimension{{padding:8px;border:1px solid var(--border);border-left:4px solid var(--muted);border-radius:7px;background:var(--surface-2)}}.dimension.positive{{border-left-color:var(--green)}}.dimension.neutral{{border-left-color:var(--amber)}}.dimension.negative{{border-left-color:var(--pink)}}.dimension strong,.dimension span,.dimension small{{display:block}}.dimension strong{{font-size:12px}}.dimension span{{font-size:12px;color:var(--soft);margin-top:2px}}.dimension small{{font-size:12px;margin-top:2px}}.ptu-stats{{display:grid;grid-template-columns:repeat(8,1fr);gap:7px}}.ptu-stats span{{font-size:12px;color:var(--muted);text-transform:uppercase}}.ptu-stats strong{{display:block;color:var(--text);font-size:12px;text-transform:none;margin-top:3px}}.ptu-note{{font-size:12px;color:var(--muted);margin-top:10px}}.ptu-evidence-note{{font-size:12px;color:var(--amber);margin:10px 0;padding:10px 12px;border:1px dashed var(--border);border-radius:8px;background:var(--surface-2)}}.eligibility-badge{{font-weight:700;padding:1px 6px;border-radius:5px;background:var(--surface-2);color:var(--soft)}}.eligibility-badge.eligible_sufficient_evidence{{color:var(--green)}}.eligibility-badge.eligible_insufficient_evidence,.eligibility-badge.pricing_unavailable,.eligibility-badge.deployment_mode_unavailable{{color:var(--amber)}}.eligibility-badge.model_capacity_unavailable,.eligibility-badge.ptu_not_applicable{{color:var(--pink)}}.ptu-graphs{{margin-top:12px}}.ptu-source{{display:flex;gap:8px;padding:12px;margin-top:12px;font-size:12px}}@media(max-width:960px){{.dimension-grid{{grid-template-columns:1fr 1fr}}.ptu-stats{{grid-template-columns:repeat(4,1fr)}}}}@media(max-width:620px){{.cost-bar{{grid-template-columns:80px 1fr}}.cost-bar strong{{grid-column:2}}.dimension-grid,.ptu-stats{{grid-template-columns:1fr 1fr}}.ptu-head{{display:block}}.ptu-recommendation{{display:block;margin-top:5px}}}}
+.state{{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;border:1px solid currentColor;line-height:1.5}}.state-symbol{{font-weight:700}}.state-success{{color:var(--status-success-fg);background:var(--status-success-bg)}}.state-warning{{color:var(--status-warning-fg);background:var(--status-warning-bg)}}.state-danger{{color:var(--status-danger-fg);background:var(--status-danger-bg)}}.state-info{{color:var(--status-info-fg);background:var(--status-info-bg)}}.state-neutral{{color:var(--status-neutral-fg);background:var(--status-neutral-bg)}}.state-reason{{display:block;color:var(--muted);font-size:12px;margin-top:4px;max-width:78ch}}.state-banner{{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;padding:11px 14px;margin-bottom:12px;border:1px solid var(--border);border-left-width:4px;border-radius:10px;background:var(--surface)}}.state-banner-warning{{border-left-color:var(--status-warning-fg)}}.state-banner-danger{{border-left-color:var(--status-danger-fg)}}.state-banner-success{{border-left-color:var(--status-success-fg)}}.state-banner-info{{border-left-color:var(--status-info-fg)}}.state-banner-neutral{{border-left-color:var(--status-neutral-fg)}}.banner-action{{margin-left:auto;font-weight:700;white-space:nowrap}}.view-toggle{{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:10px}}.view-toggle .label{{margin-right:4px}}.view-tab{{border:1px solid var(--border);background:var(--surface-2);color:var(--muted);border-radius:8px;padding:7px 12px;font:700 12px inherit;cursor:pointer;min-height:36px}}.view-tab[aria-pressed="true"]{{color:var(--text);background:var(--surface);border-color:var(--accent)}}.view-tab:focus-visible{{outline:3px solid var(--amber);outline-offset:2px}}.remediation,.how-pricing,.provenance-details{{background:var(--surface);border:1px solid var(--border);border-radius:9px;margin-bottom:12px;overflow:hidden}}.provenance-details{{margin:8px 0 0}}.provenance-headline{{font-size:13px;color:var(--soft)}}.remediation-list{{margin:0;padding-left:18px}}.remediation-list li{{padding:5px 0;border-bottom:1px solid var(--border)}}.remediation-list li:last-child{{border-bottom:0}}.remediation-list span{{display:block;color:var(--muted);font-size:12px}}.detail-list{{margin:0;padding-left:18px;color:var(--muted);font-size:12px}}.detail-list li{{padding:3px 0}}.row-detail td{{padding-top:0;border-bottom:1px solid var(--border)}}.row-detail summary{{padding:4px 0;font-size:12px;color:var(--muted)}}.cost-note{{margin-top:10px}}pre{{margin:6px 0 0;padding:8px 10px;background:var(--surface-2);border-radius:7px;overflow-x:auto}}pre code{{font:12px Consolas,monospace;color:var(--soft)}}@media(max-width:620px){{.state-banner{{display:block}}.banner-action{{display:inline-block;margin:8px 0 0}}.view-toggle{{overflow-x:auto}}}}@media print{{.state{{border-color:#46556b;color:#11213b;background:#fff}}.state-banner{{background:#fff;border-color:#9aa8ba}}.view-tab{{background:#fff;color:#11213b}}details{{display:block}}details > *{{display:block}}}}
 .data-quality{{display:grid;gap:8px;padding:12px 14px;margin-bottom:12px;border:1px solid var(--border);border-left:5px solid var(--amber);border-radius:10px;background:var(--surface)}}.data-quality.blocking{{border-left-color:var(--pink)}}.dq-head{{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline}}.dq-head strong{{font-size:13px}}.dq-head span{{color:var(--muted);font-size:12px}}.data-quality ul{{margin:0;padding-left:18px;display:grid;gap:4px}}.data-quality li{{font-size:12px;color:var(--soft)}}.data-quality li strong{{display:inline;font-size:12px}}.data-quality li span{{display:block;color:var(--muted);font-size:12px}}.data-quality li.dq-blocker strong::before{{content:"Blocker · ";color:var(--pink)}}.data-quality li.dq-warning strong::before{{content:"Limitation · ";color:var(--amber)}}.single-usage{{padding:12px 14px;display:grid;gap:8px}}.single-usage-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0}}.single-usage-grid div{{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:8px 10px}}.single-usage-grid dt{{color:var(--muted);font-size:12px}}.single-usage-grid dd{{margin:2px 0 0;font-size:13px;font-weight:700}}.status-list{{margin:0;padding:10px 14px 12px 32px;display:grid;gap:6px}}.status-list li{{font-size:13px;color:var(--soft)}}.status-list li span{{display:block;color:var(--muted);font-size:12px}}.status-list li.empty{{list-style:none;margin-left:-18px;color:var(--muted)}}.actions li.not-evaluated strong{{color:var(--amber)}}.composition{{display:grid;gap:4px;margin-bottom:8px}}.not-evaluated-panel{{border-left:3px solid var(--muted)}}
 
 {PTU_DASHBOARD_CSS}
@@ -1059,6 +1720,7 @@ def report_html(report: AnalysisReport) -> str:
 <div class="tabs"><div class="tab-list" role="tablist" aria-label="Report views">
 <button class="tab" id="overview-tab" role="tab" aria-selected="true" aria-controls="overview-panel" tabindex="0"><span class="tab-full">Overview</span><span class="tab-short" aria-hidden="true">Overview</span></button>
 <button class="tab" id="cost-tab" role="tab" aria-selected="false" aria-controls="cost-panel" tabindex="-1" aria-label="Cost analysis"><span class="tab-full">Cost analysis</span><span class="tab-short" aria-hidden="true">Cost</span></button>
+<button class="tab" id="workloads-tab" role="tab" aria-selected="false" aria-controls="workloads-panel" tabindex="-1" aria-label="Workload economics"><span class="tab-full">Workloads</span><span class="tab-short" aria-hidden="true">Workloads</span></button>
 <button class="tab" id="usage-tab" role="tab" aria-selected="false" aria-controls="usage-panel" tabindex="-1" aria-label="Usage and diagnostics"><span class="tab-full">Usage &amp; diagnostics</span><span class="tab-short" aria-hidden="true">Usage</span></button>
 <button class="tab" id="ptu-tab" role="tab" aria-selected="false" aria-controls="ptu-panel" tabindex="-1" aria-label="PTU advisor"><span class="tab-full">PTU advisor</span><span class="tab-short" aria-hidden="true">PTU</span></button></div>
 <section class="tab-panel overview active" id="overview-panel" role="tabpanel" aria-labelledby="overview-tab">
@@ -1082,6 +1744,7 @@ def report_html(report: AnalysisReport) -> str:
 <section class="analytics-section"><div class="panel-head"><div><h2>Deployment details</h2><small>Expand a deployment for its evaluated findings, metric coverage, and bucket counts.</small></div></div><div class="details-list">{_analytics_deployment_sections(report)}</div></section>
 <footer>tokenlens-for-azure · created by Tzahi Ariel</footer></section>
 <section class="tab-panel cost" id="cost-panel" role="tabpanel" aria-labelledby="cost-tab">{cost_panel}</section>
+<section class="tab-panel workloads" id="workloads-panel" role="tabpanel" aria-labelledby="workloads-tab">{workloads_panel}</section>
 <section class="tab-panel ptu" id="ptu-panel" role="tabpanel" aria-labelledby="ptu-tab">{ptu_panel}</section>
 </div></main>
 <script>
@@ -1091,7 +1754,7 @@ document.documentElement.classList.add("js");
    its parameter through this router only, so the URL, the visible panel, and
    aria-selected can never disagree. */
 window.tokenlensRouter = (function() {{
-  const names = ["overview", "cost", "usage", "ptu"];
+  const names = ["overview", "cost", "workloads", "usage", "ptu"];
   const listeners = [];
   function parse() {{
     const raw = (location.hash || "").replace(/^#/, "");
@@ -1143,7 +1806,7 @@ window.tokenlensRouter = (function() {{
 (function() {{
   const tabs = Array.from(document.querySelectorAll('.tab-list [role="tab"]'));
   const panels = Array.from(document.querySelectorAll('[role="tabpanel"]'));
-  const names = ["overview", "cost", "usage", "ptu"];
+  const names = ["overview", "cost", "workloads", "usage", "ptu"];
   function render(name, moveFocus) {{
     const index = Math.max(0, names.indexOf(name));
     const selected = tabs[index];
@@ -1163,6 +1826,29 @@ window.tokenlensRouter = (function() {{
   document.querySelectorAll("[data-tab-link]").forEach(link => link.addEventListener("click", event => {{ event.preventDefault(); activate(link.dataset.tabLink, false); }}));
   window.tokenlensRouter.subscribe(function(state, origin) {{ if (origin === "hash") render(state.tab, false); }});
   render(window.tokenlensRouter.state().tab, false);
+}})();
+(function() {{
+  /* Cost view and workload scope toggles. Both degrade to all panels visible
+     when scripting is unavailable, so print and no-JS readers lose nothing. */
+  function bind(buttonAttr, panelAttr) {{
+    const buttons = Array.from(document.querySelectorAll("[" + buttonAttr + "]"));
+    if (!buttons.length) return;
+    const panels = Array.from(document.querySelectorAll("[" + panelAttr + "]"));
+    buttons.forEach(button => button.addEventListener("click", function() {{
+      const value = button.getAttribute(buttonAttr);
+      buttons.forEach(other => other.setAttribute("aria-pressed", other === button ? "true" : "false"));
+      panels.forEach(panel => {{ panel.hidden = panel.getAttribute(panelAttr) !== value; }});
+    }}));
+  }}
+  bind("data-cost-view", "data-cost-panel");
+  bind("data-workload-scope", "data-workload-panel");
+  document.querySelectorAll("[data-open-remediation]").forEach(link => link.addEventListener("click", function(event) {{
+    const target = document.getElementById("resolve-pricing");
+    if (!target) return;
+    event.preventDefault();
+    target.open = true;
+    target.scrollIntoView({{block: "nearest"}});
+  }}));
 }})();
 {PTU_DASHBOARD_JS}
 </script></body></html>"""
