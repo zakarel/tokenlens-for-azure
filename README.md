@@ -99,30 +99,32 @@ independent estimates into a misleading aggregate (for example, `100%–100%`).
 
 **Overview**
 
-<a href="docs/assets/tokenlens-report-overview-20260914-v6.png">
-  <img src="docs/assets/tokenlens-report-overview-20260914-v6.png" alt="TokenLens for Azure synthetic report Overview showing consumption, estimated analyzed cost, and pricing coverage">
+<a href="docs/assets/tokenlens-report-overview-20260917-v8.png">
+  <img src="docs/assets/tokenlens-report-overview-20260917-v8.png" alt="TokenLens for Azure synthetic Overview showing consumption, pricing coverage, and priority actions">
 </a>
 
 **Cost analysis**
 
-<a href="docs/assets/tokenlens-report-cost-analysis-20260914-v6.png">
-  <img src="docs/assets/tokenlens-report-cost-analysis-20260914-v6.png" alt="TokenLens for Azure synthetic Cost analysis report showing model prices, cost composition, and deployment cost">
+<a href="docs/assets/tokenlens-report-cost-analysis-20260917-v8.png">
+  <img src="docs/assets/tokenlens-report-cost-analysis-20260917-v8.png" alt="TokenLens for Azure synthetic Cost analysis showing concise pricing state, cost composition, and workload-aware cost views">
+</a>
+
+**Workloads**
+
+<a href="docs/assets/tokenlens-report-workloads-20260917-v8.png">
+  <img src="docs/assets/tokenlens-report-workloads-20260917-v8.png" alt="TokenLens for Azure synthetic Workloads view showing technical workload cost and workload economics">
 </a>
 
 **Usage &amp; diagnostics**
 
-<a href="docs/assets/tokenlens-report-usage-20260914-v6.png">
-  <img src="docs/assets/tokenlens-report-usage-20260914-v6.png" alt="TokenLens for Azure synthetic Usage and diagnostics report showing multicolor model share, deployment usage, and the complete model pricing summary">
+<a href="docs/assets/tokenlens-report-usage-20260917-v8.png">
+  <img src="docs/assets/tokenlens-report-usage-20260917-v8.png" alt="TokenLens for Azure synthetic Usage and diagnostics view showing model mix, deployment usage, and findings">
 </a>
 
 **PTU advisor**
 
-<a href="docs/assets/tokenlens-report-ptu-dashboard-20260914-v7.png">
-  <img src="docs/assets/tokenlens-report-ptu-dashboard-20260914-v7.png" alt="TokenLens for Azure synthetic PTU Advisor dashboard showing the recommendation banner with confidence, six At a Glance metrics, and the token volume and request outcome evidence charts">
-</a>
-
-<a href="docs/assets/tokenlens-report-ptu-advisor-20260914-v6.png">
-  <img src="docs/assets/tokenlens-report-ptu-advisor-20260914-v6.png" alt="TokenLens for Azure synthetic PTU advisor report showing workload dimensions, sizing, and PAYG versus hybrid economics">
+<a href="docs/assets/tokenlens-report-ptu-advisor-20260917-v8.png">
+  <img src="docs/assets/tokenlens-report-ptu-advisor-20260917-v8.png" alt="TokenLens for Azure synthetic PTU Advisor showing recommendation, evidence charts, capacity sizing, and cost comparison">
 </a>
 
 <p align="center"><em>Deterministic synthetic data · Click any image to open the enlarged PNG.</em></p>
