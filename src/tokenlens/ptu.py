@@ -8,6 +8,7 @@ revision eb0558cd4c6d3794be76d9caa2e87129d1f8221c.
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from math import ceil, sqrt
 from statistics import mean, pstdev
@@ -15,7 +16,7 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import DeploymentAnalysis, TraceRecord
+from .models import AggregateAnalysisSummary, DeploymentAnalysis, TraceRecord
 from .pricing import PricingResolution, canonical_model_name, infer_publisher
 
 #: Resolves one analysis event to the same pricing decision the cost engine
@@ -39,6 +40,7 @@ EligibilityStatus = Literal[
     "ptu_not_applicable",
     "pricing_unavailable",
     "deployment_mode_unavailable",
+    "collection_identity_error",
 ]
 
 ELIGIBILITY_STATUS_LABELS: dict[str, str] = {
@@ -48,9 +50,15 @@ ELIGIBILITY_STATUS_LABELS: dict[str, str] = {
     "ptu_not_applicable": "PTU not applicable",
     "pricing_unavailable": "Pricing unavailable",
     "deployment_mode_unavailable": "Deployment mode unavailable",
+    "collection_identity_error": "Collection identity error",
 }
 
 MINIMUM_ACTIVE_BUCKETS = 100
+
+#: Provenance for every row of the PTU capacity table. Capacity is matched on the
+#: exact canonical model key only: an unlisted model reports "capacity
+#: unavailable" rather than borrowing a related model's numbers.
+CAPACITY_SOURCE = "msftse-org/ptu-advisor @ eb0558cd4c6d3794be76d9caa2e87129d1f8221c"
 
 
 class PtuThroughputPoint(BaseModel):
@@ -91,6 +99,7 @@ DashboardState = Literal[
     "ptu_recommended",
     "borderline",
     "payg_recommended",
+    "collection_identity_error",
     "insufficient_evidence",
     "pricing_unavailable",
     "ptu_not_applicable",
@@ -101,6 +110,7 @@ DASHBOARD_STATE_LABELS: dict[str, str] = {
     "ptu_recommended": "PTU Recommended",
     "borderline": "Borderline — validate before committing",
     "payg_recommended": "PAYG Recommended",
+    "collection_identity_error": "Collection Identity Error",
     "insufficient_evidence": "Insufficient Evidence",
     "pricing_unavailable": "Pricing Required",
     "ptu_not_applicable": "PTU Not Applicable",
@@ -151,15 +161,23 @@ class PtuDashboardSummary(BaseModel):
 
     deployment_name: str
     model_name: str
+    model_version: str | None = None
     deployment_mode: str
     state: DashboardState
     state_label: str
     recommendation: str
+    #: Blockers that exist but are not the primary state, rendered as badges.
+    secondary_blockers: list[str] = Field(default_factory=list)
     confidence_percent: float | None = Field(default=None, ge=0, le=100)
     confidence_label: str | None = None
     summary: str
     average_weighted_tpm: float | None = Field(default=None, ge=0)
     p95_weighted_tpm: float | None = Field(default=None, ge=0)
+    #: Throughput across *active* buckets, so a busy period is not diluted by a
+    #: mostly idle window.
+    active_average_weighted_tpm: float | None = Field(default=None, ge=0)
+    active_p95_weighted_tpm: float | None = Field(default=None, ge=0)
+    busy_hour_available: bool = False
     weighted_basis: str
     total_input_tokens: int | None = Field(default=None, ge=0)
     total_cached_tokens: int | None = Field(default=None, ge=0)
@@ -168,14 +186,25 @@ class PtuDashboardSummary(BaseModel):
     daily_average_tokens: float | None = Field(default=None, ge=0)
     rate_limited_requests: int | None = Field(default=None, ge=0)
     rate_limit_percent: float | None = Field(default=None, ge=0, le=100)
+    successful_requests: int | None = Field(default=None, ge=0)
+    other_failed_requests: int | None = Field(default=None, ge=0)
+    outcome_coverage: Literal["complete", "partial", "unavailable"] = "unavailable"
     total_requests: int | None = Field(default=None, ge=0)
+    requests_available: bool = True
+    retries_available: bool = True
     observed_days: float = Field(ge=0)
+    active_days: int = Field(default=0, ge=0)
     complete_days: int = Field(default=0, ge=0)
     partial_days: int = Field(default=0, ge=0)
     window_start: datetime | None = None
     window_end: datetime | None = None
     active_buckets: int = Field(default=0, ge=0)
+    observed_buckets: int = Field(default=0, ge=0)
     elapsed_buckets: int = Field(default=0, ge=0)
+    collection_completeness_percent: float = Field(default=0, ge=0, le=100)
+    bucket_minutes: int = Field(default=5, gt=0)
+    identity_resolved: bool = True
+    pricing_status: str = "priced"
     pricing_coverage_tokens_percent: float = Field(default=0, ge=0, le=100)
     pricing_currency: str = "USD"
     total_cost: float | None = Field(default=None, ge=0)
@@ -231,6 +260,9 @@ class PtuDeploymentAssessment(BaseModel):
     economic_result: Literal["PTU lower", "PAYG lower", "Unavailable"]
     data_points: int = Field(ge=0)
     observed_buckets: int = Field(ge=0)
+    active_buckets: int = Field(default=0, ge=0)
+    elapsed_buckets: int = Field(default=0, ge=0)
+    identity_resolved: bool = True
     observed_days: float = Field(ge=0)
     average_tpm: float = Field(ge=0)
     p95_tpm: float = Field(ge=0)
@@ -274,6 +306,10 @@ class _Capacity(BaseModel):
     global_increment: int
     regional_min_ptu: int
     regional_increment: int
+    #: Where this row came from. Capacity is only ever used for the exact
+    #: canonical model key; a related family member is never substituted.
+    source: str = CAPACITY_SOURCE
+    confidence: Literal["documented_reference", "customer_override"] = "documented_reference"
 
 
 _CAPACITIES = {
@@ -324,6 +360,48 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
+#: A busy-hour statistic needs at least an hour of active five-minute buckets
+#: before it describes a busy period rather than a single spike.
+MINIMUM_BUSY_HOUR_BUCKETS = 12
+
+
+@dataclass
+class _Evidence:
+    """Elapsed, observed, and active evidence kept strictly separate."""
+
+    input_tpm: list[float]
+    output_tpm: list[float]
+    records: list[TraceRecord]
+    observed_days: float
+    elapsed_buckets: int
+    observed_buckets: int
+    active_buckets: int
+    active_input_tpm: list[float]
+    active_output_tpm: list[float]
+
+    @property
+    def tpm(self) -> list[float]:
+        return [value + other for value, other in zip(self.input_tpm, self.output_tpm)]
+
+    @property
+    def active_tpm(self) -> list[float]:
+        return [value + other for value, other in zip(self.active_input_tpm, self.active_output_tpm)]
+
+    @property
+    def collection_completeness_percent(self) -> float:
+        if not self.elapsed_buckets:
+            return 0.0
+        return round(min(100.0, self.observed_buckets / self.elapsed_buckets * 100), 1)
+
+    def weighted(self, output_ratio: int | None) -> list[float]:
+        ratio = output_ratio or 1
+        return [value + other * ratio for value, other in zip(self.input_tpm, self.output_tpm)]
+
+    def active_weighted(self, output_ratio: int | None) -> list[float]:
+        ratio = output_ratio or 1
+        return [value + other * ratio for value, other in zip(self.active_input_tpm, self.active_output_tpm)]
+
+
 def _correlation(values: list[float], lag: int) -> float | None:
     if len(values) < lag * 2:
         return None
@@ -336,25 +414,84 @@ def _correlation(values: list[float], lag: int) -> float | None:
     return max(0.0, numerator / denominator) if denominator else 0.5
 
 
-def _series(records: list[TraceRecord], bucket_minutes: int = 5) -> tuple[list[float], list[float], list[TraceRecord], float, int]:
+def _series(
+    records: list[TraceRecord],
+    bucket_minutes: int = 5,
+    *,
+    aggregate: "AggregateAnalysisSummary | None" = None,
+) -> "_Evidence":
+    """Build the elapsed timeline and count active intervals separately.
+
+    Three counts are produced and never interchanged:
+
+    ``elapsed``   intervals the collection window covers;
+    ``observed``  intervals the source returned a data point for;
+    ``active``    observed intervals with nonzero token or request volume.
+
+    A zero-filled idle window therefore cannot earn sample-size credit, and a
+    sparse window cannot masquerade as perfect continuity.
+    """
     parsed = [(stamp, record) for record in records if (stamp := _timestamp(record.timestamp)) is not None]
     if not parsed:
-        return [], [], [], 0.0, 0
+        return _Evidence(
+            input_tpm=[],
+            output_tpm=[],
+            records=[],
+            observed_days=aggregate.observed_days if aggregate else 0.0,
+            elapsed_buckets=aggregate.elapsed_buckets if aggregate else 0,
+            observed_buckets=0,
+            active_buckets=0,
+            active_input_tpm=[],
+            active_output_tpm=[],
+        )
     parsed.sort(key=lambda item: item[0])
     end = parsed[-1][0]
     start_limit = end - timedelta(days=90)
     parsed = [item for item in parsed if item[0] >= start_limit]
     bucket_seconds = bucket_minutes * 60
-    buckets: dict[int, tuple[float, float]] = defaultdict(lambda: (0.0, 0.0))
+    buckets: dict[int, tuple[float, float, float]] = defaultdict(lambda: (0.0, 0.0, 0.0))
     for stamp, record in parsed:
         key = int(stamp.timestamp()) // bucket_seconds
-        input_tokens, output_tokens = buckets[key]
-        buckets[key] = (input_tokens + record.usage.input_tokens, output_tokens + record.usage.output_tokens)
+        input_tokens, output_tokens, requests = buckets[key]
+        bucket_requests = 0.0
+        metrics = _aggregate_metrics(record)
+        if metrics is not None:
+            bucket_requests = float(metrics.get("requests") or 0)
+        else:
+            bucket_requests = 1.0
+        buckets[key] = (
+            input_tokens + record.usage.input_tokens,
+            output_tokens + record.usage.output_tokens,
+            requests + bucket_requests,
+        )
     first, last = min(buckets), max(buckets)
-    inputs = [buckets.get(key, (0.0, 0.0))[0] / bucket_minutes for key in range(first, last + 1)]
-    outputs = [buckets.get(key, (0.0, 0.0))[1] / bucket_minutes for key in range(first, last + 1)]
+    span = list(range(first, last + 1))
+    inputs = [buckets.get(key, (0.0, 0.0, 0.0))[0] / bucket_minutes for key in span]
+    outputs = [buckets.get(key, (0.0, 0.0, 0.0))[1] / bucket_minutes for key in span]
+    active_keys = [
+        key
+        for key in span
+        if (buckets.get(key, (0.0, 0.0, 0.0))[0] + buckets.get(key, (0.0, 0.0, 0.0))[1]) > 0
+        or buckets.get(key, (0.0, 0.0, 0.0))[2] > 0
+    ]
+    active_inputs = [buckets[key][0] / bucket_minutes for key in active_keys]
+    active_outputs = [buckets[key][1] / bucket_minutes for key in active_keys]
     observed_days = max(bucket_minutes / 1440, (last - first + 1) * bucket_minutes / 1440)
-    return inputs, outputs, [record for _, record in parsed], observed_days, len(buckets)
+    elapsed = len(span)
+    if aggregate is not None and aggregate.elapsed_buckets:
+        elapsed = max(elapsed, aggregate.elapsed_buckets)
+        observed_days = max(observed_days, aggregate.observed_days)
+    return _Evidence(
+        input_tpm=inputs,
+        output_tpm=outputs,
+        records=[record for _, record in parsed],
+        observed_days=observed_days,
+        elapsed_buckets=elapsed,
+        observed_buckets=len(buckets),
+        active_buckets=len(active_keys),
+        active_input_tpm=active_inputs,
+        active_output_tpm=active_outputs,
+    )
 
 
 def _dimension(name: str, verdict: str, summary: str, metric: str) -> PtuDimension:
@@ -364,51 +501,104 @@ def _dimension(name: str, verdict: str, summary: str, metric: str) -> PtuDimensi
 def _dimensions(
     records: list[TraceRecord],
     tpm: list[float],
-    observed_buckets: int,
+    active_buckets: int,
     capacity: _Capacity | None,
+    *,
+    outcomes: dict[str, int | None] | None = None,
 ) -> tuple[list[PtuDimension], dict[str, float | None]]:
-    if observed_buckets < 100:
-        metric = f"{observed_buckets} observed · {len(tpm)} elapsed buckets"
-        workload = _dimension("Workload shape", "insufficient", "Need activity in at least 100 five-minute buckets.", metric)
-        predictability = _dimension("Load predictability", "insufficient", "Need activity in at least 100 five-minute buckets.", metric)
+    """Score workload dimensions only when there is distribution evidence.
+
+    Below the active-bucket threshold every distribution-dependent dimension is
+    ``insufficient``. A mostly idle window is not a "stable", "sparse", or
+    "predictable" workload — it is an unmeasured one.
+    """
+    outcomes = outcomes or {}
+    aggregate_source = bool(outcomes)
+    total_requests = outcomes.get("total_requests")
+    throttled = outcomes.get("rate_limited_requests")
+    if not aggregate_source:
+        total_requests = len(records) or None
+        throttled = sum(record.status_code == 429 for record in records) if records else None
+    # The rate needs a numerator and a denominator from the same source. A
+    # partial or missing denominator produces no rate at all, never a rate above
+    # 100%.
+    throttle_rate = (
+        throttled / total_requests
+        if (throttled is not None and total_requests and throttled <= total_requests)
+        else None
+    )
+
+    latencies = [record.latency_ms for record in records if record.latency_ms is not None]
+    p50_latency = _percentile(latencies, 50) if latencies else None
+    p95_latency = _percentile(latencies, 95) if latencies else None
+    p99_latency = _percentile(latencies, 99) if latencies else None
+    metrics: dict[str, float | None] = {
+        "throttle_rate": throttle_rate,
+        "p50_latency": p50_latency,
+        "p95_latency": p95_latency,
+        "p99_latency": p99_latency,
+    }
+
+    if active_buckets < MINIMUM_ACTIVE_BUCKETS:
+        metric = f"{active_buckets:,} active · {len(tpm):,} elapsed buckets"
+        need = f"Needs activity in at least {MINIMUM_ACTIVE_BUCKETS} five-minute buckets."
+        observed = (
+            f"{throttled:,} of {total_requests:,} requests rate limited"
+            if throttle_rate is not None and total_requests
+            else "Request-outcome evidence unavailable"
+        )
+        return (
+            [
+                _dimension("Workload shape", "insufficient", need, metric),
+                _dimension("Capacity pressure", "insufficient", f"{need} Observed: {observed}.", metric),
+                _dimension(
+                    "Latency sensitivity",
+                    "insufficient",
+                    "No representative latency distribution was observed." if not latencies else need,
+                    "Latency unavailable" if not latencies else metric,
+                ),
+                _dimension("Load predictability", "insufficient", need, metric),
+            ],
+            metrics,
+        )
+
+    average = mean(tpm) if tpm else 0
+    cv = pstdev(tpm) / average if average else 0
+    if cv < 0.3:
+        workload = _dimension("Workload shape", "positive", "Stable throughput favors reserved capacity.", f"TPM CV {cv:.2f}")
+    elif cv > 0.7:
+        workload = _dimension("Workload shape", "negative", "Spiky throughput risks unused PTU capacity.", f"TPM CV {cv:.2f}")
     else:
-        average = mean(tpm)
-        cv = pstdev(tpm) / average if average else 0
-        if cv < 0.3:
-            workload = _dimension("Workload shape", "positive", "Stable throughput favors reserved capacity.", f"TPM CV {cv:.2f}")
-        elif cv > 0.7:
-            workload = _dimension("Workload shape", "negative", "Spiky throughput risks unused PTU capacity.", f"TPM CV {cv:.2f}")
-        else:
-            workload = _dimension("Workload shape", "neutral", "Throughput variability is moderate.", f"TPM CV {cv:.2f}")
+        workload = _dimension("Workload shape", "neutral", "Throughput variability is moderate.", f"TPM CV {cv:.2f}")
 
-        peak = max(tpm, default=0)
-        sustained = sum(value >= peak * 0.3 for value in tpm) / len(tpm) if peak else 0
-        daily = _correlation(tpm, 288)
-        weekly = _correlation(tpm, 2016)
-        similarity = max(value for value in (daily, weekly, 0.5) if value is not None)
-        if sustained >= 0.6 and similarity >= 0.7:
-            predictability = _dimension("Load predictability", "positive", "Sustained, repeating demand favors PTU.", f"{sustained:.0%} sustained · {similarity:.0%} similarity")
-        elif sustained < 0.3:
-            predictability = _dimension("Load predictability", "negative", "Sparse demand favors PAYG.", f"{sustained:.0%} sustained · {similarity:.0%} similarity")
-        else:
-            predictability = _dimension("Load predictability", "neutral", "Demand is only moderately predictable.", f"{sustained:.0%} sustained · {similarity:.0%} similarity")
+    peak = max(tpm, default=0)
+    sustained = sum(value >= peak * 0.3 for value in tpm) / len(tpm) if peak else 0
+    daily = _correlation(tpm, 288)
+    weekly = _correlation(tpm, 2016)
+    similarity = max(value for value in (daily, weekly, 0.5) if value is not None)
+    if sustained >= 0.6 and similarity >= 0.7:
+        predictability = _dimension("Load predictability", "positive", "Sustained, repeating demand favors PTU.", f"{sustained:.0%} sustained · {similarity:.0%} similarity")
+    elif sustained < 0.3:
+        predictability = _dimension("Load predictability", "negative", "Sparse demand favors PAYG.", f"{sustained:.0%} sustained · {similarity:.0%} similarity")
+    else:
+        predictability = _dimension("Load predictability", "neutral", "Demand is only moderately predictable.", f"{sustained:.0%} sustained · {similarity:.0%} similarity")
 
-    total_requests = len(records)
-    throttled = sum(record.status_code == 429 for record in records)
-    throttle_rate = throttled / total_requests if total_requests else 0
     p95_tpm = _percentile(tpm, 95)
     utilization = p95_tpm / capacity.payg_tpm_quota if capacity and capacity.payg_tpm_quota else 0
-    if throttle_rate > 0.05 or utilization > 0.85:
+    if throttle_rate is None:
+        pressure = _dimension(
+            "Capacity pressure",
+            "insufficient",
+            "Request-outcome telemetry is required before quota pressure can be judged.",
+            f"Outcomes unavailable · {utilization:.1%} quota",
+        )
+    elif throttle_rate > 0.05 or utilization > 0.85:
         pressure = _dimension("Capacity pressure", "positive", "PAYG capacity pressure favors dedicated throughput.", f"{throttle_rate:.1%} throttled · {utilization:.1%} quota")
     elif throttle_rate < 0.01 and utilization < 0.5:
         pressure = _dimension("Capacity pressure", "negative", "PAYG is handling observed demand.", f"{throttle_rate:.1%} throttled · {utilization:.1%} quota")
     else:
         pressure = _dimension("Capacity pressure", "neutral", "Some capacity pressure is present.", f"{throttle_rate:.1%} throttled · {utilization:.1%} quota")
 
-    latencies = [record.latency_ms for record in records if record.latency_ms is not None]
-    p50_latency = _percentile(latencies, 50) if latencies else None
-    p95_latency = _percentile(latencies, 95) if latencies else None
-    p99_latency = _percentile(latencies, 99) if latencies else None
     if p50_latency is None:
         latency = _dimension("Latency sensitivity", "insufficient", "No request-latency evidence was supplied.", "Latency unavailable")
     else:
@@ -419,12 +609,7 @@ def _dimensions(
             latency = _dimension("Latency sensitivity", "negative", "Observed request latency is stable.", f"P95 {p95_latency:.0f} ms · P99/P50 {ratio:.1f}x")
         else:
             latency = _dimension("Latency sensitivity", "neutral", "Request latency is moderate.", f"P95 {p95_latency:.0f} ms · P99/P50 {ratio:.1f}x")
-    return [workload, pressure, latency, predictability], {
-        "throttle_rate": throttle_rate,
-        "p50_latency": p50_latency,
-        "p95_latency": p95_latency,
-        "p99_latency": p99_latency,
-    }
+    return [workload, pressure, latency, predictability], metrics
 
 
 def _recommendation(dimensions: list[PtuDimension], eligible: bool, publisher: str | None) -> str:
@@ -623,6 +808,7 @@ def _evidence_table(records: list[TraceRecord]) -> tuple[dict[datetime, _BucketA
 def _confidence(
     *,
     active_buckets: int,
+    observed_buckets: int,
     elapsed_buckets: int,
     observed_days: float,
     outcome_coverage: float,
@@ -630,31 +816,34 @@ def _confidence(
     pricing_coverage: float,
     capacity_known: bool,
     mode_known: bool,
+    identity_known: bool,
 ) -> tuple[float, list[PtuConfidenceComponent]]:
     """Score confidence in the *evidence*, never in how favourable PTU looks.
 
-    The formula is a fixed weighted sum of eight bounded components. Continuity
-    uses active over elapsed buckets, so a window padded with silent buckets can
-    never earn confidence it did not observe.
+    Collection completeness and active sample size are separate components.
+    Observed-versus-expected buckets measure whether the collection worked;
+    active buckets measure whether there was traffic to analyse. A silent
+    window scores full completeness and no sample size, which is exactly what
+    the evidence says.
     """
     components = [
         PtuConfidenceComponent(
-            name="Active five-minute buckets",
+            name="Active sample size",
             weight=0.30,
             score=min(1.0, active_buckets / MINIMUM_ACTIVE_BUCKETS),
             detail=f"{active_buckets:,} of {MINIMUM_ACTIVE_BUCKETS} required active buckets",
         ),
         PtuConfidenceComponent(
             name="Lookback duration",
-            weight=0.20,
+            weight=0.18,
             score=min(1.0, observed_days / 7),
             detail=f"{observed_days:.2f} of 7 reference days observed",
         ),
         PtuConfidenceComponent(
-            name="Bucket continuity",
+            name="Collection completeness",
             weight=0.15,
-            score=min(1.0, active_buckets / elapsed_buckets) if elapsed_buckets else 0.0,
-            detail=f"{active_buckets:,} active of {elapsed_buckets:,} elapsed buckets",
+            score=min(1.0, observed_buckets / elapsed_buckets) if elapsed_buckets else 0.0,
+            detail=f"{observed_buckets:,} observed of {elapsed_buckets:,} elapsed buckets",
         ),
         PtuConfidenceComponent(
             name="Request-outcome coverage",
@@ -673,6 +862,12 @@ def _confidence(
             weight=0.10,
             score=max(0.0, min(1.0, pricing_coverage)),
             detail=f"{pricing_coverage * 100:.1f}% of tokens priced exactly",
+        ),
+        PtuConfidenceComponent(
+            name="Model identity",
+            weight=0.02,
+            score=1.0 if identity_known else 0.0,
+            detail="Exact model and version resolved" if identity_known else "Model identity unresolved",
         ),
         PtuConfidenceComponent(
             name="Model capacity",
@@ -706,9 +901,24 @@ def _dashboard_state(
     eligibility_status: EligibilityStatus,
     recommendation: str,
     publisher: str | None,
+    identity_resolved: bool = True,
+    sufficient_evidence: bool = True,
 ) -> DashboardState:
+    """Deterministic precedence: the *primary* blocker is shown first.
+
+    Capacity and pricing are real blockers, but they are secondary to identity
+    and evidence: sizing a model you cannot identify, from two active buckets,
+    is not a capacity problem.
+    """
+    if not identity_resolved:
+        return "collection_identity_error"
+    # PTU applicability is categorical: no amount of extra evidence makes an
+    # Azure PTU purchase possible for a consumption-billed partner model, so it
+    # is reported ahead of sample-size problems.
     if eligibility_status == "ptu_not_applicable":
         return "ptu_not_applicable"
+    if not sufficient_evidence:
+        return "insufficient_evidence"
     if eligibility_status == "model_capacity_unavailable":
         return "capacity_unavailable"
     if eligibility_status == "pricing_unavailable":
@@ -728,6 +938,7 @@ _STATE_SUMMARIES: dict[str, str] = {
     "ptu_recommended": "Observed throughput, capacity pressure, and modeled economics all support committing to dedicated capacity.",
     "borderline": "PTU and PAYG are currently close. Validate with additional data before committing.",
     "payg_recommended": "Pay-as-you-go remains the safer or cheaper strategy for the observed demand.",
+    "collection_identity_error": "The collected telemetry does not identify the deployment's exact model, so no capacity, pricing, or workload conclusion can be drawn.",
     "insufficient_evidence": "The observed window cannot support a PTU recommendation yet.",
     "pricing_unavailable": "Workload evidence exists, but exact PAYG pricing is required before the economics can be calculated.",
     "ptu_not_applicable": "This model is billed through Foundry's partner/consumption offer; Azure PTU capacity purchasing does not apply.",
@@ -811,9 +1022,12 @@ def _dashboard(
     publisher: str | None,
     eligibility_status: EligibilityStatus,
     recommendation: str,
+    evidence_series: _Evidence,
     weighted_tpm: list[float],
-    observed_days: float,
-    active_buckets: int,
+    active_weighted_tpm: list[float],
+    identity_resolved: bool,
+    sufficient_evidence: bool,
+    secondary_blockers: list[str],
     throughput_series: PtuThroughputSeries | None,
     cost_curve: PtuCostCurve | None,
     suggested_ptu: int | None,
@@ -824,10 +1038,18 @@ def _dashboard(
     cost_resolver: CostResolver | None,
 ) -> PtuDashboardData:
     summary = deployment.summary
+    observed_days = evidence_series.observed_days
+    active_buckets = evidence_series.active_buckets
+    aggregate = summary.aggregate
     table, missing_metrics = _evidence_table(records)
     ordered = sorted(table.items())
-    window_start = ordered[0][0] if ordered else None
-    window_end = ordered[-1][0] + timedelta(minutes=BUCKET_MINUTES) if ordered else None
+    # The collection window, when the source reported one, is what "elapsed"
+    # means. Falling back to first/last observation would silently shrink an
+    # idle window to the few minutes that happened to carry traffic.
+    window_start = (aggregate.window_start if aggregate is not None else None) or (ordered[0][0] if ordered else None)
+    window_end = (aggregate.window_end if aggregate is not None else None) or (
+        ordered[-1][0] + timedelta(minutes=BUCKET_MINUTES) if ordered else None
+    )
     cached_known = any(bucket.cached_known for _, bucket in ordered)
     outcome_known = any(bucket.outcome_known for _, bucket in ordered)
     evidence = [
@@ -873,14 +1095,24 @@ def _dashboard(
     complete_days = len(daily_totals) - partial_days
     daily_average_tokens = round(sum(daily_totals.values()) / len(daily_totals), 1) if daily_totals else None
 
-    elapsed_buckets = len(weighted_tpm)
+    # Elapsed is the window, observed is what the source returned, active is
+    # where traffic happened. They are reported separately, never merged.
+    elapsed_buckets = max(evidence_series.elapsed_buckets, len(weighted_tpm))
+    observed_buckets = evidence_series.observed_buckets
     weighted_basis = (
         f"input + output x {capacity.output_ratio}"
         if capacity
         else "input + output (model output weighting unavailable)"
     )
-    average_weighted = round(mean(weighted_tpm), 2) if weighted_tpm else None
-    p95_weighted = round(_percentile(weighted_tpm, 95), 2) if weighted_tpm else None
+    # The elapsed-window average divides by every interval in the collection
+    # window. Dividing by the handful of intervals that happened to carry
+    # traffic would overstate sustained demand by orders of magnitude.
+    elapsed_weighted = weighted_tpm + [0.0] * max(0, elapsed_buckets - len(weighted_tpm))
+    average_weighted = round(mean(elapsed_weighted), 4) if elapsed_weighted else None
+    p95_weighted = round(_percentile(elapsed_weighted, 95), 4) if elapsed_weighted else None
+    active_average_weighted = round(mean(active_weighted_tpm), 4) if active_weighted_tpm else None
+    active_p95_weighted = round(_percentile(active_weighted_tpm, 95), 4) if active_weighted_tpm else None
+    busy_hour_available = len(active_weighted_tpm) >= MINIMUM_BUSY_HOUR_BUCKETS
 
     latency_coverage = (
         sum(record.latency_ms is not None for record in records) / len(records) if records else 0.0
@@ -891,6 +1123,7 @@ def _dashboard(
     mode_known = summary.deployment_mode.casefold() in {"global", "regional"}
     confidence_percent, confidence_components = _confidence(
         active_buckets=active_buckets,
+        observed_buckets=observed_buckets,
         elapsed_buckets=elapsed_buckets,
         observed_days=observed_days,
         outcome_coverage=outcome_coverage,
@@ -898,11 +1131,14 @@ def _dashboard(
         pricing_coverage=summary.pricing_coverage_tokens_percent / 100,
         capacity_known=capacity is not None,
         mode_known=mode_known,
+        identity_known=identity_resolved,
     )
     state = _dashboard_state(
         eligibility_status=eligibility_status,
         recommendation=recommendation,
         publisher=publisher,
+        identity_resolved=identity_resolved,
+        sufficient_evidence=sufficient_evidence,
     )
     show_confidence = state in STATES_WITH_CONFIDENCE
     daily_cost = _daily_cost(records, cost_resolver, window_start=window_start, window_end=window_end)
@@ -919,19 +1155,32 @@ def _dashboard(
     if summary.pricing_coverage_tokens_percent < 100:
         missing_metrics.add("pricing")
 
-    smoke_test = active_buckets < 5 and len(records) <= 10
+    smoke_test = active_buckets < 5 and (total_requests or len(records)) <= 10
+    outcome_state = (
+        aggregate.outcome_coverage
+        if aggregate is not None
+        else ("complete" if outcome_known and outcome_coverage == 1 else "partial" if outcome_known else "unavailable")
+    )
+    successful = sum(bucket.successful for _, bucket in ordered) if outcome_known else None
+    other_failed = sum(bucket.failed for _, bucket in ordered) if outcome_known else None
+    active_days = len({stamp.date() for stamp, bucket in ordered if bucket.input_tokens or bucket.output_tokens or bucket.requests})
     dashboard_summary = PtuDashboardSummary(
         deployment_name=summary.deployment_name,
         model_name=summary.model_name,
+        model_version=str((records[0].metadata or {}).get("model_version")) if records and (records[0].metadata or {}).get("model_version") else None,
         deployment_mode=summary.deployment_mode,
         state=state,
         state_label=DASHBOARD_STATE_LABELS[state],
         recommendation=DASHBOARD_STATE_LABELS[state],
+        secondary_blockers=list(secondary_blockers),
         confidence_percent=confidence_percent if show_confidence else None,
         confidence_label=_confidence_label(confidence_percent) if show_confidence else None,
         summary=_STATE_SUMMARIES[state],
         average_weighted_tpm=average_weighted,
         p95_weighted_tpm=p95_weighted,
+        active_average_weighted_tpm=active_average_weighted,
+        active_p95_weighted_tpm=active_p95_weighted,
+        busy_hour_available=busy_hour_available,
         weighted_basis=weighted_basis,
         total_input_tokens=total_input or None if records else None,
         total_cached_tokens=total_cached,
@@ -940,14 +1189,27 @@ def _dashboard(
         daily_average_tokens=daily_average_tokens,
         rate_limited_requests=rate_limited,
         rate_limit_percent=rate_limit_percent,
+        successful_requests=successful,
+        other_failed_requests=other_failed,
+        outcome_coverage=outcome_state,
         total_requests=total_requests,
+        requests_available=total_requests is not None,
+        retries_available=aggregate is None,
         observed_days=round(observed_days, 2),
+        active_days=active_days,
         complete_days=max(0, complete_days),
         partial_days=partial_days,
         window_start=window_start,
         window_end=window_end,
         active_buckets=active_buckets,
+        observed_buckets=observed_buckets,
         elapsed_buckets=elapsed_buckets,
+        collection_completeness_percent=(
+            round(min(100.0, observed_buckets / elapsed_buckets * 100), 1) if elapsed_buckets else 0.0
+        ),
+        bucket_minutes=aggregate.bucket_minutes if aggregate is not None else BUCKET_MINUTES,
+        identity_resolved=identity_resolved,
+        pricing_status=summary.pricing_status,
         pricing_coverage_tokens_percent=summary.pricing_coverage_tokens_percent,
         pricing_currency=summary.pricing_currency,
         total_cost=total_cost,
@@ -1009,6 +1271,9 @@ def _assumptions(
     if capacity is not None:
         items.append(
             f"PTU sizing uses {capacity.input_tpm_per_ptu:,} input TPM per PTU and a {capacity.output_ratio}x output weighting."
+        )
+        items.append(
+            f"Capacity for this exact model comes from {capacity.source}; no related model's capacity is substituted."
         )
     if suggested_ptu is not None:
         items.append(f"Reserved pricing assumes a one-year commitment discount applied to {suggested_ptu:,} PTU.")
@@ -1136,11 +1401,29 @@ def _data_quality_notes(*, summary: PtuDashboardSummary, missing: list[str]) -> 
 
 def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost_resolver: CostResolver | None = None) -> PtuDeploymentAssessment:
     summary = deployment.summary
-    input_tpm, output_tpm, filtered_records, observed_days, observed_buckets = _series(records)
-    tpm = [input_value + output_value for input_value, output_value in zip(input_tpm, output_tpm)]
+    aggregate = summary.aggregate
+    evidence = _series(records, aggregate=aggregate)
+    input_tpm, output_tpm = evidence.input_tpm, evidence.output_tpm
+    filtered_records = evidence.records
+    observed_days = evidence.observed_days
+    active_buckets = evidence.active_buckets
+    tpm = evidence.tpm
+    if evidence.elapsed_buckets > len(tpm):
+        tpm = tpm + [0.0] * (evidence.elapsed_buckets - len(tpm))
     capacity = _capacity_for(summary.model_name)
     publisher = infer_publisher(summary.model_name)
-    dimensions, metrics = _dimensions(filtered_records, tpm, observed_buckets, capacity)
+    identity_resolved = summary.model_name.strip().casefold() not in {"", "unknown", "none"}
+    outcomes = {
+        "total_requests": aggregate.requests_observed if aggregate is not None else None,
+        "rate_limited_requests": aggregate.rate_limited_requests if aggregate is not None else None,
+    }
+    dimensions, metrics = _dimensions(
+        filtered_records,
+        tpm,
+        active_buckets,
+        capacity,
+        outcomes=outcomes if aggregate is not None else None,
+    )
     recommendation = _recommendation(dimensions, capacity is not None, publisher)
     average_tpm = mean(tpm) if tpm else 0
     p95_tpm = _percentile(tpm, 95)
@@ -1161,22 +1444,40 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
     note = "Exact supported model capacity is required for PTU sizing."
 
     mode = summary.deployment_mode.casefold()
-    sufficient_evidence = observed_buckets >= MINIMUM_ACTIVE_BUCKETS
-    if capacity is None:
-        eligibility_status: EligibilityStatus = "ptu_not_applicable" if publisher and publisher != "microsoft" else "model_capacity_unavailable"
+    # Sufficiency is measured in *active* buckets. A window padded with silent
+    # intervals is not evidence of sustained demand.
+    sufficient_evidence = active_buckets >= MINIMUM_ACTIVE_BUCKETS
+    secondary_blockers: list[str] = []
+    if not identity_resolved:
+        eligibility_status: EligibilityStatus = "collection_identity_error"
+    elif capacity is None:
+        eligibility_status = "ptu_not_applicable" if publisher and publisher != "microsoft" else "model_capacity_unavailable"
     elif mode not in {"global", "regional"}:
         eligibility_status = "deployment_mode_unavailable"
     elif not sufficient_evidence:
         eligibility_status = "eligible_insufficient_evidence"
     else:
         eligibility_status = "eligible_sufficient_evidence"  # may be downgraded to pricing_unavailable below
+    # Capacity and pricing remain real blockers, but they are badges behind the
+    # primary state rather than a headline that hides the actual problem.
+    if capacity is None and identity_resolved:
+        secondary_blockers.append("Capacity data required")
+    if mode not in {"global", "regional"}:
+        secondary_blockers.append("Deployment mode unconfirmed")
+    if summary.pricing_status != "priced":
+        secondary_blockers.append("Pricing required")
 
     if capacity and mode in {"global", "regional"}:
         regional = mode == "regional"
         minimum = capacity.regional_min_ptu if regional else capacity.global_min_ptu
         increment = capacity.regional_increment if regional else capacity.global_increment
         hourly_rate = 2.0 if regional else 1.0
-        weighted_tpm = [input_value + output_value * capacity.output_ratio for input_value, output_value in zip(input_tpm, output_tpm)]
+        # Economics must use the same elapsed-window basis as the dashboard
+        # headline. Otherwise a short burst is incorrectly annualised as a
+        # sustained month-long workload.
+        weighted_tpm = evidence.weighted(capacity.output_ratio)
+        if evidence.elapsed_buckets > len(weighted_tpm):
+            weighted_tpm = weighted_tpm + [0.0] * (evidence.elapsed_buckets - len(weighted_tpm))
         raw_ptu = _percentile(weighted_tpm, 95) * 1.2 / capacity.input_tpm_per_ptu
         p95_sized_ptu = max(minimum, ceil(raw_ptu / increment) * increment)
         effective_capacity_per_ptu = capacity.input_tpm_per_ptu
@@ -1185,7 +1486,10 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
         cached_tokens = summary.cached_tokens
         fresh_tokens = max(0, summary.input_tokens - cached_tokens)
         pricing_ready = (
-            summary.input_price_per_million is not None
+            # Economics are a recommendation too: they are withheld until the
+            # active sample can support one.
+            sufficient_evidence
+            and summary.input_price_per_million is not None
             and summary.output_price_per_million is not None
             and (not cached_tokens or cached_rate is not None)
             and total_tokens
@@ -1251,7 +1555,9 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
                     hybrid_monthly_usd=hybrid_monthly,
                 )
         else:
-            suggested_ptu = p95_sized_ptu if filtered_records else None
+            # A PTU amount is a recommendation. It is withheld until the active
+            # sample is large enough to size against.
+            suggested_ptu = p95_sized_ptu if filtered_records and sufficient_evidence else None
             if suggested_ptu is not None:
                 ptu_capacity_tpm = suggested_ptu * effective_capacity_per_ptu
                 hourly_monthly = suggested_ptu * hourly_rate * 720
@@ -1264,17 +1570,36 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
     elif capacity:
         note = "Workload fit is available; deployment mode must be Global or Regional before PTU sizing and economics."
 
-    if eligibility_status == "eligible_insufficient_evidence":
+    if eligibility_status == "collection_identity_error":
         note = (
-            f"{observed_buckets} of the required {MINIMUM_ACTIVE_BUCKETS} active five-minute buckets were observed; "
-            "TokenLens shows the observed workload evidence but withholds a PTU recommendation and cost curve until "
-            "there is enough sustained activity to size and cost dedicated capacity."
+            "Collection did not resolve this deployment's exact model, so capacity, pricing, and workload "
+            "conclusions are withheld. Re-run collection with an explicit deployment so the model dimension or "
+            "deployment inventory can supply the exact model and version."
         )
     elif eligibility_status == "ptu_not_applicable":
         note = (
             f"{publisher.title() if publisher else 'This publisher'}'s models are billed through Foundry's "
             "consumption/marketplace offer; Azure PTU capacity purchasing does not apply to this model."
         )
+    elif eligibility_status == "eligible_insufficient_evidence" or not sufficient_evidence:
+        note = (
+            f"{active_buckets} of the required {MINIMUM_ACTIVE_BUCKETS} active five-minute buckets were observed "
+            f"across {evidence.elapsed_buckets:,} elapsed buckets; TokenLens shows the observed workload evidence "
+            "but withholds a PTU recommendation and cost curve until there is enough sustained activity to size "
+            "and cost dedicated capacity."
+        )
+
+    # Secondary blockers are appended to the note so the primary state stays the
+    # real blocker while nothing that also blocks a decision is hidden.
+    secondary_notes: list[str] = []
+    if capacity is None and identity_resolved and "PTU capacity" not in note:
+        secondary_notes.append("Exact PTU capacity for this model and version is unavailable, so sizing stays blocked.")
+    if mode not in {"global", "regional"} and "deployment mode" not in note:
+        secondary_notes.append("The deployment mode must be Global or Regional before PTU sizing and economics.")
+    if summary.pricing_status != "priced" and "pricing" not in note.casefold():
+        secondary_notes.append("Exact pricing is required before break-even and hybrid economics can be shown.")
+    if secondary_notes:
+        note = " ".join([note, *secondary_notes])
 
     dashboard = _dashboard(
         records=filtered_records,
@@ -1283,13 +1608,12 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
         publisher=publisher,
         eligibility_status=eligibility_status,
         recommendation=recommendation,
-        weighted_tpm=(
-            [input_value + output_value * capacity.output_ratio for input_value, output_value in zip(input_tpm, output_tpm)]
-            if capacity
-            else tpm
-        ),
-        observed_days=observed_days,
-        active_buckets=observed_buckets,
+        evidence_series=evidence,
+        weighted_tpm=evidence.weighted(capacity.output_ratio if capacity else None),
+        active_weighted_tpm=evidence.active_weighted(capacity.output_ratio if capacity else None),
+        identity_resolved=identity_resolved,
+        sufficient_evidence=sufficient_evidence,
+        secondary_blockers=secondary_blockers,
         throughput_series=throughput_series,
         cost_curve=cost_curve,
         suggested_ptu=suggested_ptu,
@@ -1309,11 +1633,14 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
         recommendation=recommendation,
         economic_result=economic_result,
         data_points=len(tpm),
-        observed_buckets=observed_buckets,
+        observed_buckets=active_buckets,
         observed_days=round(observed_days, 2),
         average_tpm=round(average_tpm, 2),
         p95_tpm=round(p95_tpm, 2),
         throttling_rate_percent=round(float(metrics["throttle_rate"] or 0) * 100, 2),
+        active_buckets=active_buckets,
+        elapsed_buckets=evidence.elapsed_buckets,
+        identity_resolved=identity_resolved,
         p50_latency_ms=metrics["p50_latency"],
         p95_latency_ms=metrics["p95_latency"],
         p99_latency_ms=metrics["p99_latency"],

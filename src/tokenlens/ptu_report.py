@@ -21,6 +21,7 @@ from typing import Any, Sequence
 from .ptu import (
     DASHBOARD_STATE_LABELS,
     MINIMUM_ACTIVE_BUCKETS,
+    MINIMUM_BUSY_HOUR_BUCKETS,
     PtuCostCurve,
     PtuDashboardData,
     PtuDeploymentAssessment,
@@ -68,6 +69,23 @@ def _number(value: float | int | None, *, precision: int = 0) -> str:
     if value is None:
         return "Unavailable"
     return f"{value:,.{precision}f}"
+
+
+def _throughput(value: float | None) -> str:
+    """Format throughput with adaptive precision.
+
+    Rounding a tiny nonzero rate to ``0`` reads as "no traffic", which is a
+    different statement from "very little traffic".
+    """
+    if value is None:
+        return "Unavailable"
+    if value == 0:
+        return "0"
+    if value < 0.01:
+        return "<0.01"
+    if value < 1:
+        return f"{value:,.2f}"
+    return f"{value:,.0f}"
 
 
 def money(value: float | None, currency: str = "USD", *, precision: int = 2, unavailable: str = "Unavailable") -> str:
@@ -559,36 +577,61 @@ def _cost_rows(data: PtuDashboardData) -> list[list[float | None]]:
 def _glance_cards(data: PtuDashboardData) -> str:
     summary = data.summary
     partial = " · partial window" if summary.partial_days else ""
+    scope_detail = f"{summary.model_name}"
+    if summary.model_version:
+        scope_detail += f" · version {summary.model_version}"
+    scope_detail += f" · {summary.deployment_mode.title()} deployment"
+    busy_hour_value = (
+        _throughput(summary.active_p95_weighted_tpm) if summary.busy_hour_available else "Insufficient sample"
+    )
+    busy_hour_sub = (
+        f"P95 across {summary.active_buckets:,} active buckets · elapsed-window P95 {_throughput(summary.p95_weighted_tpm)}"
+        if summary.busy_hour_available
+        else f"{summary.active_buckets:,} active buckets observed; a busy-hour statistic needs at least {MINIMUM_BUSY_HOUR_BUCKETS}"
+    )
+    requests_value = _number(summary.total_requests) if summary.requests_available else "Unavailable"
     cards = [
         (
             "Scope",
             summary.deployment_name,
-            f"{summary.model_name} · {summary.deployment_mode.title()} deployment",
+            scope_detail,
             None,
         ),
         (
             "Typical Throughput",
-            _number(summary.average_weighted_tpm),
-            f"weighted tokens / min avg · {summary.weighted_basis}",
-            "Weighted TPM applies the model's output-token weighting so a PTU size can be compared against observed demand.",
+            _throughput(summary.average_weighted_tpm),
+            f"weighted tokens / min across {summary.elapsed_buckets:,} elapsed buckets · active-bucket average {_throughput(summary.active_average_weighted_tpm)}",
+            "Weighted TPM applies the model's output-token weighting. The elapsed-window average divides by every interval in the collection window; the active-bucket average divides only by intervals with traffic.",
         ),
         (
             "Busy-Hour Throughput",
-            _number(summary.p95_weighted_tpm),
-            "P95 weighted tokens / min",
-            "P95 is the busy-hour reference: 95% of observed buckets were at or below this throughput.",
+            busy_hour_value,
+            busy_hour_sub,
+            "Busy-hour throughput is the P95 across active buckets. A P95 across a mostly idle window measures silence, not a busy period.",
+        ),
+        (
+            "Requests",
+            requests_value,
+            (
+                f"{summary.active_buckets:,} active of {summary.elapsed_buckets:,} elapsed {summary.bucket_minutes}-minute buckets"
+                if summary.requests_available
+                else "Request metric unavailable · bucket counts are never shown as requests"
+            ),
+            "Requests come from the request metric. A bucket is a time interval, so bucket counts are never used as a request count.",
         ),
         (
             "Total Tokens",
             _number(summary.total_tokens),
-            f"{_number(summary.total_input_tokens)} input · {_number(summary.total_cached_tokens)} cached · {_number(summary.total_output_tokens)} output",
+            f"{_number(summary.total_input_tokens)} input · "
+            + (f"{_number(summary.total_cached_tokens)} cached" if summary.total_cached_tokens is not None else "cached unavailable")
+            + f" · {_number(summary.total_output_tokens)} output",
             None,
         ),
         (
             "Daily Average Tokens",
             _number(summary.daily_average_tokens),
-            f"{summary.complete_days} complete · {summary.partial_days} partial day(s){partial}",
-            "The daily average divides observed tokens by observed days. Partial days are marked because they understate a full day.",
+            f"{summary.active_days} active day(s) · {summary.complete_days} complete · {summary.partial_days} partial day(s){partial}",
+            "The daily average divides observed tokens by observed days. Active days, complete days, and partial days are counted separately.",
         ),
         (
             "Rate-Limit Events",
@@ -599,18 +642,33 @@ def _glance_cards(data: PtuDashboardData) -> str:
             else "Unavailable",
             (
                 f"{_number(summary.rate_limited_requests)} of {_number(summary.total_requests)} requests"
+                + (" · complete status coverage" if summary.outcome_coverage == "complete" else " · partial status coverage")
                 if summary.rate_limit_percent is not None
                 else "429 events observed · rate unavailable (incomplete request totals)"
                 if summary.rate_limited_requests is not None
                 else "Request-outcome metric unavailable"
             ),
-            "The 429 rate is rate-limited requests divided by requests whose outcome and total the source reported.",
+            "The 429 rate is rate-limited requests divided by requests whose outcome and total the source reported. A zero is only reported when status-code coverage is complete.",
+        ),
+        (
+            "Request Outcomes",
+            (
+                f"{_number(summary.successful_requests)} ok"
+                if summary.outcome_coverage != "unavailable"
+                else "Unavailable"
+            ),
+            (
+                f"{_number(summary.other_failed_requests)} other failure(s) · {_number(summary.rate_limited_requests)} rate limited · coverage {summary.outcome_coverage}"
+                if summary.outcome_coverage != "unavailable"
+                else "Status-code series were not returned for this deployment"
+            ),
+            "Success, HTTP 429, and other failures are derived from the status-code series. Success is never derived as total minus 429.",
         ),
     ]
     rendered = []
     for label, value, sub, tip in cards:
         tooltip = (
-            f'<span class="info-tip" tabindex="0" role="note" aria-label="{_escape(tip)}"><span aria-hidden="true">i</span>'
+            f'<span class="info-tip" tabindex="0" role="note" aria-label="{_escape(tip)}"><span aria-hidden="true">&#8505;</span>'
             f'<span class="tip-body">{_escape(tip)}</span></span>'
             if tip
             else ""
@@ -630,9 +688,12 @@ def _banner(data: PtuDashboardData, slug: str) -> str:
         if summary.confidence_percent is not None
         else f'<span class="confidence-score missing">Confidence withheld<small>{_escape(_missing_evidence_line(data))}</small></span>'
     )
+    blockers = "".join(
+        f'<span class="blocker-badge">{_escape(item)}</span>' for item in summary.secondary_blockers
+    )
     return f"""<section class="ptu-banner state-{_escape(summary.state)}" aria-label="Recommendation">
       <div class="banner-copy">
-        <div class="banner-badges"><span class="state-badge">{_escape(DASHBOARD_STATE_LABELS[summary.state])}</span>{confidence}</div>
+        <div class="banner-badges"><span class="state-badge">{_escape(DASHBOARD_STATE_LABELS[summary.state])}</span>{confidence}{blockers}</div>
         <h2>Recommendation: {_escape(summary.recommendation)}</h2>
         <p>{_escape(summary.summary)}</p>
         <small>{_escape(summary.deployment_name)} · {_escape(summary.model_name)} · {_escape(summary.deployment_mode.title())} deployment
@@ -654,8 +715,13 @@ def _window_label(summary) -> str:
 
 def _missing_evidence_line(data: PtuDashboardData) -> str:
     summary = data.summary
+    if summary.state == "collection_identity_error":
+        return "Deployment model identity unresolved during collection"
     if summary.state == "insufficient_evidence":
-        return f"{summary.active_buckets:,} of {MINIMUM_ACTIVE_BUCKETS} active five-minute buckets observed"
+        return (
+            f"{summary.active_buckets:,} of {MINIMUM_ACTIVE_BUCKETS} active buckets observed "
+            f"({summary.observed_buckets:,} observed of {summary.elapsed_buckets:,} elapsed)"
+        )
     if summary.state == "pricing_unavailable":
         return "Exact PAYG pricing required"
     if summary.state == "capacity_unavailable":
@@ -913,6 +979,7 @@ PTU_DASHBOARD_CSS = """
 .state-payg_recommended .state-badge{color:var(--accent)}
 .state-insufficient_evidence .state-badge,.state-capacity_unavailable .state-badge,.state-ptu_not_applicable .state-badge{color:var(--pink)}
 .confidence-score{font-size:12px;color:var(--soft)}
+.blocker-badge{font-size:12px;font-weight:700;padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface-2);color:var(--amber)}
 .confidence-score small{display:inline;margin-left:6px;color:var(--muted)}
 .confidence-score.missing{color:var(--amber)}
 .ptu-banner h2{font-size:17px}
@@ -925,23 +992,27 @@ PTU_DASHBOARD_CSS = """
 .glance-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:14px}
 .glance-card .label{display:flex;align-items:center;gap:6px}
 .glance-value{font-size:22px;line-height:1.15;overflow-wrap:anywhere}
-.info-tip{position:relative;display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;border-radius:50%;border:1px solid var(--border);background:var(--surface-2);color:var(--muted);font-size:10px;cursor:help}
-.info-tip .tip-body{display:none;position:absolute;z-index:6;top:130%;left:0;width:max(220px,14vw);padding:8px 10px;border:1px solid var(--border);border-radius:7px;background:var(--surface-2);color:var(--soft);font-size:11px;text-transform:none;letter-spacing:0;box-shadow:var(--shadow)}
+.info-tip{position:relative;display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;border:1px solid var(--border);background:var(--surface-2);color:var(--muted);font-size:11px;font-style:normal;cursor:help}
+.info-tip .tip-body{display:none;position:absolute;z-index:8;top:130%;left:0;width:max(220px,14vw);padding:8px 10px;border:1px solid var(--border);border-radius:7px;background:var(--surface-2);color:var(--soft);font-size:12px;text-transform:none;letter-spacing:0;box-shadow:var(--shadow)}
 .info-tip:hover .tip-body,.info-tip:focus .tip-body,.info-tip:focus-within .tip-body{display:block}
 .evidence-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .ptu-chart{display:flex;flex-direction:column;gap:8px;min-width:0}
 .chart-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap}
 .chart-head h3{font-size:14px}
 .chart-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
-.chart-badge{font-size:11px;font-weight:700;color:var(--soft);background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:3px 8px}
+.chart-badge{font-size:12px;font-weight:700;color:var(--soft);background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:3px 8px}
 .ptu-chart-svg{width:100%;height:auto;display:block}
-.chart-range{display:flex;flex-wrap:wrap;align-items:center;gap:9px;font-size:11px;color:var(--muted)}
+.chart-range{display:flex;flex-wrap:wrap;align-items:center;gap:9px;font-size:12px;color:var(--muted)}
 .chart-range label{display:flex;align-items:center;gap:5px}
 .chart-range input[type=range]{width:min(170px,32vw);accent-color:var(--accent)}
-.range-readout{font-size:11px;color:var(--soft)}
-.chart-summary{font-size:11px;color:var(--muted)}
+.range-readout{font-size:12px;color:var(--soft)}
+.chart-summary{font-size:12px;color:var(--muted)}
 .chart-unavailable{font-size:12px;color:var(--amber);padding:12px;border:1px dashed var(--border);border-radius:8px;background:var(--surface-2)}
-.chart-table summary{font-size:11px;color:var(--accent);cursor:pointer}
+.chart-table summary{font-size:12px;color:var(--accent);cursor:pointer}
+.ptu-chart>*{min-width:0;max-width:100%}
+.chart-table{min-width:0;max-width:100%}
+.chart-table .table-scroll{max-width:100%;overflow-x:auto}
+.ptu-chart .data-table{width:max-content;min-width:100%}
 .table-scroll{max-width:100%;overflow-x:auto}
 .glance-grid>*,.evidence-grid>*,.rationale-grid>*,.ptu-graphs>*{min-width:0}
 .ptu-deployment table,.ptu-portfolio table{min-width:0}
@@ -950,7 +1021,8 @@ PTU_DASHBOARD_CSS = """
 .rationale-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:14px}
 .rationale-panel{padding:14px}
 .rationale-panel h3{font-size:14px;margin-bottom:7px}
-.rationale-panel ul{margin:0;padding-left:18px;display:grid;gap:5px}
+.rationale-panel ul{margin:0;padding-left:18px;display:grid;gap:5px;overflow-wrap:anywhere}
+.rationale-panel li{overflow-wrap:anywhere}
 .rationale-panel li{font-size:13px;color:var(--soft)}
 .rationale-panel li.empty{color:var(--muted);list-style:none;margin-left:-18px}
 .ptu-modal{position:fixed;inset:0;z-index:20;display:none;align-items:center;justify-content:center;padding:clamp(10px,3vw,40px);background:rgba(5,12,24,.78)}
@@ -960,12 +1032,15 @@ PTU_DASHBOARD_CSS = """
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 @media(max-width:1180px){.glance-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:900px){.evidence-grid,.rationale-grid{grid-template-columns:1fr}}
-@media(max-width:620px){.glance-grid{grid-template-columns:1fr}.ptu-banner{flex-direction:column}.banner-actions{width:100%}.chart-range input[type=range]{width:100%}.chart-range label{flex:1 1 100%}}
+@media(max-width:620px){.rationale-panel{padding:12px}.rationale-panel ul{padding-left:16px}.glance-grid{grid-template-columns:1fr}.ptu-banner{flex-direction:column}.banner-actions{width:100%}.chart-range input[type=range]{width:100%}.chart-range label{flex:1 1 100%}}
 @media print{
   body{background:#fff;color:#000}
   .tab-list,.ptu-selector,.banner-actions,.chart-range,.chart-button{display:none!important}
-  .tab-panel{display:none!important}
-  .tab-panel.ptu,body.ptu-print .tab-panel.ptu{display:block!important}
+  /* Only the PTU export button narrows a print to the PTU tab. A plain print
+     from any other tab keeps the whole report, as the shell's print rules
+     intend. */
+  body.ptu-print .tab-panel{display:none!important}
+  body.ptu-print .tab-panel.ptu{display:block!important}
   .ptu-deployment[hidden]{display:none!important}
   .evidence-grid,.rationale-grid,.ptu-graphs{grid-template-columns:1fr!important}
   .chart-card,.panel,.card,.ptu-banner{break-inside:avoid;box-shadow:none}
@@ -1266,14 +1341,21 @@ PTU_DASHBOARD_JS = """
     }
     var picker = panel.querySelector("[data-ptu-select]");
     if (picker && picker.value !== slug) picker.value = slug;
-    if (history.replaceState) history.replaceState(null, "", "#ptu=" + slug);
+    /* Deployment selection owns only its own parameter; the shared router keeps
+       the tab fragment and the ARIA state in agreement. */
+    if (window.tokenlensRouter) window.tokenlensRouter.setDeployment(slug);
     apply(slug);
     if (moveFocus && picker) picker.focus();
   }
   var picker = panel.querySelector("[data-ptu-select]");
   if (picker) picker.addEventListener("change", function(){ select(picker.value, false); });
-  var initial = (location.hash.match(/^#ptu=(.+)$/) || [])[1];
+  var routed = window.tokenlensRouter ? window.tokenlensRouter.state().deployment : null;
   var first = panel.querySelector("[data-ptu-deployment]");
-  if (first) select(initial ? decodeURIComponent(initial) : first.dataset.ptuDeployment, false);
+  if (first) select(routed ? routed : first.dataset.ptuDeployment, false);
+  if (window.tokenlensRouter) {
+    window.tokenlensRouter.subscribe(function(state, origin){
+      if (origin === "hash" && state.tab === "ptu" && state.deployment) select(state.deployment, false);
+    });
+  }
 })();
 """

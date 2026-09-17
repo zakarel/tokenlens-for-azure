@@ -92,23 +92,29 @@ def pricing_audit_text(report: AnalysisReport) -> str:
     from .presentation import model_rollups
 
     summary = report.summary
+    volume = (
+        f"{summary.requests_observed:,} requests"
+        if summary.requests_available and summary.requests_observed is not None
+        else "requests unavailable"
+    )
     lines = [
         "TokenLens for Azure · Pricing audit",
         "─" * 68,
         (
-            f"{summary.requests_analyzed:,} requests · {summary.total_tokens:,} tokens · "
+            f"{volume} · {summary.total_tokens:,} tokens · "
             f"{len(model_rollups(report)):,} unique model/mode combinations"
         ),
         (
-            f"Coverage: {summary.pricing_coverage_requests_percent:.1f}% of requests · "
-            f"{summary.pricing_coverage_tokens_percent:.1f}% of tokens priced"
+            f"Coverage: {summary.pricing_coverage_tokens_percent:.1f}% of tokens priced · "
+            f"status={summary.pricing_status}"
         ),
         "",
     ]
     for item in model_rollups(report):
         lines.append(f"model={item.model_name} mode={item.deployment_mode} tier={item.service_tier}")
+        requests = f"{item.requests:,}" if item.requests is not None else "unavailable"
         lines.append(
-            f"  requests={item.requests:,} tokens={item.total_tokens:,} "
+            f"  requests={requests} tokens={item.total_tokens:,} "
             f"coverage={item.pricing_coverage_requests_percent:.1f}%"
         )
         if item.estimated_cost_usd is not None:
@@ -122,8 +128,9 @@ def pricing_audit_text(report: AnalysisReport) -> str:
         if item.unresolved_requests:
             reasons = ", ".join(item.unresolved_reasons) or "no-exact-model-mode-price"
             overrides = ", ".join(item.suggested_override_keys) or item.canonical_model_key
+            unit = "metric buckets" if item.analysis_unit == "metric_buckets" else "requests"
             lines.append(
-                f"  unresolved: {item.unresolved_requests:,} requests / {item.unresolved_tokens:,} tokens "
+                f"  unresolved: {item.unresolved_requests:,} {unit} / {item.unresolved_tokens:,} tokens "
                 f"· reason={reasons}"
             )
             lines.append(f"  suggested-override-key: {overrides}")

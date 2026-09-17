@@ -82,27 +82,41 @@ def test_html_report_embeds_logo():
     header = rendered.split("<header>", 1)[1].split("</header>", 1)[0]
     assert "<h1>" not in header
     assert "Token efficiency assessment" not in header
-    # Internal rule confidence and evaluation jargon must stay out of the
-    # executive views. The PTU Advisor tab has its own documented evidence
-    # confidence score, so it is scoped out of this assertion.
+    # The header states how much was read, never where it was read from.
+    assert "sample.jsonl" not in header
+    assert "local telemetry file" in header
+    # Internal rule confidence jargon stays out of the executive views. The PTU
+    # Advisor tab has its own documented evidence confidence score, so it is
+    # scoped out of this assertion.
     executive_views = rendered.split("<body>", 1)[1].split('<section class="tab-panel ptu"', 1)[0]
     assert "confidence" not in executive_views.lower()
-    assert "Data quality" not in executive_views
     assert "tokenlens-for-azure · created by Tzahi Ariel" in rendered
 
 
 def test_combined_report_keeps_brand_tabs_and_usage_charts():
-    records = [next(iter_records(__import__("io").StringIO(json.dumps(record()) + "\n")))]
+    records = [
+        next(iter_records(__import__("io").StringIO(json.dumps(record()) + "\n"))),
+        next(
+            iter_records(
+                __import__("io").StringIO(
+                    json.dumps(record(model="gpt-4o-mini", deployment_name="second-route", model_name="gpt-4o-mini")) + "\n"
+                )
+            )
+        ),
+    ]
     report = analyze(records, "sample.jsonl")
     from tokenlens.economics import TaskEconomicsReport
 
     rendered = report_html(report.model_copy(update={"task_economics": TaskEconomicsReport()}))
     assert 'alt="TokenLens for Azure logo"' in rendered
     assert rendered.count('<button class="tab"') == 4
-    assert "Overview</button>" in rendered
-    assert "Cost analysis</button>" in rendered
-    assert "Usage &amp; diagnostics</button>" in rendered
-    assert "PTU advisor</button>" in rendered
+    # Full labels stay in the accessibility tree; short labels are shown on
+    # narrow viewports so a tab never wraps onto two lines.
+    assert "<span class=\"tab-full\">Overview</span>" in rendered
+    assert "<span class=\"tab-full\">Cost analysis</span>" in rendered
+    assert "<span class=\"tab-full\">Usage &amp; diagnostics</span>" in rendered
+    assert "<span class=\"tab-full\">PTU advisor</span>" in rendered
+    assert "<span class=\"tab-short\" aria-hidden=\"true\">Cost</span>" in rendered
     assert "Token share by model" in rendered
     assert "Token usage by deployment" in rendered
     assert 'class="donut' in rendered
@@ -110,4 +124,11 @@ def test_combined_report_keeps_brand_tabs_and_usage_charts():
     assert "Task economics</button>" not in rendered
     assert 'style="fill:none;stroke:#73c7ff;stroke-width:28"' in rendered
     assert "Model summary" in rendered
-    assert rendered.index("Model summary") < rendered.index("All findings")
+    assert rendered.index("Model summary") < rendered.index("Evaluated findings")
+
+
+def test_single_model_replaces_the_donut_with_composition():
+    records = [next(iter_records(__import__("io").StringIO(json.dumps(record()) + "\n")))]
+    rendered = report_html(analyze(records, "sample.jsonl"))
+    assert "Token composition" in rendered
+    assert 'class="donut' not in rendered

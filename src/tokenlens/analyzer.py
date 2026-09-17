@@ -4,21 +4,26 @@ from datetime import UTC, datetime
 from statistics import mean
 
 from . import __version__
+from .aggregate import MixedTelemetryError, aggregate_summary, field_coverage, source_kinds, telemetry_kind
 from .economics import TaskEconomicsReport, build_savings_scenarios, calculate_task_economics
 from .events import TaskEvent
 from .models import (
+    AggregateAnalysisSummary,
     AnalysisReport,
     AnalysisSummary,
+    DataQualityIssue,
     DeploymentAnalysis,
     DeploymentSummary,
+    DiagnosticCoverage,
     Finding,
+    RuleEvaluation,
     TraceRecord,
 )
 from .pricing import PricingCatalog, PricingResolution, canonical_model_name, resolve_trace_cost
 from .ptu import analyze_ptu
 from .reference import load_bundled_reference_catalog
 from .tasks import reconstruct_tasks
-from .rules import RULES, run_rules
+from .rules import RULES, evaluate_rules
 
 
 DEFAULT_REPORT_CONFIG = {
@@ -189,7 +194,11 @@ def _summary(
     customer_catalog: PricingCatalog | None,
     reference_catalog: PricingCatalog | None,
     pricing_currency: str,
+    evaluations: list[RuleEvaluation] | None = None,
 ) -> AnalysisSummary | DeploymentSummary:
+    aggregate_source = bool(records) and all(telemetry_kind(record) == "aggregate" for record in records)
+    aggregate: AggregateAnalysisSummary | None = aggregate_summary(records) if aggregate_source else None
+    coverage = field_coverage(aggregate) if aggregate else {}
     input_tokens = sum(record.usage.input_tokens for record in records)
     output_tokens = sum(record.usage.output_tokens for record in records)
     cached_tokens = sum(record.usage.cached_tokens for record in records)
@@ -199,24 +208,64 @@ def _summary(
     medium = sum(finding.severity == "medium" for finding in findings)
     low = sum(finding.severity == "low" for finding in findings)
     info = sum(finding.severity == "info" for finding in findings)
+    statuses = evaluations or []
+
+    if aggregate is not None:
+        requests_observed = aggregate.requests_observed
+        requests_available = requests_observed is not None
+        analysis_unit = "metric_buckets"
+        # Request counts come from the request metric. A bucket is an interval,
+        # not a request, so it is never used as a denominator.
+        requests_analyzed = requests_observed or 0
+        retries_available = coverage.get("retries", False)
+        cached_available = coverage.get("cached_tokens", False)
+        input_available = coverage.get("input_tokens", False)
+        output_available = coverage.get("output_tokens", False)
+        cached_tokens = aggregate.cached_tokens or 0
+        average_tokens = (
+            round((input_tokens + output_tokens) / requests_observed, 2)
+            if requests_observed
+            else None
+        )
+    else:
+        requests_observed = len(records)
+        requests_available = True
+        analysis_unit = "requests"
+        requests_analyzed = len(records)
+        retries_available = True
+        cached_available = True
+        input_available = True
+        output_available = True
+        average_tokens = round((input_tokens + output_tokens) / max(1, len(records)), 1) if records else 0.0
+
     common = {
-        "requests_analyzed": len(records),
+        "analysis_unit": analysis_unit,
+        "requests_analyzed": requests_analyzed,
+        "requests_observed": requests_observed,
+        "requests_available": requests_available,
+        "retries_available": retries_available,
+        "cached_tokens_available": cached_available,
+        "input_tokens_available": input_available,
+        "output_tokens_available": output_available,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cached_tokens": cached_tokens,
         "total_tokens": input_tokens + output_tokens,
-        "retries": sum(bool(record.retry_of) for record in records),
+        "retries": sum(bool(record.retry_of) for record in records) if retries_available else 0,
         "findings": len(findings),
         "high_findings": high,
         "medium_findings": medium,
         "low_findings": low,
         "info_findings": info,
+        "evaluated_rules": sum(item.status in {"finding", "no_issue"} for item in statuses),
+        "not_evaluated_rules": sum(item.status == "not_evaluated" for item in statuses),
         "addressable_min_tokens": minimum,
         "addressable_max_tokens": maximum,
         "addressable_min_percent": round(minimum / denominator * 100, 1),
         "addressable_max_percent": round(maximum / denominator * 100, 1),
         "addressable_aggregation": "largest_individual_opportunity",
-        "average_tokens_per_request": round((input_tokens + output_tokens) / max(1, len(records)), 1),
+        "average_tokens_per_request": average_tokens,
+        "aggregate": aggregate,
         "average_latency_ms": (
             round(mean([record.latency_ms for record in records if record.latency_ms is not None]), 1)
             if any(record.latency_ms is not None for record in records)
@@ -242,6 +291,7 @@ def _summary(
                 "pricing_coverage_tokens_percent",
                 "pricing_complete",
                 "pricing_currency",
+                "pricing_catalog_name",
                 "pricing_source",
                 "pricing_billing_basis",
                 "pricing_publisher",
@@ -252,6 +302,13 @@ def _summary(
                 "suggested_override_keys",
             )
         }
+    )
+    common["pricing_coverage_basis"] = "metric_buckets" if aggregate is not None else "requests"
+    common["pricing_status"] = _pricing_status(
+        records,
+        estimated_cost=pricing["estimated_cost_usd"],
+        unresolved_reasons=list(pricing["unresolved_reasons"]),
+        coverage_tokens_percent=float(pricing["pricing_coverage_tokens_percent"]),
     )
     service_tiers = {record.service_tier for record in records}
     common["service_tier"] = service_tiers.pop() if len(service_tiers) == 1 else "mixed"
@@ -264,19 +321,56 @@ def _summary(
         **common,
         deployment_name=deployment_name,
         model_name=model_name or "unknown",
+        model_version=next(
+            (
+                str(version)
+                for record in records
+                if (version := (record.metadata or {}).get("model_version"))
+            ),
+            None,
+        ),
         canonical_model_key=canonical_model_key,
         provider=provider,
         deployment_mode=records[0].deployment_mode if records else "unknown",
         resource_name=resource_name,
         project_name=project_name,
-        request_share_percent=round(len(records) / max(1, request_total) * 100, 1),
+        request_share_percent=round((requests_observed or 0) / max(1, request_total) * 100, 1),
         token_share_percent=round((input_tokens + output_tokens) / max(1, token_total) * 100, 1),
-        pricing_catalog_name=pricing["pricing_catalog_name"],
         pricing_effective_from=pricing["pricing_effective_from"],
         input_price_per_million=pricing["input_price_per_million"],
         cached_input_price_per_million=pricing["cached_input_price_per_million"],
         output_price_per_million=pricing["output_price_per_million"],
     )
+
+
+def _model_identity_resolved(records: list[TraceRecord]) -> bool:
+    return bool(records) and any(
+        (record.model_name or "").strip().casefold() not in {"", "unknown", "none"} for record in records
+    )
+
+
+def _pricing_status(
+    records: list[TraceRecord],
+    *,
+    estimated_cost: float | None,
+    unresolved_reasons: list[str],
+    coverage_tokens_percent: float,
+) -> str:
+    """Separate identity failure from catalog coverage.
+
+    "0% priced" is a symptom. The report must say whether the model was never
+    identified, whether the catalog has no exact entry, or whether a currency
+    policy blocked the match.
+    """
+    if not _model_identity_resolved(records):
+        return "identity_unresolved"
+    if "currency-conversion-required" in unresolved_reasons:
+        return "currency_mismatch"
+    if estimated_cost is None:
+        return "catalog_missing"
+    if coverage_tokens_percent < 100:
+        return "partial"
+    return "priced"
 
 
 def _sorted_findings(findings: list[Finding]) -> list[Finding]:
@@ -298,9 +392,28 @@ def analyze(
     customer_catalog: PricingCatalog | None = None,
     reference_catalog: PricingCatalog | None = None,
     use_bundled_reference: bool = True,
+    mixed_source_policy: str = "reject",
+    data_classification: str = "unknown",
+    source_files: int | None = None,
 ) -> AnalysisReport:
-    """Analyze all records once and expose the same rule engine per deployment."""
-    overall_findings = _with_impact(run_rules(records), sum(r.usage.input_tokens for r in records), len(records))
+    """Analyze all records once and expose the same rule engine per deployment.
+
+    ``mixed_source_policy`` defaults to ``reject``: request telemetry and Azure
+    Monitor buckets usually describe the same traffic, so analyzing them together
+    double counts tokens, requests, and cost. ``allow`` is an explicit merge
+    policy for callers that have proven the two sources do not overlap.
+    """
+    kinds = source_kinds(records)
+    if len(kinds) > 1 and mixed_source_policy != "allow":
+        raise MixedTelemetryError(
+            "This input mixes request-level telemetry with aggregate Azure Monitor buckets. "
+            "The same traffic would be counted twice, so analysis stopped. Analyze each source "
+            "separately, or pass an explicit merge policy once you have proven they do not overlap."
+        )
+    rule_run = evaluate_rules(records)
+    overall_findings = _with_impact(
+        rule_run.findings, sum(r.usage.input_tokens for r in records), len(records)
+    )
     applied_report_config = DEFAULT_REPORT_CONFIG | {
         key: value for key, value in (report_config or {}).items() if key in DEFAULT_REPORT_CONFIG
     }
@@ -324,8 +437,9 @@ def analyze(
         customer_catalog=customer_catalog,
         reference_catalog=reference_catalog,
         pricing_currency=pricing_currency,
+        evaluations=rule_run.evaluations,
     )
-    total_requests = len(records)
+    total_requests = summary.requests_observed or 0
     total_tokens = summary.total_tokens
     grouped: dict[tuple[str, str, str, str, str], list[TraceRecord]] = {}
     for record in records:
@@ -346,8 +460,9 @@ def analyze(
         reverse=True,
     ):
         first = deployment_records[0]
+        deployment_run = evaluate_rules(deployment_records)
         findings = _with_impact(
-            run_rules(deployment_records),
+            deployment_run.findings,
             sum(r.usage.input_tokens for r in deployment_records),
             len(deployment_records),
         )
@@ -368,38 +483,40 @@ def analyze(
                     customer_catalog=customer_catalog,
                     reference_catalog=reference_catalog,
                     pricing_currency=pricing_currency,
+                    evaluations=deployment_run.evaluations,
                 ),
                 findings=_sorted_findings(findings),
+                diagnostics=DiagnosticCoverage(
+                    source=deployment_run.source,  # type: ignore[arg-type]
+                    evaluations=deployment_run.evaluations,
+                ),
             )
         )
     report = AnalysisReport(
         version=__version__,
         generated_at=generated,
         source=source,
+        data_classification=data_classification,  # type: ignore[arg-type]
         summary=summary,
         findings=_sorted_findings(overall_findings),
         deployments=deployments,
+        diagnostics=DiagnosticCoverage(
+            source=rule_run.source,  # type: ignore[arg-type]
+            evaluations=rule_run.evaluations,
+        ),
+        data_quality=_data_quality(summary, deployments),
         rules=RULES,
         report_metadata={
             "materiality": applied_report_config,
             "scenario_aggregation": "not_combined_due_to_overlap",
             "scenarios": [scenario.model_dump(mode="json") for scenario in build_savings_scenarios(findings=overall_findings)],
-            "pricing": {
-                "currency": summary.pricing_currency,
-                "catalog_name": reference_catalog.catalog_name if reference_catalog else None,
-                "customer_catalog_name": customer_catalog.catalog_name if customer_catalog else None,
-                "source_url": reference_catalog.source_url if reference_catalog else None,
-                "retrieved_at": (
-                    reference_catalog.retrieved_at.isoformat()
-                    if reference_catalog and reference_catalog.retrieved_at
-                    else None
-                ),
-                "coverage_requests_percent": summary.pricing_coverage_requests_percent,
-                "coverage_tokens_percent": summary.pricing_coverage_tokens_percent,
-                "estimate_only": True,
-                "pricing_basis": reference_catalog.pricing_basis if reference_catalog else None,
-                "currency_policy": "single_currency_no_conversion",
-            },
+            "telemetry_source": rule_run.source,
+            "source_files": source_files,
+            "pricing": _pricing_metadata(
+                summary,
+                customer_catalog=customer_catalog,
+                reference_catalog=reference_catalog,
+            ),
         },
     )
     # The PTU dashboard's daily cost must agree with Cost analysis exactly, so
@@ -415,6 +532,152 @@ def analyze(
 
     report.ptu_analysis = analyze_ptu(records, deployments, cost_resolver=_ptu_cost_resolver)
     return report
+
+
+def _pricing_metadata(
+    summary: AnalysisSummary,
+    *,
+    customer_catalog: PricingCatalog | None,
+    reference_catalog: PricingCatalog | None,
+) -> dict[str, object]:
+    """Separate catalogs *consulted* from the catalog entry actually selected."""
+    consulted = [
+        catalog.catalog_name
+        for catalog in (customer_catalog, reference_catalog)
+        if catalog is not None
+    ]
+    selected = summary.pricing_catalog_name
+    selected_catalog = next(
+        (
+            catalog
+            for catalog in (customer_catalog, reference_catalog)
+            if catalog is not None and catalog.catalog_name == selected
+        ),
+        None,
+    )
+    matched = summary.estimated_cost_usd is not None
+    return {
+        "currency": summary.pricing_currency,
+        "catalogs_consulted": consulted,
+        "catalog_selected": selected if matched else None,
+        "catalog_name": selected,
+        "customer_catalog_name": customer_catalog.catalog_name if customer_catalog else None,
+        "source_url": selected_catalog.source_url if selected_catalog and matched else None,
+        # A retrieval date is only meaningful for an entry that actually matched.
+        "retrieved_at": (
+            selected_catalog.retrieved_at.isoformat()
+            if matched and selected_catalog and selected_catalog.retrieved_at
+            else None
+        ),
+        "coverage_requests_percent": summary.pricing_coverage_requests_percent,
+        "coverage_tokens_percent": summary.pricing_coverage_tokens_percent,
+        "coverage_basis": summary.pricing_coverage_basis,
+        "pricing_status": summary.pricing_status,
+        "estimate_only": True,
+        "pricing_basis": selected_catalog.pricing_basis if selected_catalog else None,
+        "currency_policy": "single_currency_no_conversion",
+    }
+
+
+_PRICING_STATUS_TITLES = {
+    "identity_unresolved": "Pricing not attempted — model identity unresolved",
+    "catalog_missing": "Model identified, exact rate missing",
+    "currency_mismatch": "Pricing requires currency conversion",
+    "partial": "Partial pricing coverage",
+}
+
+
+def _data_quality(summary: AnalysisSummary, deployments: list[DeploymentAnalysis]) -> list[DataQualityIssue]:
+    """State plainly what in this report is trustworthy and what is not."""
+    issues: list[DataQualityIssue] = []
+    unresolved = [
+        item.summary.deployment_name
+        for item in deployments
+        if item.summary.model_name.strip().casefold() in {"", "unknown", "none"}
+    ]
+    if unresolved:
+        issues.append(
+            DataQualityIssue(
+                code="identity_unresolved",
+                severity="blocker",
+                title="Model identity unresolved",
+                detail=(
+                    f"{len(unresolved)} deployment(s) have no resolved model. Pricing, PTU capacity, and model "
+                    "comparisons are withheld until collection resolves the exact model and version."
+                ),
+            )
+        )
+    if not summary.requests_available:
+        issues.append(
+            DataQualityIssue(
+                code="requests_unavailable",
+                severity="blocker",
+                title="Request totals unavailable",
+                detail=(
+                    "The telemetry source reported no request metric, so request counts, averages per request, "
+                    "and outcome rates are unavailable rather than zero."
+                ),
+            )
+        )
+    aggregate = summary.aggregate
+    if aggregate is not None:
+        if aggregate.outcome_coverage != "complete":
+            issues.append(
+                DataQualityIssue(
+                    code="outcomes_incomplete",
+                    severity="warning",
+                    title="Request outcomes incomplete",
+                    detail=(
+                        "Status-code coverage is "
+                        f"{aggregate.outcome_coverage}, so success, HTTP 429, and other-failure counts are not "
+                        "derived. A zero rate-limit count is only reported with complete coverage."
+                    ),
+                )
+            )
+        for field_name, label in (("input_tokens", "Input-token"), ("output_tokens", "Output-token")):
+            if getattr(aggregate, field_name) is None:
+                issues.append(
+                    DataQualityIssue(
+                        code=f"{field_name}_unavailable",
+                        severity="blocker",
+                        title=f"{label} metric unavailable",
+                        detail=(
+                            f"The source reported no {label.lower()} series, so token totals, averages, and cost "
+                            "for this field are unavailable rather than zero."
+                        ),
+                    )
+                )
+        if aggregate.cached_tokens is None:
+            issues.append(
+                DataQualityIssue(
+                    code="cached_tokens_unavailable",
+                    severity="warning",
+                    title="Cached-token metric unavailable",
+                    detail="Cached input is shown as unavailable, never as zero.",
+                )
+            )
+        if aggregate.latency_coverage_percent == 0:
+            issues.append(
+                DataQualityIssue(
+                    code="latency_unavailable",
+                    severity="warning",
+                    title="Latency metric unavailable",
+                    detail="No latency series was returned for the selected window.",
+                )
+            )
+    if summary.pricing_status != "priced":
+        issues.append(
+            DataQualityIssue(
+                code=f"pricing_{summary.pricing_status}",
+                severity="warning",
+                title=_PRICING_STATUS_TITLES.get(summary.pricing_status, "Pricing unresolved"),
+                detail=(
+                    f"{summary.pricing_coverage_tokens_percent:.1f}% of observed tokens are priced. "
+                    "Unpriced volume stays visible and is never folded into the cost total."
+                ),
+            )
+        )
+    return issues
 
 
 def analyze_task_events(

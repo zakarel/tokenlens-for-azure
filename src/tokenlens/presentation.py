@@ -20,7 +20,13 @@ class MaterialityConfig:
 class ModelRollup:
     canonical_model_key: str
     model_name: str
-    requests: int
+    model_version: str | None
+    requests: int | None
+    analysis_unit: str
+    active_buckets: int
+    elapsed_buckets: int
+    cached_tokens_available: bool
+    pricing_status: str
     input_tokens: int
     output_tokens: int
     cached_tokens: int
@@ -51,10 +57,24 @@ class ModelRollup:
 class DeploymentRollup:
     deployment_name: str
     model_name: str
+    model_version: str | None
     canonical_model_key: str
     resource_name: str | None
     project_name: str | None
-    requests: int
+    #: Actual requests. ``None`` when the source reports no request metric — a
+    #: bucket count is never substituted.
+    requests: int | None
+    analysis_unit: str
+    metric_buckets: int
+    active_buckets: int
+    observed_buckets: int
+    elapsed_buckets: int
+    cached_tokens_available: bool
+    retries_available: bool
+    pricing_status: str
+    window_start: str | None
+    window_end: str | None
+    active_days: int
     input_tokens: int
     output_tokens: int
     cached_tokens: int
@@ -63,7 +83,7 @@ class DeploymentRollup:
     addressable_min_tokens: int
     addressable_max_tokens: int
     token_share_percent: float
-    average_tokens_per_request: float
+    average_tokens_per_request: float | None
     deployment_mode: str
     service_tier: str
     estimated_cost_usd: float | None
@@ -91,10 +111,18 @@ def materiality_config(report: AnalysisReport) -> MaterialityConfig:
     )
 
 
+#: A percentage of a very small workload is still a very small opportunity. A
+#: finding must clear an absolute floor before it can be called Major or High.
+MATERIAL_ABSOLUTE_TOKENS = 1000
+
+
 def impact_category(finding: Finding) -> str:
     maximum = finding.impact_max_percent
     if maximum is None:
         return "Evaluation opportunity"
+    absolute = _absolute_impact(finding)
+    if finding.estimated_savings.unit == "tokens" and absolute < MATERIAL_ABSOLUTE_TOKENS:
+        return "Low absolute volume"
     if maximum >= 10:
         return "Major"
     if maximum >= 5:
@@ -163,13 +191,26 @@ def top_recommendations(findings: Iterable[Finding], limit: int = 3) -> list[Fin
 
 def _deployment_rollup(deployment: DeploymentAnalysis, portfolio_total: int) -> DeploymentRollup:
     summary = deployment.summary
+    aggregate = summary.aggregate
     return DeploymentRollup(
         deployment_name=summary.deployment_name,
         model_name=summary.model_name,
+        model_version=summary.model_version,
         canonical_model_key=summary.canonical_model_key,
         resource_name=summary.resource_name,
         project_name=summary.project_name,
-        requests=summary.requests_analyzed,
+        requests=summary.requests_observed if summary.requests_available else None,
+        analysis_unit=summary.analysis_unit,
+        metric_buckets=aggregate.metric_buckets_read if aggregate else 0,
+        active_buckets=aggregate.active_buckets if aggregate else summary.requests_analyzed,
+        observed_buckets=aggregate.observed_buckets if aggregate else summary.requests_analyzed,
+        elapsed_buckets=aggregate.elapsed_buckets if aggregate else summary.requests_analyzed,
+        cached_tokens_available=summary.cached_tokens_available,
+        retries_available=summary.retries_available,
+        pricing_status=summary.pricing_status,
+        window_start=aggregate.window_start.isoformat() if aggregate and aggregate.window_start else None,
+        window_end=aggregate.window_end.isoformat() if aggregate and aggregate.window_end else None,
+        active_days=aggregate.active_days if aggregate else 0,
         input_tokens=summary.input_tokens,
         output_tokens=summary.output_tokens,
         cached_tokens=summary.cached_tokens,
@@ -215,9 +256,16 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
             (item.canonical_model_key, item.deployment_mode.casefold(), item.pricing_currency.casefold()),
             {
                 "model_name": item.model_name,
+                "model_version": item.model_version,
+                "analysis_unit": item.analysis_unit,
                 "deployment_mode": item.deployment_mode,
                 "service_tier": item.service_tier,
                 "requests": 0,
+                "requests_available": False,
+                "active_buckets": 0,
+                "elapsed_buckets": 0,
+                "cached_tokens_available": item.cached_tokens_available,
+                "pricing_status": item.pricing_status,
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "cached_tokens": 0,
@@ -242,7 +290,6 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
             },
         )
         for key in (
-            "requests",
             "input_tokens",
             "output_tokens",
             "cached_tokens",
@@ -254,6 +301,14 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
             "unresolved_tokens",
         ):
             current[key] = int(current[key]) + int(getattr(item, key))
+        # An unavailable request metric stays unavailable for the whole model
+        # rollup rather than being summed as if it were zero.
+        if item.requests is not None:
+            current["requests"] = int(current["requests"]) + item.requests
+            current["requests_available"] = True
+        current["active_buckets"] = int(current["active_buckets"]) + item.active_buckets
+        current["elapsed_buckets"] = max(int(current["elapsed_buckets"]), item.elapsed_buckets)
+        current["cached_tokens_available"] = bool(current["cached_tokens_available"]) and item.cached_tokens_available
         current["unresolved_reasons"] = set(current["unresolved_reasons"]) | set(item.unresolved_reasons)
         current["suggested_override_keys"] = set(current["suggested_override_keys"]) | set(item.suggested_override_keys)
         for field in ("service_tier", "pricing_billing_basis", "pricing_publisher", "pricing_confidence"):
@@ -265,14 +320,24 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
                 current[field] = "mixed"
         if item.estimated_cost_usd is not None:
             current["estimated_cost_usd"] = float(current["estimated_cost_usd"]) + item.estimated_cost_usd
+            # Numerator and denominator must describe the same population:
+            # requests when the request metric exists, active buckets otherwise.
+            basis = item.requests if item.requests is not None else item.active_buckets
             current["priced_requests"] = int(current["priced_requests"]) + round(
-                item.requests * item.pricing_coverage_requests_percent / 100
+                max(1, basis) * item.pricing_coverage_requests_percent / 100
             )
     return sorted(
         [
             ModelRollup(
                 canonical_model_key=key[0],
                 model_name=str(values["model_name"]),
+                model_version=values["model_version"],  # type: ignore[arg-type]
+                analysis_unit=str(values["analysis_unit"]),
+                requests=int(values["requests"]) if values["requests_available"] else None,
+                active_buckets=int(values["active_buckets"]),
+                elapsed_buckets=int(values["elapsed_buckets"]),
+                cached_tokens_available=bool(values["cached_tokens_available"]),
+                pricing_status=str(values["pricing_status"]),
                 deployment_mode=str(values["deployment_mode"]),
                 service_tier=str(values["service_tier"]),
                 token_share_percent=round(int(values["total_tokens"]) / max(1, total) * 100, 1),
@@ -280,8 +345,14 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
                     float(values["estimated_cost_usd"]) if int(values["priced_requests"]) else None
                 ),
                 pricing_currency=str(values["pricing_currency"]),
-                pricing_coverage_requests_percent=round(
-                    int(values["priced_requests"]) / max(1, int(values["requests"])) * 100, 1
+                pricing_coverage_requests_percent=min(
+                    100.0,
+                    round(
+                        int(values["priced_requests"])
+                        / max(1, int(values["requests"]) if values["requests_available"] else int(values["active_buckets"]))
+                        * 100,
+                        1,
+                    ),
                 ),
                 input_price_per_million=values["input_price_per_million"],
                 cached_input_price_per_million=values["cached_input_price_per_million"],
@@ -293,7 +364,6 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
                 unresolved_reasons=sorted(values["unresolved_reasons"]),  # type: ignore[arg-type]
                 suggested_override_keys=sorted(values["suggested_override_keys"]),  # type: ignore[arg-type]
                 **{name: int(values[name]) for name in (
-                    "requests",
                     "input_tokens",
                     "output_tokens",
                     "cached_tokens",

@@ -152,9 +152,10 @@ def _canonical_bucket(record: MetricBucketRecord) -> TraceRecord:
     """Map a schema-v3 aggregate bucket onto the shared analysis event.
 
     One bucket becomes one analysis event carrying the bucket's aggregate token
-    counts. Request outcomes, latency percentiles, and the explicit list of
-    metrics the source could not provide stay in ``metadata`` so PTU analysis can
-    distinguish "zero" from "unavailable" instead of inventing per-request rows.
+    counts. Request outcomes, latency percentiles, per-field provenance, the
+    collection window, and the explicit list of metrics the source could not
+    provide stay in ``metadata`` so aggregate analysis can distinguish "zero"
+    from "unavailable" instead of inventing per-request rows.
     """
     metrics = record.metrics
     return TraceRecord(
@@ -182,6 +183,12 @@ def _canonical_bucket(record: MetricBucketRecord) -> TraceRecord:
             "model_version": record.model_version,
             "metrics": metrics.model_dump(),
             "missing_metrics": list(record.missing_metrics),
+            "metric_provenance": dict(record.metric_provenance),
+            "status_codes": dict(record.status_codes) if record.status_codes else None,
+            "outcome_coverage": record.outcome_coverage,
+            "window_start": record.window_start.isoformat().replace("+00:00", "Z") if record.window_start else None,
+            "window_end": record.window_end.isoformat().replace("+00:00", "Z") if record.window_end else None,
+            "expected_buckets": record.expected_buckets,
         },
     )
 
