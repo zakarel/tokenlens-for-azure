@@ -265,48 +265,176 @@ az login
 .venv/bin/tokenlens-azure foundry
 ```
 
-The normal path asks four questions:
+The normal path has four steps and asks at most three questions:
 
-1. Azure subscription
-2. Foundry account
-3. Deployments (multi-select)
-4. Analysis window
+1. **Azure subscription scope** — all accessible subscriptions, or one specific
+   subscription
+2. **Foundry accounts** — every account in scope, or one account
+3. **Deployments** — every deployment discovered in scope is shown and
+   collected; there is nothing to select
+4. **Analysis window**
+
+TokenLens always runs the **full assessment** — cost, PTU suitability, and token
+efficiency come from the same collected window — so there is no analysis-goal
+question, and no answer can quietly remove evidence from the report.
+
+Below is an exact transcript of one interactive run (`NO_COLOR=1`, so the linear
+screen-reader layout is shown; a colour terminal renders the same content as
+Rich panels, tables, and a live progress bar). Typed answers are shown after
+each prompt:
 
 ```text
 TokenLens Foundry setup
+python=3.14.5 (supported)
+cwd-writable=yes
+collector-extras=ready
 
-Step 1/4 · Azure subscription
-  1. Production Subscription · 1234abcd…9012 (Azure CLI active)
-  2. Sandbox Subscription · 5678efgh…3456
+Step 1/4 · Azure subscription scope
+Which subscriptions should TokenLens read?
+  1. All accessible subscriptions   Every Foundry/Azure OpenAI account the signed-in principal can read · 2 accessible
+  2. Specific subscription   One subscription you choose from the Azure CLI account list
+Select a number [2]: 2
+Azure subscription
+  1. Production Subscription · 8f2a1c04…9012 (Azure CLI active)
+  2. Sandbox Subscription · 1b9d3e57…5566
+Select a number [1]: 1
+
+Step 2/4 · Foundry accounts
+Foundry account
+  1. All Foundry accounts in this subscription (1)   Every account and every deployment in it
+  2. contoso-foundry — East US 2 · rg-ai-prod · AIServices · Production Subscription
+Select a number [1]: 1
 
 Step 3/4 · Deployments
-  1. ◉ reasoning-prod   gpt-4.1 v2026-04-14   Global Standard   ✓ Exact public rate
-  2. ◉ coding-prod      claude-opus-5 v2      Global Standard   ⚠ Model identified, rate unavailable
-  3. ○ compact-prod     ministral-3b v1       Regional Standard ⚠ Model identified, rate unavailable
 
+Deployments discovered in scope
+  Deployment · Model · Mode · Pricing
+  chat-prod · phi-4 v2026-04-14 · Global Standard · ✓ Exact public rate
+  claude-opus-5 · claude-opus-5 v2 · Global Standard · ⚠ Model identified, rate unavailable
+  ministral-3b · Ministral-3B v1 · Global Standard · ⚠ Model identified, rate unavailable
+  All 3 deployment(s) are collected. Use `tokenlens-azure foundry collect --deployment NAME` for a narrower automated run.
+
+Step 4/4 · Analysis window
+Analysis window
+  1. 1 day   Connectivity and metric-shape check · 288 five-minute buckets
+  2. 7 days   Preliminary operational view · 2,016 five-minute buckets
+  3. 14 days   Recommended default · 4,032 five-minute buckets
+  4. 30 days   Stronger workload evidence · 8,640 five-minute buckets
+  5. 90 days   Long-term seasonality, bounded by service limits · 25,920 five-minute buckets
+Select a number [3]: 3
+
+How the window is used
+PTU evidence needs active buckets, not elapsed time. A long window with little
+traffic still provides insufficient evidence, and a recently created deployment
+may have less history than the window requests.
+
+Workloads
 Technical workloads created automatically
-✓ reasoning-prod — deployment-backed workload · Needs configuration
-✓ coding-prod — deployment-backed workload · Needs configuration
+✓ chat-prod — deployment-backed workload · Needs configuration
+✓ claude-opus-5 — deployment-backed workload · Needs configuration
+✓ ministral-3b — deployment-backed workload · Needs configuration
+Configure business workload names and ownership now?
+  1. Later
+  2. Yes
+Select a number [1]: 1
+
+Pricing readiness
+  Deployment · Model · State
+  chat-prod · phi-4 v2026-04-14 · ✓ Exact public rate
+  claude-opus-5 · claude-opus-5 v2 · ⚠ Model identified, rate unavailable
+  ministral-3b · Ministral-3B v1 · ⚠ Model identified, rate unavailable
+  1/3 priced exactly.
+
+Why cost is withheld
+2 deployment(s) have no exact rate in the packaged verified catalog or your customer catalog for that exact model, version, and deployment mode.
+The full assessment continues: usage, throughput, and PTU evidence are collected, and cost is withheld for those deployments only. A rate is never guessed from a related model or family.
+To add a contracted rate: tokenlens-azure pricing set-rate --model claude-opus-5 --input-per-million X --output-per-million Y --effective-from YYYY-MM-DD
+Rates are stored locally in ~/Library/Application Support/tokenlens/pricing/customer.yml.
+Public pricing synchronization is deferred. TokenLens will only publish a rate it can attribute to a documented, machine-readable source with a deterministic parser, an effective date, a retrieval timestamp, and a content hash. Until that source is wired in, synchronizing would be indistinguishable from guessing a rate.
+phase=1/4 Discovering Azure resources · 1 account(s)
+phase=2/4 Collecting Azure Monitor metrics · 3 deployment(s)
+✓ chat-prod · collected
+✓ claude-opus-5 · collected
+✓ ministral-3b · collected
+phase=3/4 Analyzing collected telemetry · 6,912 record(s)
+phase=4/4 Writing the report · reports/tokenlens-report-20260917-111218Z.html
 
 Collection complete
-2 / 2 deployments succeeded
+3 / 3 deployments succeeded
 14-day window
+Deployment              Identity    Metrics     Active  Requests      Tokens  Pricing                     PTU evidence
+chat-prod               exact       available    2,304   140,544 139,161,600  exact_public_rate           sufficient
+claude-opus-5           exact       available    2,304   140,544 139,161,600  rate_unavailable            sufficient
+ministral-3b            exact       available    2,304   140,544 139,161,600  rate_unavailable            sufficient
+records-written=6912 already-present=0
+run-directory=local-traces/foundry-metrics/runs/run-20260917T111218Z
+pricing-withheld=claude-opus-5, ministral-3b
+pricing-remediation=tokenlens-azure pricing set-rate --model MODEL --input-per-million X --output-per-million Y --effective-from YYYY-MM-DD
 model-identity-coverage=100%
-token-pricing-coverage=52%
-report=reports/tokenlens-report-20260915-081200Z.html
+token-pricing-coverage=33%
+business-workload-identity-coverage=0%
+technical-workloads=3
+report=reports/tokenlens-report-20260917-111218Z.html
+browser-open=not requested or unavailable
 ```
 
-Deployment mode, provider family, inference API, account endpoints, and the
-regional Azure Monitor endpoint are detected from exact Azure metadata. Nothing
-is inferred from a name, and an unknown mode stays `unknown` rather than
-defaulting to Global. The workflow never makes an inference call; smoke testing
-remains a separate, explicitly billable command.
+Only two values in that transcript are environment-specific: the report
+filename's timestamp, and the customer-catalog path (shown here for macOS;
+Linux uses `~/.config/tokenlens/...`, Windows `%APPDATA%\tokenlens\...`).
+
+In a colour-capable terminal the same run is rendered with Rich: each step is a
+panel, each choice list and inventory is a table, and collection shows a live
+progress bar for the four phases plus one bar for per-deployment collection.
+The layout degrades deterministically — `NO_COLOR`, `TOKENLENS_ASCII`,
+`TOKENLENS_PLAIN`, a non-TTY pipe, or CI all produce the linear, numbered text
+above, with ASCII markers (`OK`, `!`, `x`) when Unicode cannot be encoded. No
+state is ever signalled by colour alone, and nothing requires a mouse.
+
+#### Scope: all subscriptions or one
+
+Choosing **All accessible subscriptions** enumerates every subscription the
+Azure CLI can list, discovers the Foundry/Azure OpenAI accounts in *each* of
+them, and collects every deployment of every one of those accounts. It never
+stops at the first subscription or account that answered. Each account keeps its
+own subscription, region, and Azure Monitor regional endpoint, and one account
+that the signed-in principal cannot read is reported as a failed deployment
+outcome rather than silently dropping the rest of the run.
+
+#### Every deployment in scope is collected
+
+There is no per-deployment selection question. Partial selection silently
+removes evidence: a deployment left out of the window is missing from cost
+totals, from workload coverage, and from PTU sizing, while the report still
+looks complete. Automation can still narrow a run explicitly with
+`foundry collect --deployment NAME` (repeatable).
+
+#### One run, one telemetry directory
+
+Every guided run writes into its own directory:
+
+```text
+local-traces/foundry-metrics/
+└── runs/
+    ├── run-20260917T104501Z/tokenlens-2026-09-17.jsonl
+    └── run-20260917T111218Z/tokenlens-2026-09-17.jsonl   ← the current run
+```
+
+The report is generated from the current run's directory only, so an older
+run — including any slice whose model identity was never resolved — can never
+re-enter a fresh report, and the "N local metric files" provenance line counts
+exactly the files that were analyzed. `foundry refresh` starts a **new** run
+rather than appending to an old one. Historical telemetry is never deleted; it
+stays on disk and can still be analyzed explicitly:
+
+```bash
+.venv/bin/tokenlens-azure analyze local-traces/foundry-metrics/runs/run-20260917T104501Z --format html --open
+```
 
 #### Repeat and change setup
 
 ```bash
-.venv/bin/tokenlens-azure foundry refresh       # same settings, idempotent re-collection
-.venv/bin/tokenlens-azure foundry configure     # change subscription/account/deployments/window
+.venv/bin/tokenlens-azure foundry refresh       # same settings, new isolated run
+.venv/bin/tokenlens-azure foundry configure     # change scope/accounts/window
 .venv/bin/tokenlens-azure foundry status        # configuration, coverage, and last run
 .venv/bin/tokenlens-azure foundry pricing       # exact pricing state per deployment
 ```
@@ -314,6 +442,7 @@ remains a separate, explicitly billable command.
 #### Noninteractive automation
 
 ```bash
+# One account, explicit deployments
 .venv/bin/tokenlens-azure foundry collect \
   --subscription SUBSCRIPTION_ID \
   --resource-group RESOURCE_GROUP \
@@ -323,7 +452,14 @@ remains a separate, explicitly billable command.
   --days 14 \
   --format html \
   --output-dir reports
+
+# Every Foundry account in every accessible subscription
+.venv/bin/tokenlens-azure foundry collect --all-subscriptions --days 14
 ```
+
+`--deployment` remains fully supported for automation and narrows the run to
+exactly those deployments; omit it and every deployment in scope is collected.
+`--all-subscriptions` is also accepted by `foundry configure`.
 
 Noninteractive runs never prompt and never fall back to an ambiguous ambient
 Azure CLI context. Exit codes are stable:
@@ -340,28 +476,43 @@ A non-TTY environment prints help instead of waiting for an answer.
 #### What the workflow stores
 
 `.tokenlens.yml` gains a versioned, credential-free block. Existing keys are
-preserved, and a version 1 configuration migrates automatically on first write:
+preserved, and a version 1 or version 2 configuration migrates automatically on
+first write — a version 2 document's single account becomes the first entry of
+the version 3 `accounts` list, and its flat fields keep being written for older
+readers:
 
 ```yaml
-version: 2
+version: 3
 foundry:
   subscription_id_env: AZURE_SUBSCRIPTION_ID   # the ID itself is stored user-locally
-  resource_group: "..."
+  scope: all_subscriptions                     # account | subscription | all_subscriptions
+  resource_group: "..."                        # the first account, for v2 readers
   account: "..."
   region: eastus2
-  deployments:
-    - name: reasoning-prod
-      model: gpt-4.1
+  deployments:                                 # the first account's deployments
+    - name: chat-prod
+      model: phi-4
       model_version: "2026-04-14"
       sku: GlobalStandard
       deployment_mode: global
       provider_family: azure_openai
       inference_api: openai
+  accounts:                                    # every account in scope (v3)
+    - resource_group: "..."
+      account: "..."
+      region: eastus2
+      deployments: [...]
+    - resource_group: "..."
+      account: "..."
+      region: westeurope
+      deployments: [...]
 collection:
   lookback_days: 14
   granularity_minutes: 5
   output_dir: local-traces/foundry-metrics
   task_events_dir: null
+  isolate_runs: true          # each run writes to output_dir/runs/run-<UTC stamp>
+  analysis_goal: full_assessment
 report:
   format: html
   output_dir: reports
@@ -375,12 +526,14 @@ workloads:
 ```
 
 No key, token, connection string, endpoint, or subscription ID is written into
-`.tokenlens.yml`. The remembered subscription, the customer pricing catalog, and
-run state (last collection, coverage, and the relative report path) are kept
-outside the repository in the platform application-data directory — or in
-`TOKENLENS_CONFIG_DIR` when set — with user-only permissions. `.tokenlens.yml`
-still names your Azure resource group, account, and deployments, so do not stage
-it.
+`.tokenlens.yml` — including in a multi-subscription run, where each account's
+subscription is remembered user-locally in a `resource-group/account` map rather
+than in the tracked file. The remembered subscriptions, the customer pricing
+catalog, and run state (last collection, coverage, the relative run directory,
+and the relative report path) are kept outside the repository in the platform
+application-data directory — or in `TOKENLENS_CONFIG_DIR` when set — with
+user-only permissions. `.tokenlens.yml` still names your Azure resource groups,
+accounts, and deployments, so do not stage it.
 
 ### Advanced: individual collection commands
 
@@ -922,14 +1075,40 @@ range readout states when display downsampling is active.
 
 ### PTU eligibility states and cost/throughput graphs
 
-Every deployment gets one of six explicit eligibility states — eligible with
-sufficient evidence, eligible but insufficient evidence, model capacity
-unavailable, PTU not applicable, pricing unavailable, or deployment mode
-unavailable — shown as a badge on its PTU card. Partner/marketplace models
-(for example Anthropic or Mistral models served through Foundry) report
-**PTU not applicable** rather than "Model not supported": Azure PTU capacity
-purchasing is a Microsoft first-party model feature, so a partner model
-correctly never gets a numeric PTU recommendation.
+Every deployment gets one explicit eligibility state, shown as a badge on its
+PTU card. Each state names the *actual* blocker, and no state is ever phrased as
+a product verdict TokenLens is not entitled to make:
+
+| State | What it means | What would change it |
+|---|---|---|
+| Eligible and sufficient evidence | Capacity, mode, history, and pricing are all available | nothing; the recommendation and cost curve are shown |
+| Eligible but insufficient evidence | Capacity and mode are supported; fewer than 100 active five-minute buckets were observed | collect a longer, genuinely active window |
+| **Capacity data required** | The exact model **and version** is not in TokenLens's verified PTU capacity catalog | a verified capacity row for that exact model/version; a related model's capacity is never substituted |
+| **PTU not applicable** | The model is a partner/Marketplace model billed per token or in provider credit units (Anthropic CCUs) | nothing — Azure PTU capacity is a first-party purchase that cannot be bought for it |
+| Pricing unavailable | Workload fit is available; no exact USD rate matched | `pricing set-rate`, or a catalog entry for that model |
+| Deployment mode unavailable | PTU sizing requires Global or Regional | confirm the deployment mode |
+| **Collection identity error** | Collection did not resolve that deployment's exact model | re-collect that deployment explicitly |
+
+Two distinctions matter, and both were wrong in earlier releases:
+
+- **Partner and Marketplace models — Claude on Foundry, Mistral/Ministral, and
+  other non-Microsoft publishers — report "PTU not applicable", never
+  "Model not supported".** They are billed per token or in provider credit
+  units (CCUs) through Foundry's partner/Marketplace offer. Azure PTU capacity
+  is a Microsoft first-party purchase, so there is no PTU quantity, break-even,
+  or hybrid cost to calculate for them at any volume of evidence.
+- **A first-party model whose exact version is absent from the verified capacity
+  catalog reports "Capacity data required", never "Model not supported".** The
+  model may be perfectly supported by Azure; TokenLens simply has no verified
+  input/output TPM-per-PTU row for that exact model and version, and will not
+  borrow another model's numbers. Only capacity is withheld — throughput,
+  utilization, and evidence quality are still reported.
+
+An unresolved identity is never rendered as a separate `unknown` deployment
+either: it stays attached to the deployment it was collected for and is labelled
+**Collection identity error**, because a slice you cannot name is a collection
+problem, not a model problem. After a successful inventory-driven collection the
+current report therefore contains exactly one slice per collected deployment.
 
 For eligible deployments with at least 100 active five-minute buckets,
 TokenLens renders two native inline SVG graphs sourced entirely from typed
@@ -1196,6 +1375,34 @@ Identity failures are counted and remediated separately from missing rates:
 and operational analysis stay available; only the monetary comparison is
 withheld.
 
+### Why a rate is unresolved, and what the workflow does about it
+
+A deployment is unpriced when neither the packaged verified catalog nor your
+customer catalog contains an entry for that **exact model, version, and
+deployment mode**. In practice that happens for three reasons:
+
+1. the model is a partner/Marketplace model (Claude, Mistral/Ministral, and
+   other non-Microsoft publishers) whose rate is contractual or credit-unit
+   based rather than published in the packaged snapshot;
+2. the model or version is newer than the packaged catalog snapshot;
+3. the deployment's identity itself was never resolved during collection, in
+   which case pricing is not the problem to fix first.
+
+The guided workflow no longer asks what to do about this — there was only ever
+one safe answer. It states the reason, continues the **full assessment** with
+cost withheld for those deployments only, and prints one remediation command:
+
+```text
+Why cost is withheld
+2 deployment(s) have no exact rate in the packaged verified catalog or your customer catalog for that exact model, version, and deployment mode.
+The full assessment continues: usage, throughput, and PTU evidence are collected, and cost is withheld for those deployments only. A rate is never guessed from a related model or family.
+To add a contracted rate: tokenlens-azure pricing set-rate --model claude-opus-5 --input-per-million X --output-per-million Y --effective-from YYYY-MM-DD
+```
+
+A rate is never inferred from a related model, a model family, a quota, or a
+capacity figure, and public pricing synchronization stays deferred until a
+documented, machine-readable source with a deterministic parser exists.
+
 
 ## Eight diagnostics
 
@@ -1346,14 +1553,23 @@ monitor:
   granularity_minutes: 5
 ```
 
-`tokenlens-azure foundry configure` writes the version 2 workflow blocks
+`tokenlens-azure foundry configure` writes the version 3 workflow blocks
 (`foundry`, `collection`, `pricing`, `report`, `workloads`) alongside whatever
-else is already in the file. A version 1 document migrates automatically:
-`foundry.deployments` entries expand from bare names into exact
-name/model/version/SKU/mode records, and `monitor.lookback_days` moves to
-`collection.lookback_days`. Unrelated keys — including the `report` materiality
-thresholds the analyzer reads — are preserved, and every write is atomic with
-user-only permissions.
+else is already in the file. Older documents migrate automatically and
+losslessly:
+
+- **version 1 → 3**: `foundry.deployments` entries expand from bare names into
+  exact name/model/version/SKU/mode records, and `monitor.lookback_days` moves
+  to `collection.lookback_days`;
+- **version 2 → 3**: the single inline account becomes the first entry of
+  `foundry.accounts`, while `foundry.resource_group`, `foundry.account`,
+  `foundry.region`, and `foundry.deployments` keep being written so a version 2
+  reader still works;
+- any stored `collection.analysis_goal` normalizes to `full_assessment`, which
+  is the only analysis mode.
+
+Unrelated keys — including the `report` materiality thresholds the analyzer
+reads — are preserved, and every write is atomic with user-only permissions.
 
 Credentials, access tokens, tenant secrets, API keys, and bearer tokens are
 never stored. Subscription identity may be referenced by environment-variable
@@ -1364,19 +1580,24 @@ the file.
 
 | Path | Contents | Location |
 |---|---|---|
-| `.tokenlens.yml` | Credential-free configuration: resource group, account, region, deployments, window, workloads | Repository root — **never stage it**; it names your Azure resources |
-| `local-traces/foundry-metrics/` | Aggregate metric buckets | Repository root, git-ignored |
+| `.tokenlens.yml` | Credential-free configuration: scope, accounts, regions, deployments, window, workloads | Repository root — **never stage it**; it names your Azure resources |
+| `local-traces/foundry-metrics/runs/run-<UTC stamp>/` | One guided run's aggregate metric buckets | Repository root, git-ignored |
 | `tokenlens-traces/` | Request telemetry | Repository root, git-ignored |
 | `reports/` | Generated HTML/JSON reports | Repository root, git-ignored |
-| `~/.config/tokenlens/foundry-target.json` | The remembered subscription ID | User-local, `0600` |
+| `~/.config/tokenlens/foundry-target.json` | The remembered subscription IDs and the `resource-group/account` → subscription map | User-local, `0600` |
 | `~/.config/tokenlens/pricing/customer.yml` | Customer rates | User-local, `0600` |
-| `~/.config/tokenlens/foundry-run-state.json` | Last run coverage and the relative report path | User-local, `0600` |
+| `~/.config/tokenlens/foundry-run-state.json` | Last run coverage, the relative run directory, and the relative report path | User-local, `0600` |
 
 The subscription ID is an Azure tenant identifier, so it is deliberately kept
 **out of** `.tokenlens.yml` — that file sits in your repository and could be
-committed. The workflow still remembers your selection; it just stores it
-user-locally. A legacy `foundry.subscription_id` already in the file keeps
+committed. The workflow still remembers your selection, including which
+subscription each account belongs to in a multi-subscription run; it just stores
+it user-locally. A legacy `foundry.subscription_id` already in the file keeps
 working and is never re-written.
+
+Run directories accumulate: TokenLens never deletes a previous run's telemetry.
+Remove old `runs/run-*` directories yourself when you no longer need that
+history.
 
 Set `TOKENLENS_CONFIG_DIR` to relocate the user-local directory, for example in
 a sandbox or CI image. Nothing in run state contains an access token, a tenant
@@ -1390,6 +1611,9 @@ containing a username.
 | `collector-extras=missing` | Install the extras with the exact command the wizard prints, then rerun. Nothing is installed automatically. |
 | `error=A subscription is required` in automation | Pass `--subscription`. Noninteractive runs never fall back to an ambiguous ambient Azure CLI context. |
 | `deployment_not_found` for a deployment that used to work | The deployment left the account inventory. Run `tokenlens-azure foundry configure` to update the selection; historical workload data is retained. |
+| A stale `unknown` row in the report | Fixed: each run writes to `local-traces/foundry-metrics/runs/run-<stamp>/` and the report is built from that directory alone. Re-run `tokenlens-azure foundry refresh` to produce a current-run report. |
+| `Capacity data required` on a PTU card | That exact model and version has no verified PTU capacity row. Throughput and evidence are still reported; capacity sizing is withheld rather than guessed. |
+| `PTU not applicable` on a Claude or Mistral card | Expected. Partner/Marketplace models are billed per token or in provider credit units; Azure PTU capacity cannot be purchased for them. |
 | `authorization` for one deployment | The signed-in principal needs Monitoring Reader on the account. Other deployments still collect. |
 | Exit code `3` | Partial success. Some deployments collected and the report was generated; check the per-deployment table. |
 | `Model identity missing` in the report | Azure Monitor returned no model dimension for that slice. Recollect or enrich it — do not add a pricing override for `unknown`. |

@@ -1,25 +1,24 @@
-"""The guided Foundry workflow: four decisions, then collect and report.
+"""The guided Foundry workflow: four steps, then collect and report.
 
-The normal path asks for a subscription, a Foundry account, deployments, and a
-lookback period. Everything else — deployment mode, provider family, inference
-API, endpoints, and the Azure Monitor regional endpoint — is detected from exact
-Azure metadata. Pricing remediation and business workload enrichment appear only
-when they are relevant, and neither blocks usage collection.
+The normal path asks where to look (all accessible subscriptions or one
+specific subscription), which Foundry account(s) to read, and how long a window
+to analyze. Deployments are never a question: every deployment discovered in the
+chosen scope is shown and collected, because a partial selection silently
+removes evidence from cost and PTU conclusions.
+
+Everything else — deployment mode, provider family, inference API, endpoints,
+and the Azure Monitor regional endpoint — is detected from exact Azure metadata.
+Pricing gaps and business workload enrichment are reported rather than asked
+about, and neither blocks usage collection.
 """
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Sequence
 
 from ..pricing import PricingCatalog
-from ..workloads import (
-    WorkloadMapping,
-    canonical_workload_id,
-    merge_identities,
-    safe_account_scope,
-)
+from ..workloads import WorkloadMapping, canonical_workload_id, safe_account_scope
 from . import discovery
 from .configuration import (
     customer_catalog_path,
@@ -30,11 +29,11 @@ from .configuration import (
     save_run_state,
 )
 from .models import (
-    ANALYSIS_GOALS,
     LOOKBACK_CHOICES,
     AccountOption,
     CollectionSummary,
     DeploymentRecord,
+    FoundryAccountTarget,
     FoundryWorkflowConfig,
     NoninteractiveError,
     SubscriptionOption,
@@ -48,22 +47,44 @@ from .orchestration import (
     install_command,
     run_state_from,
 )
-from .pricing import PricingReadiness, load_customer_catalog, pricing_readiness
-from .prompts import Choice, Prompter, symbol
+from .pricing import (
+    PRICING_SYNC_DEFERRED_REASON,
+    PricingReadiness,
+    load_customer_catalog,
+    pricing_readiness,
+)
+from .prompts import PHASES, Choice, Prompter, WorkflowProgress, symbol
 
 __all__ = [
     "TOTAL_STEPS",
     "collect_and_report",
     "configure",
+    "pricing_explanation_lines",
     "preflight",
     "workload_summary_lines",
     "configure_workloads",
 ]
 
-#: The normal path never exceeds four infrastructure decisions. Optional
-#: business workload enrichment enriches report semantics rather than enabling
-#: collection, so it is not counted here.
+#: Four steps: where to look, which account(s), the discovered deployments, and
+#: the analysis window. Optional business workload enrichment enriches report
+#: semantics rather than enabling collection, so it is not counted here.
 TOTAL_STEPS = 4
+
+#: Scope of one run. Choosing "all" never means "the first one that answered":
+#: every accessible subscription is enumerated and every Foundry account in it
+#: is collected.
+SUBSCRIPTION_SCOPES: tuple[tuple[str, str, str], ...] = (
+    (
+        "all",
+        "All accessible subscriptions",
+        "Every Foundry/Azure OpenAI account the signed-in principal can read",
+    ),
+    (
+        "specific",
+        "Specific subscription",
+        "One subscription you choose from the Azure CLI account list",
+    ),
+)
 
 WORKLOAD_TYPES: tuple[tuple[str, str], ...] = (
     ("agent", "Agent"),
@@ -123,66 +144,175 @@ def preflight(prompter: Prompter, services: WorkflowServices | None = None) -> l
     return lines
 
 
-def _select_subscription(
+def _subscription_options(services: WorkflowServices) -> list[SubscriptionOption]:
+    try:
+        return list(services.subscriptions())
+    except Exception:  # noqa: BLE001 - the Azure CLI is optional, never fatal
+        return []
+
+
+def _select_scope(
     prompter: Prompter,
     services: WorkflowServices,
     *,
-    configured: str | None,
+    configured_scope: str,
+    configured_subscription: str | None,
     explicit: str | None,
-) -> str:
+    all_subscriptions: bool | None,
+) -> tuple[str, list[SubscriptionOption]]:
+    """Ask where to look before asking what to read.
+
+    The first question is the scope: every accessible subscription, or one
+    specific subscription. "All" is implemented literally — every accessible
+    subscription is enumerated and every Foundry account in each one is
+    collected, never just the first that answered.
+    """
+    options = _subscription_options(services)
     if explicit:
-        return explicit
-    options: list[SubscriptionOption] = list(services.subscriptions())
+        match = next((item for item in options if item.subscription_id == explicit), None)
+        return "account", [match or SubscriptionOption(subscription_id=explicit, name=explicit)]
+    if all_subscriptions:
+        if not options:
+            raise WorkflowError(
+                "No accessible subscription could be listed, so 'all subscriptions' has nothing to "
+                "enumerate. Run `az login`, or pass --subscription for one explicit subscription."
+            )
+        return "all_subscriptions", options
     if not prompter.interactive:
-        if configured:
-            return configured
+        if configured_scope == "all_subscriptions":
+            if options:
+                return "all_subscriptions", options
+            raise NoninteractiveError(
+                "The saved scope is all subscriptions, but accessible subscriptions could not "
+                "be enumerated. Run `az login`, or reconfigure with one explicit subscription."
+            )
+        if configured_subscription:
+            match = next((item for item in options if item.subscription_id == configured_subscription), None)
+            return configured_scope if configured_scope != "all_subscriptions" else "account", [
+                match or SubscriptionOption(subscription_id=configured_subscription, name=configured_subscription)
+            ]
         raise NoninteractiveError(
-            "A subscription is required. Pass --subscription or configure one with "
-            "`tokenlens-azure foundry configure`. TokenLens never falls back to an ambiguous "
-            "ambient Azure CLI context in a noninteractive run."
+            "A subscription is required. Pass --subscription (or --all-subscriptions) or configure "
+            "one with `tokenlens-azure foundry configure`. TokenLens never falls back to an "
+            "ambiguous ambient Azure CLI context in a noninteractive run."
         )
+    scope_choices: list[Choice] = []
+    for value, label, detail in SUBSCRIPTION_SCOPES:
+        if value == "all" and options:
+            detail = f"{detail} · {len(options)} accessible"
+        scope_choices.append(
+            Choice(
+                value,
+                label,
+                detail,
+                selected=(value == "all") == (configured_scope == "all_subscriptions"),
+            )
+        )
+    scope = prompter.select(
+        "Which subscriptions should TokenLens read?",
+        scope_choices,
+        default="all" if configured_scope == "all_subscriptions" else "specific",
+    )
+    if scope == "all":
+        if not options:
+            raise WorkflowError(
+                "No accessible subscription could be listed, so 'all subscriptions' has nothing to "
+                "enumerate. Run `az login`, then start the workflow again."
+            )
+        prompter.table(
+            "Subscriptions in scope",
+            ["Subscription", "ID", "Azure CLI"],
+            [
+                [item.name, item.short_id, "active" if item.is_default else ""]
+                for item in options
+            ],
+            caption=f"{len(options)} subscription(s) will be enumerated for Foundry accounts.",
+        )
+        return "all_subscriptions", options
     if not options:
         value = prompter.text(
             "Azure subscription ID (run `az login` to list them automatically)",
-            default=configured or "",
+            default=configured_subscription or "",
             allow_empty=False,
         )
         if not value:
             raise WorkflowError("A subscription is required.")
-        return value
+        return "account", [SubscriptionOption(subscription_id=value, name=value)]
     choices = [
-        Choice(option.subscription_id, option.label(), selected=option.subscription_id == configured)
-        for option in options
+        Choice(
+            item.subscription_id,
+            item.label(),
+            selected=item.subscription_id == configured_subscription,
+        )
+        for item in options
     ]
-    return prompter.select("Azure subscription", choices, default=configured or options[0].subscription_id)
+    chosen = prompter.select(
+        "Azure subscription", choices, default=configured_subscription or options[0].subscription_id
+    )
+    return "account", [item for item in options if item.subscription_id == chosen]
 
 
-def _select_account(
+def _select_accounts(
     prompter: Prompter,
     accounts: Sequence[AccountOption],
     *,
-    configured: str | None,
-) -> AccountOption:
+    scope: str,
+    configured: Sequence[str],
+    explicit_account: str | None,
+    explicit_resource_group: str | None,
+) -> tuple[list[AccountOption], str]:
+    """Resolve which discovered accounts this run reads.
+
+    An all-subscriptions run reads every discovered account. A single
+    subscription still offers one account or all of them, so a focused run
+    stays possible without hiding anything that exists.
+    """
     if not accounts:
         raise WorkflowError(
-            "No Foundry or Azure OpenAI account was found in this subscription. Confirm the "
+            "No Foundry or Azure OpenAI account was found in the selected scope. Confirm the "
             "subscription selection and that the signed-in principal can read Cognitive Services "
             "accounts."
         )
-    if not prompter.interactive:
-        match = next((item for item in accounts if item.name == configured), None)
-        if match is None:
-            raise NoninteractiveError(
-                "An account is required. Pass --account (and --resource-group) explicitly."
+    if explicit_account:
+        matched = [
+            item
+            for item in accounts
+            if item.name == explicit_account
+            and (not explicit_resource_group or item.resource_group == explicit_resource_group)
+        ]
+        if not matched:
+            location = (
+                f" in resource group {explicit_resource_group}" if explicit_resource_group else ""
             )
-        return match
+            raise WorkflowError(
+                f"Account {explicit_account} was not found{location} for the selected scope."
+            )
+        return matched[:1], "account"
+    if scope == "all_subscriptions":
+        return list(accounts), "all_subscriptions"
+    if not prompter.interactive:
+        matched = [item for item in accounts if item.name in set(configured)]
+        if matched:
+            return matched, "subscription" if len(matched) > 1 else "account"
+        raise NoninteractiveError(
+            "An account is required. Pass --account (and --resource-group) explicitly, or "
+            "--all-subscriptions to read every accessible account."
+        )
     choices = [
-        Choice(f"{item.resource_group}/{item.name}", item.label(), selected=item.name == configured)
+        Choice(
+            "*",
+            f"All Foundry accounts in this subscription ({len(accounts)})",
+            "Every account and every deployment in it",
+            selected=len(configured) != 1,
+        )
+    ] + [
+        Choice(item.key, item.label(), selected=item.name in set(configured))
         for item in accounts
     ]
-    chosen = prompter.select("Foundry account", choices)
-    resource_group, _, name = chosen.partition("/")
-    return next(item for item in accounts if item.name == name and item.resource_group == resource_group)
+    chosen = prompter.select("Foundry account", choices, default="*")
+    if chosen == "*":
+        return list(accounts), "subscription"
+    return [item for item in accounts if item.key == chosen], "account"
 
 
 def _deployment_detail(deployment: DeploymentRecord, readiness: PricingReadiness | None) -> str:
@@ -196,51 +326,64 @@ def _deployment_detail(deployment: DeploymentRecord, readiness: PricingReadiness
     return " · ".join(parts)
 
 
-def _select_deployments(
+def _show_inventory(
     prompter: Prompter,
-    inventory: Sequence[DeploymentRecord],
+    inventory: Sequence[tuple[AccountOption, list[DeploymentRecord]]],
     *,
-    configured: Sequence[str],
-    explicit: Sequence[str],
     readiness: dict[str, PricingReadiness],
-) -> list[DeploymentRecord]:
-    if explicit:
-        resolved, missing = discovery.selected_deployments(inventory, explicit)
-        if missing:
-            raise WorkflowError(
-                "These deployments are not in the account inventory: " + ", ".join(missing)
-            )
-        return resolved
-    if not inventory:
-        raise WorkflowError("This account has no deployments to collect.")
-    if not prompter.interactive:
-        resolved, missing = discovery.selected_deployments(inventory, configured)
-        if missing:
-            raise WorkflowError(
-                "These configured deployments are no longer in the account inventory: "
-                + ", ".join(missing)
-            )
-        if not resolved:
-            raise NoninteractiveError(
-                "At least one deployment is required. Pass --deployment one or more times."
-            )
-        return resolved
-    preselected = {name.casefold() for name in configured} or {
-        item.name.casefold() for item in inventory
-    }
-    choices = [
-        Choice(
-            item.name,
-            item.label(),
-            _deployment_detail(item, readiness.get(item.name)),
-            selected=item.name.casefold() in preselected,
-        )
-        for item in inventory
-    ]
-    names = prompter.multiselect("Select deployments", choices, minimum=1)
-    resolved, _missing = discovery.selected_deployments(inventory, names)
-    return resolved
+    multi_account: bool,
+) -> None:
+    """Show every discovered deployment; all of them are always collected."""
+    headers = ["Deployment", "Model", "Mode", "Pricing"]
+    if multi_account:
+        headers.insert(0, "Account")
+    rows: list[list[str]] = []
+    for account, deployments in inventory:
+        for item in deployments:
+            state = readiness.get(item.name)
+            marker = symbol("✓") if state is not None and state.resolved else symbol("⚠")
+            row = [
+                item.name,
+                f"{item.model or 'model unknown'}" + (f" v{item.model_version}" if item.model_version else ""),
+                item.mode_label,
+                f"{marker} {state.label}" if state is not None else "not evaluated",
+            ]
+            if multi_account:
+                row.insert(0, account.name)
+            rows.append(row)
+    prompter.table(
+        "Deployments discovered in scope",
+        headers,
+        rows,
+        caption=(
+            f"All {len(rows)} deployment(s) are collected. Use "
+            "`tokenlens-azure foundry collect --deployment NAME` for a narrower automated run."
+        ),
+    )
 
+
+def _explicit_selection(
+    inventory: Sequence[tuple[AccountOption, list[DeploymentRecord]]],
+    explicit: Sequence[str],
+) -> list[tuple[AccountOption, list[DeploymentRecord]]]:
+    """Apply an explicit --deployment list, rejecting any unknown name."""
+    wanted = {str(name).casefold(): index for index, name in enumerate(explicit)}
+    narrowed: list[tuple[AccountOption, list[DeploymentRecord]]] = []
+    found: set[str] = set()
+    for account, deployments in inventory:
+        selected = [item for item in deployments if item.name.casefold() in wanted]
+        # The caller's order is preserved so an explicit automated run reports
+        # its deployments in the order it asked for them.
+        selected.sort(key=lambda item: wanted[item.name.casefold()])
+        found.update(item.name.casefold() for item in selected)
+        if selected:
+            narrowed.append((account, selected))
+    missing = [str(name) for name in explicit if str(name).casefold() not in found]
+    if missing:
+        raise WorkflowError(
+            "These deployments are not in the account inventory: " + ", ".join(missing)
+        )
+    return narrowed
 
 def _select_lookback(prompter: Prompter, *, configured: int, explicit: int | None) -> int:
     if explicit is not None:
@@ -259,22 +402,15 @@ def _select_lookback(prompter: Prompter, *, configured: int, explicit: int | Non
         for days, purpose in LOOKBACK_CHOICES
     ]
     chosen = int(prompter.select("Analysis window", choices, default=str(configured)))
-    prompter.echo(
-        "PTU evidence needs active buckets, not elapsed time. A long window with little traffic "
-        "still provides insufficient evidence, and a recently created deployment may have less "
-        "history than the window requests."
+    prompter.panel(
+        "How the window is used",
+        [
+            "PTU evidence needs active buckets, not elapsed time. A long window with little",
+            "traffic still provides insufficient evidence, and a recently created deployment",
+            "may have less history than the window requests.",
+        ],
     )
     return chosen
-
-
-def _select_goal(prompter: Prompter, *, configured: str) -> str:
-    if not prompter.interactive:
-        return configured
-    choices = [
-        Choice(value, label, requirement, selected=value == configured)
-        for value, label, requirement in ANALYSIS_GOALS
-    ]
-    return prompter.select("Analysis goal", choices, default=configured)
 
 
 def workload_summary_lines(config: FoundryWorkflowConfig) -> list[str]:
@@ -285,7 +421,7 @@ def workload_summary_lines(config: FoundryWorkflowConfig) -> list[str]:
         for mapping in config.workloads.mappings
         for deployment in mapping.deployments
     }
-    for deployment in config.foundry.deployments:
+    for deployment in config.foundry.all_deployments:
         mapping = business.get(canonical_workload_id(deployment.name))
         if mapping is None:
             lines.append(f"{symbol('✓')} {deployment.name} — deployment-backed workload · Needs configuration")
@@ -317,7 +453,7 @@ def configure_workloads(
     existing = {mapping.id: mapping for mapping in config.workloads.mappings}
     targets = [
         deployment
-        for deployment in config.foundry.deployments
+        for deployment in config.foundry.all_deployments
         if only is None or deployment.name in set(only)
     ]
     for deployment in targets:
@@ -410,55 +546,69 @@ def configure_workloads(
     )
 
 
-def _resolve_pricing(
+def pricing_explanation_lines(unresolved: Sequence[PricingReadiness]) -> list[str]:
+    """Explain *why* a rate is missing and the one command that fixes it.
+
+    TokenLens never guesses a rate. A missing rate means neither the packaged
+    verified catalog nor your customer catalog contains an entry for that exact
+    model, version, and deployment mode — which is the case for most partner and
+    marketplace models, and for a model published after the packaged snapshot.
+    """
+    identity = [item for item in unresolved if item.state == "identity_unresolved"]
+    rate_missing = [item for item in unresolved if item.state != "identity_unresolved"]
+    lines = [
+        f"{len(unresolved)} deployment(s) have no exact rate in the packaged verified catalog or "
+        "your customer catalog for that exact model, version, and deployment mode.",
+        "The full assessment continues: usage, throughput, and PTU evidence are collected, and "
+        "cost is withheld for those deployments only. A rate is never guessed from a related "
+        "model or family.",
+    ]
+    keys = [item.suggested_override_key for item in rate_missing if item.suggested_override_key]
+    if keys:
+        lines.append(
+            "To add a contracted rate: tokenlens-azure pricing set-rate --model "
+            f"{keys[0]} --input-per-million X --output-per-million Y --effective-from YYYY-MM-DD"
+        )
+        lines.append(f"Rates are stored locally in {safe_display_path(customer_catalog_path())}.")
+    if identity:
+        lines.append(
+            "Collection identity must be fixed first for: "
+            + ", ".join(item.deployment for item in identity)
+            + " — `unknown` is never a pricing override key."
+        )
+    lines.append(PRICING_SYNC_DEFERRED_REASON)
+    return lines
+
+
+def _report_pricing(
     prompter: Prompter,
     config: FoundryWorkflowConfig,
     *,
     customer_catalog: PricingCatalog | None,
 ) -> list[PricingReadiness]:
-    """Show exact pricing readiness and offer only safe remediations."""
-    readiness = pricing_readiness(config.foundry.deployments, customer_catalog=customer_catalog)
-    prompter.echo("\nPricing readiness")
-    for item in readiness:
-        marker = symbol("✓") if item.resolved else symbol("⚠")
-        prompter.echo(f"{marker} {item.deployment} — {item.label}")
-    unresolved = [item for item in readiness if not item.resolved]
-    if not unresolved or not prompter.interactive:
-        return readiness
-    choice = prompter.select(
-        f"{len(unresolved)} deployment(s) have no exact rate. What next?",
-        [
-            Choice("continue", "Continue without cost analysis for those deployments"),
-            Choice("override", "Configure a customer/contracted rate now"),
-            Choice("sync", "Synchronize verified public pricing"),
-            Choice("remove", "Remove those deployments from this run"),
-        ],
-        default="continue",
-    )
-    if choice == "sync":
-        from .pricing import PRICING_SYNC_DEFERRED_REASON
+    """Report exact pricing readiness. There is no question to answer here.
 
-        prompter.echo(PRICING_SYNC_DEFERRED_REASON)
-        prompter.echo("Use a customer rate instead: tokenlens-azure pricing set-rate")
-    elif choice == "remove":
-        remaining = [
-            deployment
-            for deployment in config.foundry.deployments
-            if deployment.name not in {item.deployment for item in unresolved}
-        ]
-        if not remaining:
-            prompter.echo("Every selected deployment is unpriced, so none were removed.")
-        else:
-            config.foundry.deployments = remaining
-            readiness = pricing_readiness(
-                config.foundry.deployments, customer_catalog=customer_catalog
-            )
-    elif choice == "override":
-        prompter.echo(
-            "Add an exact contracted rate with: tokenlens-azure pricing set-rate --model MODEL "
-            "--input-per-million X --output-per-million Y --effective-from YYYY-MM-DD"
-        )
-        prompter.echo(f"Rates are stored locally in {safe_display_path(customer_catalog_path())}.")
+    Asking "what next?" for an unpriced deployment only ever produced one safe
+    answer, so the workflow states the reason, continues the full assessment
+    with cost withheld, and prints the single remediation command.
+    """
+    readiness = pricing_readiness(config.foundry.all_deployments, customer_catalog=customer_catalog)
+    prompter.table(
+        "Pricing readiness",
+        ["Deployment", "Model", "State"],
+        [
+            [
+                item.deployment,
+                item.model + (f" v{item.model_version}" if item.model_version else ""),
+                f"{symbol('✓') if item.resolved else symbol('⚠')} {item.label}",
+            ]
+            for item in readiness
+        ],
+        caption=f"{sum(1 for item in readiness if item.resolved)}/{len(readiness)} priced exactly.",
+    )
+    unresolved = [item for item in readiness if not item.resolved]
+    if unresolved:
+        prompter.panel("Why cost is withheld", pricing_explanation_lines(unresolved), tone="warning")
     return readiness
 
 
@@ -472,9 +622,15 @@ def configure(
     account: str | None = None,
     deployments: Sequence[str] = (),
     days: int | None = None,
+    all_subscriptions: bool | None = None,
     configure_business_workloads: bool | None = None,
 ) -> tuple[FoundryWorkflowConfig, list[PricingReadiness]]:
-    """Discover, select, and save a credential-free configuration."""
+    """Discover, select, and save a credential-free configuration.
+
+    TokenLens always runs the full assessment, so there is no analysis-goal
+    question, and every deployment discovered in the chosen scope is collected,
+    so there is no per-deployment selection question either.
+    """
     services = services or WorkflowServices()
     config, raw = load_config(config_path)
     missing = services.missing_packages()
@@ -484,75 +640,133 @@ def configure(
             + ", ".join(missing)
             + f"). Install them with: {install_command()}"
         )
+    config.collection.analysis_goal = "full_assessment"
 
-    prompter.echo("\nAnalysis goal")
-    goal = _select_goal(prompter, configured=config.collection.analysis_goal)
-    config.collection.analysis_goal = goal  # type: ignore[assignment]
-    if goal in {"prompt_efficiency", "full_assessment"}:
-        prompter.echo(
-            "Prompt and token efficiency needs request-level telemetry. Azure Monitor aggregates "
-            "answer cost and PTU questions; instrument the client with tokenlens.integrations or "
-            "import OpenTelemetry spans for per-request diagnostics."
-        )
-
-    prompter.step(1, TOTAL_STEPS, "Azure subscription")
-    subscription_id = _select_subscription(
+    prompter.step(1, TOTAL_STEPS, "Azure subscription scope")
+    scope, subscriptions = _select_scope(
         prompter,
         services,
-        configured=config.foundry.subscription_id or os.getenv(config.foundry.subscription_id_env),
+        configured_scope=config.foundry.scope,
+        configured_subscription=(
+            config.foundry.subscription_id or os.getenv(config.foundry.subscription_id_env)
+        ),
         explicit=subscription,
+        all_subscriptions=all_subscriptions,
     )
-    resources = services.resource_client(subscription_id)
 
-    prompter.step(2, TOTAL_STEPS, "Foundry account")
-    accounts = discovery.discover_accounts(resources, subscription_id, resource_group=resource_group)
-    if account and resource_group:
-        chosen_account = next(
-            (item for item in accounts if item.name == account and item.resource_group == resource_group),
-            None,
+    prompter.step(2, TOTAL_STEPS, "Foundry accounts")
+    discovery_errors: list[str] = []
+    accounts = discovery.discover_accounts_in_scope(
+        services.resource_client,
+        subscriptions,
+        resource_group=resource_group,
+        on_error=lambda subscription_id, exc: discovery_errors.append(
+            f"a subscription could not be read ({type(exc).__name__})"
+        ),
+    )
+    if discovery_errors:
+        prompter.panel(
+            "Partial discovery",
+            sorted(set(discovery_errors))
+            + ["Confirm the signed-in principal can read Cognitive Services accounts there."],
+            tone="warning",
         )
-        if chosen_account is None:
-            raise WorkflowError(
-                f"Account {account} was not found in resource group {resource_group} for this subscription."
-            )
-    else:
-        chosen_account = _select_account(prompter, accounts, configured=account or config.foundry.account)
+    configured_accounts = [item.account for item in config.foundry.targets]
+    chosen_accounts, resolved_scope = _select_accounts(
+        prompter,
+        accounts,
+        scope=scope,
+        configured=configured_accounts,
+        explicit_account=account,
+        explicit_resource_group=resource_group,
+    )
 
     prompter.step(3, TOTAL_STEPS, "Deployments")
-    inventory = discovery.discover_deployments(
-        resources, subscription_id, chosen_account.resource_group, chosen_account.name
+    inventory_errors: list[str] = []
+    inventory = discovery.discover_inventory(
+        services.resource_client,
+        chosen_accounts,
+        on_error=lambda account_option, exc: inventory_errors.append(
+            f"{account_option.name}: deployments could not be listed ({type(exc).__name__})"
+        ),
     )
+    if inventory_errors:
+        prompter.panel(
+            "Accounts skipped",
+            sorted(set(inventory_errors))
+            + ["Confirm the signed-in principal can read deployments in that account."],
+            tone="warning",
+        )
+    if list(deployments):
+        inventory = _explicit_selection(inventory, list(deployments))
     customer_catalog = load_customer_catalog()
+    all_records = [item for _account, records in inventory for item in records]
+    if not all_records:
+        raise WorkflowError(
+            "No deployment was found in the selected scope. Confirm the account selection, or "
+            "create a deployment in the Foundry account first."
+        )
     readiness_map = {
         item.deployment: item
-        for item in pricing_readiness(inventory, customer_catalog=customer_catalog)
+        for item in pricing_readiness(all_records, customer_catalog=customer_catalog)
     }
-    selection = _select_deployments(
+    _show_inventory(
         prompter,
         inventory,
-        configured=config.foundry.deployment_names,
-        explicit=list(deployments),
         readiness=readiness_map,
+        multi_account=len(chosen_accounts) > 1,
     )
 
     prompter.step(4, TOTAL_STEPS, "Analysis window")
     lookback = _select_lookback(prompter, configured=config.collection.lookback_days, explicit=days)
 
-    metadata = resources.get_account(chosen_account.resource_group, chosen_account.name)
-    config.foundry.subscription_id = subscription_id
-    config.foundry.resource_group = chosen_account.resource_group
-    config.foundry.account = chosen_account.name
-    config.foundry.region = str(metadata.get("location") or chosen_account.location or "") or None
-    config.foundry.deployments = selection
+    targets: list[FoundryAccountTarget] = []
+    empty_accounts: list[str] = []
+    for account_option, records in inventory:
+        if not records:
+            # An account with no deployment has nothing to collect; it is named
+            # rather than silently folded into the selection.
+            empty_accounts.append(account_option.name)
+            continue
+        metadata = services.resource_client(account_option.subscription_id).get_account(
+            account_option.resource_group, account_option.name
+        )
+        targets.append(
+            FoundryAccountTarget(
+                subscription_id=account_option.subscription_id,
+                resource_group=account_option.resource_group,
+                account=account_option.name,
+                region=str(metadata.get("location") or account_option.location or "") or None,
+                metrics_endpoint=config.foundry.metrics_endpoint,
+                deployments=records,
+            )
+        )
+    if empty_accounts:
+        prompter.panel(
+            "Accounts without deployments",
+            [", ".join(sorted(empty_accounts))],
+            tone="warning",
+        )
+    primary = targets[0]
+    config.foundry.scope = resolved_scope  # type: ignore[assignment]
+    config.foundry.subscription_id = primary.subscription_id
+    config.foundry.subscription_ids = (
+        [item.subscription_id for item in subscriptions]
+        if resolved_scope == "all_subscriptions"
+        else [item.subscription_id for item in targets if item.subscription_id]
+    )
+    config.foundry.accounts = targets
+    config.foundry.resource_group = primary.resource_group
+    config.foundry.account = primary.account
+    config.foundry.region = primary.region
+    config.foundry.deployments = list(primary.deployments)
     config.collection.lookback_days = lookback
     config = refresh_identities(
         config,
         account_scope=safe_account_scope(config.foundry.account, config.foundry.resource_group),
     )
 
-    prompter.echo("")
-    for line in workload_summary_lines(config):
-        prompter.echo(line)
+    prompter.panel("Workloads", workload_summary_lines(config))
     wants_workloads = configure_business_workloads
     if wants_workloads is None and prompter.interactive:
         wants_workloads = (
@@ -565,11 +779,9 @@ def configure(
         )
     if wants_workloads:
         config = configure_workloads(prompter, config)
-        prompter.echo("")
-        for line in workload_summary_lines(config):
-            prompter.echo(line)
+        prompter.panel("Workloads", workload_summary_lines(config))
 
-    readiness = _resolve_pricing(prompter, config, customer_catalog=customer_catalog)
+    readiness = _report_pricing(prompter, config, customer_catalog=customer_catalog)
     save_config(config, raw, path=config_path)
     return config, readiness
 
@@ -583,26 +795,40 @@ def collect_and_report(
     output_format: str | None = None,
     write_run_state: bool = True,
 ) -> tuple[CollectionSummary, ReportResult | None]:
-    """Collect every selected deployment, then analyze and open the report."""
+    """Collect every selected deployment, then analyze and open the report.
+
+    The run writes into its own telemetry directory and the report is generated
+    from that directory alone, so a previous run's files — including any slice
+    whose identity was never resolved — can never re-enter a fresh report.
+    """
     services = services or WorkflowServices()
     customer_catalog = load_customer_catalog()
-
-    def progress(name: str, state: str) -> None:
-        marker = symbol("✓") if state == "collected" else symbol("✕")
-        prompter.echo(f"{marker} {name} · {state}")
-
-    summary = collect_deployments(
-        config, services=services, progress=progress, customer_catalog=customer_catalog
-    )
+    selected = config.foundry.all_deployments
     result: ReportResult | None = None
-    if summary.succeeded:
-        result = generate_report(
+    with WorkflowProgress(prompter, deployments=len(selected)) as progress:
+        progress.phase(PHASES[0], f"{len(config.foundry.targets)} account(s)")
+        progress.phase(PHASES[1], f"{len(selected)} deployment(s)")
+        summary = collect_deployments(
             config,
             services=services,
-            open_report=open_report,
-            output_format=output_format,
+            progress=progress.item,
             customer_catalog=customer_catalog,
         )
+        if summary.succeeded:
+            progress.phase(PHASES[2], f"{summary.records_written:,} record(s)")
+            # Only this run's directory is analyzed. Historical telemetry stays
+            # on disk untouched and is never mixed into the current report.
+            sources = [summary.run_dir] if summary.run_dir else None
+            result = generate_report(
+                config,
+                services=services,
+                inputs=sources,
+                open_report=open_report,
+                output_format=output_format,
+                customer_catalog=customer_catalog,
+            )
+            progress.phase(PHASES[3], result.display_path)
+        progress.finish()
     if write_run_state:
         save_run_state(run_state_from(summary, result, now=services.now))
     return summary, result

@@ -97,6 +97,8 @@ def _print_summary(summary: CollectionSummary, result: ReportResult | None) -> N
     typer.echo("Collection complete" if summary.status != "failed" else "Collection failed")
     typer.echo(f"{len(summary.succeeded)} / {len(summary.outcomes)} deployments succeeded")
     typer.echo(f"{summary.lookback_days}-day window")
+    if len(summary.accounts) > 1:
+        typer.echo(f"accounts={', '.join(summary.accounts)}")
     header = (
         f"{'Deployment':<24}{'Identity':<12}{'Metrics':<10}{'Active':>8}{'Requests':>10}"
         f"{'Tokens':>12}  {'Pricing':<28}{'PTU evidence'}"
@@ -120,6 +122,16 @@ def _print_summary(summary: CollectionSummary, result: ReportResult | None) -> N
     for conflict in summary.identity_conflicts:
         typer.echo(f"identity-conflict={conflict}")
     typer.echo(f"records-written={summary.records_written} already-present={summary.duplicates_skipped}")
+    if summary.run_dir:
+        typer.echo(f"run-directory={safe_display_path(summary.run_dir)}")
+    if summary.unresolved_pricing:
+        typer.echo(
+            "pricing-withheld=" + ", ".join(summary.unresolved_pricing)
+        )
+        typer.echo(
+            "pricing-remediation=tokenlens-azure pricing set-rate --model MODEL "
+            "--input-per-million X --output-per-million Y --effective-from YYYY-MM-DD"
+        )
     if result is None:
         typer.echo("report=not generated because no deployment succeeded")
         return
@@ -156,9 +168,10 @@ def foundry_entry(ctx: typer.Context) -> None:
         )
         return
     prompter = _prompter()
-    typer.echo("TokenLens Foundry setup")
-    for line in preflight(prompter):
-        typer.echo(line)
+    prompter.panel(
+        "TokenLens Foundry setup",
+        preflight(prompter),
+    )
     missing = missing_collector_packages()
     if missing:
         typer.echo(
@@ -172,10 +185,16 @@ def foundry_entry(ctx: typer.Context) -> None:
         raise typer.Exit(code=EXIT_FAILED)
     config, _raw = load_config(None)
     if config.configured:
-        typer.echo("")
-        typer.echo(f"account={config.foundry.account} region={config.foundry.region or 'unknown'}")
-        typer.echo(f"deployments={', '.join(config.foundry.deployment_names)}")
-        typer.echo(f"window={config.collection.lookback_days} days")
+        prompter.panel(
+            "Saved setup",
+            [
+                f"scope={config.foundry.scope}",
+                f"accounts={', '.join(item.account for item in config.foundry.targets)}",
+                f"region={config.foundry.region or 'unknown'}",
+                f"deployments={', '.join(config.foundry.deployment_names)}",
+                f"window={config.collection.lookback_days} days",
+            ],
+        )
         choice = typer.prompt("Refresh this setup or reconfigure it? [refresh/reconfigure]", default="refresh")
         if str(choice).strip().casefold().startswith("recon"):
             config, _readiness = run_configure(prompter, services=_services())
@@ -193,6 +212,11 @@ def foundry_entry(ctx: typer.Context) -> None:
 @foundry_app.command("configure")
 def foundry_configure(
     subscription: str | None = typer.Option(None, "--subscription", help="Explicit subscription ID."),
+    all_subscriptions: bool = typer.Option(
+        False,
+        "--all-subscriptions",
+        help="Read every accessible subscription and every Foundry account in them.",
+    ),
     resource_group: str | None = typer.Option(None, "--resource-group", help="Resource group of the account."),
     account: str | None = typer.Option(None, "--account", help="Foundry/Azure OpenAI account name."),
     deployment: list[str] = typer.Option([], "--deployment", help="Deployment to select; repeat for more."),
@@ -220,14 +244,17 @@ def foundry_configure(
             account=account,
             deployments=deployment,
             days=days,
+            all_subscriptions=all_subscriptions or None,
             configure_business_workloads=workloads,
         )
     except (WorkflowError, NoninteractiveError, WorkloadMappingError) as exc:
         _fail(exc)
         return
     typer.echo(f"configuration={safe_display_path(config or '.tokenlens.yml')}")
+    typer.echo(f"scope={saved.foundry.scope}")
+    typer.echo(f"accounts={', '.join(item.account for item in saved.foundry.targets)}")
     typer.echo(f"account={saved.foundry.account} region={saved.foundry.region or 'unknown'}")
-    for item in saved.foundry.deployments:
+    for item in saved.foundry.all_deployments:
         typer.echo(
             f"deployment={item.name} model={item.model or 'unknown'} "
             f"version={item.model_version or 'unknown'} sku={item.sku or 'unknown'} "
@@ -242,6 +269,11 @@ def foundry_configure(
 @foundry_app.command("collect")
 def foundry_collect(
     subscription: str | None = typer.Option(None, "--subscription", help="Explicit subscription ID."),
+    all_subscriptions: bool = typer.Option(
+        False,
+        "--all-subscriptions",
+        help="Collect every Foundry account in every accessible subscription.",
+    ),
     resource_group: str | None = typer.Option(None, "--resource-group", help="Resource group of the account."),
     account: str | None = typer.Option(None, "--account", help="Foundry/Azure OpenAI account name."),
     deployment: list[str] = typer.Option([], "--deployment", help="Deployment to collect; repeat for more."),
@@ -280,6 +312,7 @@ def foundry_collect(
             account=account,
             deployments=deployment,
             days=days,
+            all_subscriptions=all_subscriptions or None,
             configure_business_workloads=False,
         )
         if output_dir:
@@ -357,7 +390,7 @@ def foundry_pricing(
         _fail(exc)
         return
     customer = load_customer_catalog()
-    readiness = pricing_readiness(saved.foundry.deployments, customer_catalog=customer)
+    readiness = pricing_readiness(saved.foundry.all_deployments, customer_catalog=customer)
     if as_json:
         typer.echo(json.dumps([item.model_dump(mode="json") for item in readiness], indent=2))
         return
@@ -377,11 +410,16 @@ def foundry_pricing(
         return
     typer.echo("")
     typer.echo(f"unresolved={len(unresolved)} of {len(readiness)} deployment(s)")
-    typer.echo("Choose one safe remediation. TokenLens never guesses a rate:")
-    typer.echo("  1. Configure a contracted rate: tokenlens-azure pricing set-rate --model MODEL ...")
-    typer.echo("  2. Continue without cost analysis for those deployments (usage stays available).")
-    typer.echo("  3. Remove them from the selection: tokenlens-azure foundry configure")
-    typer.echo("  4. Public pricing synchronization is deferred; see tokenlens-azure pricing sync")
+    typer.echo(
+        "reason=no packaged verified rate or customer rate matches that exact model, version, and "
+        "deployment mode. TokenLens never guesses a rate, so the assessment continues with cost "
+        "withheld for those deployments only."
+    )
+    typer.echo(
+        "remediation=tokenlens-azure pricing set-rate --model MODEL --input-per-million X "
+        "--output-per-million Y --effective-from YYYY-MM-DD"
+    )
+    typer.echo("public-sync=deferred; see tokenlens-azure pricing sync")
     for item in unresolved:
         if item.state == "identity_unresolved":
             typer.echo(

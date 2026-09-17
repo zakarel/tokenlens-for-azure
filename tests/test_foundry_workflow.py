@@ -25,6 +25,7 @@ from tokenlens.foundry_workflow.configuration import (
 )
 from tokenlens.foundry_workflow.models import (
     NoninteractiveError,
+    SubscriptionOption,
     WorkflowError,
 )
 from tokenlens.foundry_workflow.orchestration import (
@@ -46,12 +47,31 @@ TENANT_SECRET = "TENANT-SECRET-must-never-be-written"
 PRICED_MODEL = "phi-4"
 UNPRICED_MODEL = "ministral-3b"
 
+#: Every deployment the default stub account exposes. All of them are always
+#: collected: TokenLens no longer asks which deployments to include.
+ALL_DEPLOYMENTS = ["coding-prod", "compact-prod", "reasoning-prod"]
+
+#: A second subscription/account pair, for all-subscriptions scope tests.
+ACCOUNT_A = {"name": "alpha-account", "resource_group": "alpha-rg", "kind": "AIServices", "location": "East US 2"}
+ACCOUNT_B = {"name": "beta-account", "resource_group": "beta-rg", "kind": "AIServices", "location": "West Europe"}
+DEPLOYMENT_A = {"name": "alpha-prod", "model": PRICED_MODEL, "model_version": "2026-07-09", "sku": "GlobalStandard", "capacity": 10}
+DEPLOYMENT_B = {"name": "beta-prod", "model": PRICED_MODEL, "model_version": "2026-07-09", "sku": "GlobalStandard", "capacity": 20}
+
 
 class StubResources:
     """Discovery surface only. Constructing a metrics client here would be a bug."""
 
-    def __init__(self, *, deployments: list[dict] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        deployments: list[dict] | None = None,
+        accounts: list[dict] | None = None,
+    ) -> None:
         self.calls: list[str] = []
+        self._accounts = accounts if accounts is not None else [
+            {"name": "example-foundry-account", "resource_group": "example-rg", "kind": "AIServices", "location": "East US 2"},
+            {"name": "example-speech", "resource_group": "example-rg", "kind": "SpeechServices", "location": "East US 2"},
+        ]
         self._deployments = deployments if deployments is not None else [
             {"name": "reasoning-prod", "model": PRICED_MODEL, "model_version": "2026-07-09", "sku": "GlobalStandard", "capacity": 100},
             {"name": "coding-prod", "model": PRICED_MODEL, "model_version": "2026-07-09", "sku": "GlobalStandard", "capacity": 50},
@@ -60,10 +80,7 @@ class StubResources:
 
     def list_accounts(self, subscription_id: str, resource_group: str | None = None) -> list[dict]:
         self.calls.append("list_accounts")
-        return [
-            {"name": "example-foundry-account", "resource_group": "example-rg", "kind": "AIServices", "location": "East US 2"},
-            {"name": "example-speech", "resource_group": "example-rg", "kind": "SpeechServices", "location": "East US 2"},
-        ]
+        return list(self._accounts)
 
     def list_deployments(self, subscription_id: str, resource_group: str, account: str) -> list[dict]:
         self.calls.append("list_deployments")
@@ -71,10 +88,18 @@ class StubResources:
 
     def get_account(self, resource_group: str, account: str) -> dict:
         self.calls.append("get_account")
+        location = next(
+            (
+                str(item.get("location") or "East US 2")
+                for item in self._accounts
+                if item.get("name") == account
+            ),
+            "East US 2",
+        )
         return {
             "name": account,
             "kind": "AIServices",
-            "location": "East US 2",
+            "location": location,
             "endpoint": "https://example-account.services.ai.azure.com/",
         }
 
@@ -147,37 +172,74 @@ def workspace(tmp_path, monkeypatch):
     return tmp_path
 
 
-def services(*, resources=None, collect=None, subscriptions=None, missing=None, opened=None):
+def services(*, resources=None, collect=None, subscriptions=None, missing=None, opened=None, now=None):
     opened_paths: list[Path] = [] if opened is None else opened
+    shared = resources if resources is not None else StubResources()
 
     def _open(path: Path) -> bool:
         opened_paths.append(path)
         return True
 
+    def _resource_client(subscription: str):
+        # A callable ``resources`` lets a test hand out a different stub per
+        # subscription, which is how the all-subscriptions scope is exercised.
+        return shared(subscription) if callable(shared) else shared
+
     return WorkflowServices(
-        resource_client=lambda subscription: resources or StubResources(),
+        resource_client=_resource_client,
         metrics_client=lambda endpoint: {"endpoint": endpoint},
         collect=collect or collector(),
         subscriptions=lambda: list(subscriptions or []),
         open_report=_open,
-        now=lambda: datetime(2026, 9, 15, tzinfo=UTC),
+        now=now or (lambda: datetime(2026, 9, 15, tzinfo=UTC)),
         missing_packages=lambda: list(missing or []),
     )
 
 
-def first_run_answers(deployments=("reasoning-prod", "coding-prod"), *, workloads: str = "later"):
-    answers = [
-        "workload_cost",
-        SUBSCRIPTION,
-        "example-rg/example-foundry-account",
-        list(deployments),
-        "14",
-        workloads,
-    ]
-    if "compact-prod" in deployments:
-        # The partner model has no exact rate, so the wizard asks how to proceed.
-        answers.append("continue")
+def first_run_answers(*, workloads: str = "later", scope: str = "specific"):
+    """Answers for one guided run.
+
+    There is no analysis-goal question and no deployment-selection question:
+    TokenLens always runs the full assessment over every deployment discovered
+    in the chosen scope.
+    """
+    answers: list[object] = [scope]
+    if scope == "specific":
+        answers.extend([SUBSCRIPTION, "*"])
+    answers.extend(["14", workloads])
     return answers
+
+
+def workload_answers(*, owner: str = "", cost_center: str = ""):
+    """A full guided run that also enriches business workload identity.
+
+    ``configure_workloads`` walks the deployments in inventory order:
+    coding-prod (shared), compact-prod (kept technical), reasoning-prod
+    (dedicated).
+    """
+    return first_run_answers(workloads="yes") + [
+        # coding-prod — shared, so an integration example is offered first.
+        "shared",
+        "python",
+        "Coding agent",
+        "agent",
+        "production",
+        "",
+        "",
+        "",
+        "unknown",
+        # compact-prod — stays a technical deployment only.
+        "technical",
+        # reasoning-prod — dedicated to one business workload.
+        "dedicated",
+        "Support assistant",
+        "agent",
+        "production",
+        "Handles tier-1 support",
+        owner,
+        cost_center,
+        "high",
+    ]
 
 
 # --- Preflight and dependency guidance -------------------------------------
@@ -287,24 +349,44 @@ def test_first_run_completes_without_manually_supplied_resource_identifiers(work
     assert config.foundry.resource_group == "example-rg"
     assert config.foundry.account == "example-foundry-account"
     assert config.foundry.region == "East US 2"
-    assert config.foundry.deployment_names == ["reasoning-prod", "coding-prod"]
+    # Every discovered deployment is collected; there is no selection question.
+    assert config.foundry.deployment_names == ALL_DEPLOYMENTS
     assert config.collection.lookback_days == 14
-    reasoning = config.foundry.deployments[0]
+    reasoning = next(item for item in config.foundry.all_deployments if item.name == "reasoning-prod")
     assert reasoning.model == PRICED_MODEL
     assert reasoning.model_version == "2026-07-09"
     assert reasoning.sku == "GlobalStandard"
     assert reasoning.deployment_mode == "global"
     assert reasoning.provider_family == "azure_openai"
     assert reasoning.inference_api == "openai"
-    assert [item.state for item in readiness] == ["exact_public_rate", "exact_public_rate"]
-    # Four decisions only on the normal path.
+    assert {item.deployment: item.state for item in readiness} == {
+        "coding-prod": "exact_public_rate",
+        "compact-prod": "rate_unavailable",
+        "reasoning-prod": "exact_public_rate",
+    }
+    # Four steps on the normal path, and the deployment step asks nothing.
     steps = [line for line in prompter.transcript if line.startswith("Step ")]
     assert steps == [
-        "Step 1/4 · Azure subscription",
-        "Step 2/4 · Foundry account",
+        "Step 1/4 · Azure subscription scope",
+        "Step 2/4 · Foundry accounts",
         "Step 3/4 · Deployments",
         "Step 4/4 · Analysis window",
     ]
+    questions = [line for line in prompter.transcript if line.startswith("? ")]
+    assert not any("deployment" in line.casefold() for line in questions)
+    assert not any("goal" in line.casefold() for line in questions)
+    # The full assessment is the only analysis mode.
+    assert config.collection.analysis_goal == "full_assessment"
+
+
+def test_the_first_question_is_the_subscription_scope(workspace):
+    prompter = ScriptedPrompter(first_run_answers())
+    configure(prompter, services=services())
+    questions = [line for line in prompter.transcript if line.startswith("? ")]
+    assert questions[0] == "? Which subscriptions should TokenLens read?"
+    offered = [line for line in prompter.transcript if line.startswith("  - ")]
+    assert "  - All accessible subscriptions" in offered
+    assert "  - Specific subscription" in offered
 
 
 def test_multiple_subscriptions_require_an_explicit_choice(workspace):
@@ -316,24 +398,50 @@ def test_multiple_subscriptions_require_an_explicit_choice(workspace):
             ]
         )
     )
-    prompter = ScriptedPrompter(
-        ["workload_cost", "b" * 36, "example-rg/example-foundry-account", ["reasoning-prod"], "14", "later"]
-    )
+    prompter = ScriptedPrompter(["specific", "b" * 36, "*", "14", "later"])
     config, _ = configure(prompter, services=services(subscriptions=options))
     # The chosen subscription is used, not the Azure CLI's active one.
     assert config.foundry.subscription_id == "b" * 36
+    assert config.foundry.scope == "subscription"
     offered = [line for line in prompter.transcript if line.startswith("  - ")]
     assert any("Production Subscription" in line for line in offered)
     assert any("Sandbox Subscription" in line for line in offered)
+
+
+def test_all_subscriptions_collects_every_account_not_just_the_first(workspace):
+    options = discovery.list_subscriptions(
+        runner=lambda: json.dumps(
+            [
+                {"id": "a" * 36, "name": "Production Subscription", "state": "Enabled", "isDefault": True},
+                {"id": "b" * 36, "name": "Sandbox Subscription", "state": "Enabled"},
+            ]
+        )
+    )
+    resources = {
+        "a" * 36: StubResources(accounts=[ACCOUNT_A], deployments=[DEPLOYMENT_A]),
+        "b" * 36: StubResources(accounts=[ACCOUNT_B], deployments=[DEPLOYMENT_B]),
+    }
+    prompter = ScriptedPrompter(["all", "14", "later"])
+    config, readiness = configure(
+        prompter,
+        services=services(resources=lambda subscription: resources[subscription], subscriptions=options),
+    )
+    assert config.foundry.scope == "all_subscriptions"
+    assert [item.account for item in config.foundry.targets] == ["alpha-account", "beta-account"]
+    assert config.foundry.deployment_names == ["alpha-prod", "beta-prod"]
+    # Each account keeps its own subscription, region, and deployments.
+    assert [item.subscription_id for item in config.foundry.targets] == ["a" * 36, "b" * 36]
+    assert {item.deployment for item in readiness} == {"alpha-prod", "beta-prod"}
 
 
 def test_every_selected_deployment_gets_one_default_technical_workload(workspace):
     prompter = ScriptedPrompter(first_run_answers())
     config, _ = configure(prompter, services=services())
     technical = [item for item in config.workloads.identities if item.workload_scope == "technical"]
-    assert [item.workload_id for item in technical] == [
-        "deployment:reasoning-prod",
+    assert sorted(item.workload_id for item in technical) == [
         "deployment:coding-prod",
+        "deployment:compact-prod",
+        "deployment:reasoning-prod",
     ]
     assert all(item.configuration_status == "needs_configuration" for item in technical)
     assert not config.workloads.mappings
@@ -341,26 +449,7 @@ def test_every_selected_deployment_gets_one_default_technical_workload(workspace
 
 
 def test_optional_business_workload_enrichment_is_recorded(workspace):
-    answers = first_run_answers(workloads="yes") + [
-        "dedicated",
-        "Support assistant",
-        "agent",
-        "production",
-        "Handles tier-1 support",
-        "platform-team",
-        "CC-1234",
-        "high",
-        "shared",
-        "python",
-        "Coding agent",
-        "agent",
-        "production",
-        "",
-        "",
-        "",
-        "unknown",
-    ]
-    prompter = ScriptedPrompter(answers)
+    prompter = ScriptedPrompter(workload_answers(owner="platform-team", cost_center="CC-1234"))
     config, _ = configure(prompter, services=services())
     mappings = {item.id: item for item in config.workloads.mappings}
     assert mappings["support-assistant"].allocation == "dedicated"
@@ -369,6 +458,97 @@ def test_optional_business_workload_enrichment_is_recorded(workspace):
     # A shared deployment is told plainly that Azure Monitor cannot allocate it.
     assert any("This deployment is shared." in line for line in prompter.transcript)
     assert any("instrument_openai" in line for line in prompter.transcript)
+
+
+def test_an_unpriced_deployment_is_explained_rather_than_asked_about(workspace):
+    """Regression: the "N deployments have no exact rate. What next?" prompt is gone."""
+    prompter = ScriptedPrompter(first_run_answers())
+    _config, readiness = configure(prompter, services=services())
+    questions = [line for line in prompter.transcript if line.startswith("? ")]
+    assert not any("no exact rate" in line for line in questions)
+    assert not any("what next" in line.casefold() for line in questions)
+    assert any(item.state == "rate_unavailable" for item in readiness)
+    transcript = "\n".join(prompter.transcript)
+    # The reason, the continuation, and exactly one remediation command.
+    assert "no exact rate in the packaged verified catalog" in transcript
+    assert "cost is withheld for those deployments only" in transcript
+    assert transcript.count("tokenlens-azure pricing set-rate --model") == 1
+    assert f"--model {UNPRICED_MODEL}" in transcript
+    # A rate is never guessed, and public synchronization stays deferred.
+    assert "never guessed from a related model or family" in transcript
+    assert "Public pricing synchronization is deferred" in transcript
+
+
+def test_all_subscriptions_collect_every_account_in_one_run(workspace):
+    options = [
+        SubscriptionOption(subscription_id="a" * 36, name="Production Subscription"),
+        SubscriptionOption(subscription_id="b" * 36, name="Sandbox Subscription"),
+    ]
+    resources = {
+        "a" * 36: StubResources(accounts=[ACCOUNT_A], deployments=[DEPLOYMENT_A]),
+        "b" * 36: StubResources(accounts=[ACCOUNT_B], deployments=[DEPLOYMENT_B]),
+    }
+    service = services(
+        resources=lambda subscription: resources[subscription], subscriptions=options
+    )
+    config, _readiness = configure(ScriptedPrompter(["all", "14", "later"]), services=service)
+    summary, result = collect_and_report(
+        ScriptedPrompter([], interactive=False), config, services=service, open_report=False
+    )
+    assert summary.accounts == ["alpha-account", "beta-account"]
+    assert [item.deployment for item in summary.succeeded] == ["alpha-prod", "beta-prod"]
+    assert [item.account for item in summary.outcomes] == ["alpha-account", "beta-account"]
+    assert result is not None
+    assert sorted(item.summary.deployment_name for item in result.report.deployments) == [
+        "alpha-prod",
+        "beta-prod",
+    ]
+
+
+def test_one_unreadable_account_never_hides_the_others(workspace):
+    class Refusing(StubResources):
+        def list_metric_definitions(self, uri: str) -> list[dict]:
+            from tokenlens.foundry.monitor import AuthorizationError
+
+            raise AuthorizationError("Azure rejected the request for this resource.")
+
+    options = [
+        SubscriptionOption(subscription_id="a" * 36, name="Production Subscription"),
+        SubscriptionOption(subscription_id="b" * 36, name="Sandbox Subscription"),
+    ]
+    resources = {
+        "a" * 36: Refusing(accounts=[ACCOUNT_A], deployments=[DEPLOYMENT_A]),
+        "b" * 36: StubResources(accounts=[ACCOUNT_B], deployments=[DEPLOYMENT_B]),
+    }
+    service = services(
+        resources=lambda subscription: resources[subscription], subscriptions=options
+    )
+    config, _readiness = configure(ScriptedPrompter(["all", "14", "later"]), services=service)
+    summary = collect_deployments(config, services=service)
+    assert summary.status == "partial"
+    assert [item.deployment for item in summary.failed] == ["alpha-prod"]
+    assert summary.failed[0].error_category == "authorization"
+    assert [item.deployment for item in summary.succeeded] == ["beta-prod"]
+
+
+def test_an_account_without_deployments_is_named_and_skipped(workspace):
+    options = [
+        SubscriptionOption(subscription_id="a" * 36, name="Production Subscription"),
+        SubscriptionOption(subscription_id="b" * 36, name="Sandbox Subscription"),
+    ]
+    resources = {
+        "a" * 36: StubResources(accounts=[ACCOUNT_A], deployments=[]),
+        "b" * 36: StubResources(accounts=[ACCOUNT_B], deployments=[DEPLOYMENT_B]),
+    }
+    prompter = ScriptedPrompter(["all", "14", "later"])
+    config, _readiness = configure(
+        prompter,
+        services=services(resources=lambda subscription: resources[subscription], subscriptions=options),
+    )
+    assert [item.account for item in config.foundry.targets] == ["beta-account"]
+    assert config.configured is True
+    assert any("Accounts without deployments" in line for line in prompter.transcript)
+    assert "alpha-account" in prompter.transcript
 
 
 def test_noninteractive_configure_requires_explicit_values(workspace):
@@ -433,12 +613,72 @@ def test_v1_configuration_migrates_without_losing_unrelated_keys(workspace):
     assert config.foundry.deployment_names == ["reasoning-prod"]
     save_config(config, raw)
     written = yaml.safe_load(Path(".tokenlens.yml").read_text(encoding="utf-8"))
-    assert written["version"] == 2
+    assert written["version"] == 3
     assert written["analysis"] == {"redact_content": True}
     assert written["rules"] == {"TL001": {"enabled": True}}
     # The materiality key the analyzer reads is preserved beside the new keys.
     assert written["report"]["overview_min_impact_percent"] == 1.0
     assert written["report"]["format"] == "html"
+
+
+def test_v2_single_account_migrates_into_one_typed_account_target(workspace):
+    """Regression: a version 2 document keeps working after multi-account support."""
+    Path(".tokenlens.yml").write_text(
+        yaml.safe_dump(
+            {
+                "version": 2,
+                "foundry": {
+                    "subscription_id_env": "AZURE_SUBSCRIPTION_ID",
+                    "resource_group": "example-rg",
+                    "account": "example-foundry-account",
+                    "region": "East US 2",
+                    "deployments": [
+                        {"name": "reasoning-prod", "model": PRICED_MODEL, "sku": "GlobalStandard"}
+                    ],
+                },
+                "collection": {"lookback_days": 7, "analysis_goal": "workload_cost"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config, raw = load_config(None)
+    assert [item.account for item in config.foundry.targets] == ["example-foundry-account"]
+    assert config.foundry.targets[0].region == "East US 2"
+    assert config.foundry.targets[0].deployment_names == ["reasoning-prod"]
+    # A legacy analysis goal normalizes to the only supported mode.
+    assert config.collection.analysis_goal == "full_assessment"
+    save_config(config, raw)
+    written = yaml.safe_load(Path(".tokenlens.yml").read_text(encoding="utf-8"))
+    assert written["version"] == 3
+    assert written["foundry"]["accounts"][0]["account"] == "example-foundry-account"
+    assert written["foundry"]["accounts"][0]["deployments"][0]["name"] == "reasoning-prod"
+    assert written["collection"]["analysis_goal"] == "full_assessment"
+    # The version 2 flat block is still written for older readers.
+    assert written["foundry"]["account"] == "example-foundry-account"
+
+
+def test_a_multi_account_configuration_round_trips_without_storing_subscriptions(workspace):
+    prompter = ScriptedPrompter(["all", "14", "later"])
+    options = [
+        SubscriptionOption(subscription_id="a" * 36, name="Production Subscription"),
+        SubscriptionOption(subscription_id="b" * 36, name="Sandbox Subscription"),
+    ]
+    resources = {
+        "a" * 36: StubResources(accounts=[ACCOUNT_A], deployments=[DEPLOYMENT_A]),
+        "b" * 36: StubResources(accounts=[ACCOUNT_B], deployments=[DEPLOYMENT_B]),
+    }
+    configure(
+        prompter,
+        services=services(resources=lambda subscription: resources[subscription], subscriptions=options),
+    )
+    document = Path(".tokenlens.yml").read_text(encoding="utf-8")
+    assert "a" * 36 not in document and "b" * 36 not in document
+    reloaded, _raw = load_config(None)
+    assert [item.account for item in reloaded.foundry.targets] == ["alpha-account", "beta-account"]
+    # The per-account subscription is restored from the user-local map.
+    assert [item.subscription_id for item in reloaded.foundry.targets] == ["a" * 36, "b" * 36]
+    assert reloaded.foundry.scope == "all_subscriptions"
+    assert reloaded.configured is True
 
 
 def test_migration_is_pure_and_leaves_the_source_mapping_untouched():
@@ -447,6 +687,7 @@ def test_migration_is_pure_and_leaves_the_source_mapping_untouched():
     assert original["foundry"]["deployments"] == ["a"]
     assert migrated["foundry"]["deployments"] == [{"name": "a"}]
     assert migrated["collection"]["lookback_days"] == 7
+    assert migrated["collection"]["analysis_goal"] == "full_assessment"
 
 
 def test_saved_configuration_contains_no_credential_material(workspace):
@@ -476,12 +717,12 @@ def configured(workspace, *, answers=None, service=None):
 
 
 def test_collection_isolates_one_deployment_failure_from_the_others(workspace):
-    config = configured(workspace, answers=first_run_answers(("reasoning-prod", "coding-prod", "compact-prod")))
+    config = configured(workspace)
     service = services(collect=collector(failing={"compact-prod"}))
     prompter = ScriptedPrompter([], interactive=False)
     summary, result = collect_and_report(prompter, config, services=service, open_report=False)
     assert summary.status == "partial"
-    assert [item.deployment for item in summary.succeeded] == ["reasoning-prod", "coding-prod"]
+    assert [item.deployment for item in summary.succeeded] == ["coding-prod", "reasoning-prod"]
     failed = summary.failed[0]
     assert failed.deployment == "compact-prod"
     assert failed.error_category == "metric_unavailable"
@@ -491,22 +732,62 @@ def test_collection_isolates_one_deployment_failure_from_the_others(workspace):
 
 def test_zero_successes_are_never_described_as_a_successful_collection(workspace):
     config = configured(workspace)
-    service = services(collect=collector(failing={"reasoning-prod", "coding-prod"}))
+    service = services(collect=collector(failing=set(ALL_DEPLOYMENTS)))
     prompter = ScriptedPrompter([], interactive=False)
     summary, result = collect_and_report(prompter, config, services=service, open_report=False)
     assert summary.status == "failed"
     assert result is None
 
 
-def test_refresh_is_idempotent_and_writes_no_duplicate_buckets(workspace):
+def test_each_run_writes_its_own_isolated_telemetry_directory(workspace):
     config = configured(workspace)
     service = services()
     prompter = ScriptedPrompter([], interactive=False)
     first, _ = collect_and_report(prompter, config, services=service, open_report=False)
     second, _ = collect_and_report(prompter, config, services=service, open_report=False)
-    assert first.records_written == 8
-    assert second.records_written == 0
-    assert second.duplicates_skipped >= 8
+    # Each run is a complete, self-contained snapshot of the window.
+    assert first.records_written == 12
+    assert second.records_written == 12
+    assert first.duplicates_skipped == 0 and second.duplicates_skipped == 0
+    assert first.run_dir != second.run_dir
+    base = Path("local-traces/foundry-metrics")
+    # Nothing is written to the base directory any more, and the previous run
+    # is still on disk: history is preserved, never merged or deleted.
+    assert not list(base.glob("*.jsonl"))
+    runs = sorted(item.name for item in (base / "runs").iterdir())
+    assert len(runs) == 2
+    assert all(list((base / "runs" / name).glob("*.jsonl")) for name in runs)
+
+
+def test_a_refreshed_run_never_reads_a_previous_runs_files(workspace):
+    """Regression: stale `unknown` slices must not re-enter a fresh report."""
+    config = configured(workspace)
+    prompter = ScriptedPrompter([], interactive=False)
+    first, _ = collect_and_report(prompter, config, services=services(), open_report=False)
+    stale = Path(first.run_dir)
+    # Simulate an older run whose identity was never resolved.
+    (stale / "tokenlens-2026-08-01.jsonl").write_text(
+        json.dumps(
+            {
+                "record_type": "foundry_metric_bucket",
+                "event_id": "stale-unknown-bucket",
+                "timestamp": "2026-08-01T00:00:00Z",
+                "deployment_name": "unknown",
+                "model_name": "unknown",
+                "deployment_mode": "global",
+                "metrics": {"input_tokens": 10, "output_tokens": 2, "requests": 1},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _summary, result = collect_and_report(
+        prompter, config, services=services(), open_report=False
+    )
+    assert result is not None
+    names = {item.summary.deployment_name for item in result.report.deployments}
+    assert names == set(ALL_DEPLOYMENTS)
+    assert "unknown" not in names
 
 
 def test_a_stale_deployment_is_reported_rather_than_failing_opaquely(workspace):
@@ -518,32 +799,17 @@ def test_a_stale_deployment_is_reported_rather_than_failing_opaquely(workspace):
     )
     summary = collect_deployments(config, services=services(resources=shrunk))
     statuses = {item.deployment: item.status for item in summary.outcomes}
-    assert statuses == {"reasoning-prod": "succeeded", "coding-prod": "skipped"}
+    assert statuses == {
+        "reasoning-prod": "succeeded",
+        "coding-prod": "skipped",
+        "compact-prod": "skipped",
+    }
     skipped = next(item for item in summary.outcomes if item.status == "skipped")
     assert skipped.error_category == "deployment_not_found"
 
 
 def test_only_a_dedicated_deployment_is_tagged_on_an_aggregate_bucket(workspace):
-    answers = first_run_answers(workloads="yes") + [
-        "dedicated",
-        "Support assistant",
-        "agent",
-        "production",
-        "",
-        "",
-        "",
-        "unknown",
-        "shared",
-        "python",
-        "Coding agent",
-        "agent",
-        "production",
-        "",
-        "",
-        "",
-        "unknown",
-    ]
-    config = configured(workspace, answers=answers)
+    config = configured(workspace, answers=workload_answers())
     assignments = dedicated_workload_assignments(config)
     assert assignments == {"reasoning-prod": "Support assistant"}
     fake = collector()
@@ -581,26 +847,7 @@ def test_report_is_generated_and_opened_in_one_run(workspace):
 
 
 def test_the_report_shows_cost_by_workload_and_an_unassigned_row(workspace):
-    answers = first_run_answers(workloads="yes") + [
-        "dedicated",
-        "Support assistant",
-        "agent",
-        "production",
-        "",
-        "",
-        "",
-        "unknown",
-        "shared",
-        "python",
-        "Coding agent",
-        "agent",
-        "production",
-        "",
-        "",
-        "",
-        "unknown",
-    ]
-    config = configured(workspace, answers=answers)
+    config = configured(workspace, answers=workload_answers())
     prompter = ScriptedPrompter([], interactive=False)
     _summary, result = collect_and_report(prompter, config, services=services(), open_report=False)
     assert result is not None
@@ -632,8 +879,9 @@ def test_run_state_stores_no_identifier_path_or_secret(workspace):
     prompter = ScriptedPrompter([], interactive=False)
     summary, result = collect_and_report(prompter, config, services=services(), open_report=False)
     state = load_run_state()
-    assert state.successful_deployments == 2
+    assert state.successful_deployments == 3
     assert state.failed_deployments == 0
+    assert state.accounts_collected == 1
     assert state.collection_status == "succeeded"
     payload = json.dumps(state.model_dump(mode="json"))
     assert SUBSCRIPTION not in payload
@@ -641,10 +889,13 @@ def test_run_state_stores_no_identifier_path_or_secret(workspace):
     assert "services.ai.azure.com" not in payload
     assert str(workspace) not in payload
     assert state.report is not None and state.report.startswith("reports/")
+    # The run directory is remembered as a safe relative path.
+    assert state.run_directory is not None
+    assert state.run_directory.startswith("local-traces/foundry-metrics/runs/run-")
 
 
 def test_run_state_reports_partial_and_failed_collections_honestly(workspace):
-    config = configured(workspace, answers=first_run_answers(("reasoning-prod", "coding-prod", "compact-prod")))
+    config = configured(workspace)
     summary = collect_deployments(config, services=services(collect=collector(failing={"compact-prod"})))
     state = run_state_from(summary, None, now=lambda: datetime(2026, 9, 15, tzinfo=UTC))
     assert state.collection_status == "partial"

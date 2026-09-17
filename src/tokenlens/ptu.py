@@ -46,7 +46,10 @@ EligibilityStatus = Literal[
 ELIGIBILITY_STATUS_LABELS: dict[str, str] = {
     "eligible_sufficient_evidence": "Eligible and sufficient evidence",
     "eligible_insufficient_evidence": "Eligible but insufficient evidence",
-    "model_capacity_unavailable": "Model capacity unavailable",
+    # "Capacity data required" is deliberate: the model is supported by Azure,
+    # but this exact model and version is absent from the verified PTU capacity
+    # catalog, which is a data gap in TokenLens rather than a product verdict.
+    "model_capacity_unavailable": "Capacity data required",
     "ptu_not_applicable": "PTU not applicable",
     "pricing_unavailable": "Pricing unavailable",
     "deployment_mode_unavailable": "Deployment mode unavailable",
@@ -254,8 +257,11 @@ class PtuDeploymentAssessment(BaseModel):
         "Borderline",
         "PAYG recommended",
         "Insufficient evidence",
-        "Model not supported",
+        # No exact capacity row exists for this model and version. That is a
+        # missing input, never a claim that Azure does not support the model.
+        "Capacity data required",
         "PTU not applicable",
+        "Collection identity error",
     ]
     economic_result: Literal["PTU lower", "PAYG lower", "Unavailable"]
     data_points: int = Field(ge=0)
@@ -612,11 +618,26 @@ def _dimensions(
     return [workload, pressure, latency, predictability], metrics
 
 
-def _recommendation(dimensions: list[PtuDimension], eligible: bool, publisher: str | None) -> str:
+def _recommendation(
+    dimensions: list[PtuDimension],
+    eligible: bool,
+    publisher: str | None,
+    *,
+    identity_resolved: bool = True,
+) -> str:
+    """Name the *actual* blocker. Nothing here implies an unsupported product.
+
+    * an unresolved identity is a collection problem, not a model problem;
+    * a partner/marketplace/CCU-billed model has no Azure PTU capacity purchase
+      at all, so PTU is categorically not applicable to it;
+    * a first-party model with no exact capacity row is a missing-data state.
+    """
+    if not identity_resolved:
+        return "Collection identity error"
     if not eligible:
         if publisher and publisher != "microsoft":
             return "PTU not applicable"
-        return "Model not supported"
+        return "Capacity data required"
     if sum(item.verdict == "insufficient" for item in dimensions) >= 2:
         return "Insufficient evidence"
     positives = sum(item.verdict == "positive" for item in dimensions)
@@ -941,7 +962,7 @@ _STATE_SUMMARIES: dict[str, str] = {
     "collection_identity_error": "The collected telemetry does not identify the deployment's exact model, so no capacity, pricing, or workload conclusion can be drawn.",
     "insufficient_evidence": "The observed window cannot support a PTU recommendation yet.",
     "pricing_unavailable": "Workload evidence exists, but exact PAYG pricing is required before the economics can be calculated.",
-    "ptu_not_applicable": "This model is billed through Foundry's partner/consumption offer; Azure PTU capacity purchasing does not apply.",
+    "ptu_not_applicable": "This is a partner/Marketplace model billed per token or in provider credit units (CCUs); Azure PTU capacity cannot be purchased for it.",
     "capacity_unavailable": "Exact PTU capacity for this model and version is unavailable, so dedicated capacity cannot be sized.",
 }
 
@@ -1424,7 +1445,9 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
         capacity,
         outcomes=outcomes if aggregate is not None else None,
     )
-    recommendation = _recommendation(dimensions, capacity is not None, publisher)
+    recommendation = _recommendation(
+        dimensions, capacity is not None, publisher, identity_resolved=identity_resolved
+    )
     average_tpm = mean(tpm) if tpm else 0
     p95_tpm = _percentile(tpm, 95)
     total_tokens = sum(record.usage.input_tokens + record.usage.output_tokens for record in filtered_records)
@@ -1441,7 +1464,10 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
     throughput_series = None
     cost_curve = None
     economic_result: Literal["PTU lower", "PAYG lower", "Unavailable"] = "Unavailable"
-    note = "Exact supported model capacity is required for PTU sizing."
+    note = (
+        "Exact PTU capacity for this model and version is not in TokenLens's verified capacity "
+        "catalog, so dedicated capacity cannot be sized."
+    )
 
     mode = summary.deployment_mode.casefold()
     # Sufficiency is measured in *active* buckets. A window padded with silent
@@ -1578,8 +1604,10 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
         )
     elif eligibility_status == "ptu_not_applicable":
         note = (
-            f"{publisher.title() if publisher else 'This publisher'}'s models are billed through Foundry's "
-            "consumption/marketplace offer; Azure PTU capacity purchasing does not apply to this model."
+            f"{publisher.title() if publisher else 'This publisher'}'s models are served through Foundry as "
+            "partner/Marketplace models billed per token or in provider credit units (Anthropic CCUs); "
+            "Azure PTU capacity is a first-party purchase that cannot be bought for them, so no PTU "
+            "recommendation, sizing, or break-even is produced."
         )
     elif eligibility_status == "eligible_insufficient_evidence" or not sufficient_evidence:
         note = (
@@ -1699,7 +1727,13 @@ def analyze_ptu(
         borderline_deployments=sum(item.recommendation == "Borderline" for item in assessments),
         payg_deployments=sum(item.recommendation == "PAYG recommended" for item in assessments),
         insufficient_deployments=sum(
-            item.recommendation in {"Insufficient evidence", "Model not supported", "PTU not applicable"}
+            item.recommendation
+            in {
+                "Insufficient evidence",
+                "Capacity data required",
+                "PTU not applicable",
+                "Collection identity error",
+            }
             for item in assessments
         ),
         deployments=assessments,

@@ -15,7 +15,7 @@ import os
 import re
 import shutil
 import subprocess
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from ..pricing import canonical_model_name, infer_publisher
 from .models import (
@@ -32,7 +32,9 @@ __all__ = [
     "anthropic_base_url",
     "deployment_mode_for_sku",
     "discover_accounts",
+    "discover_accounts_in_scope",
     "discover_deployments",
+    "discover_inventory",
     "inference_api_for_family",
     "list_subscriptions",
     "metrics_endpoint_for_region",
@@ -199,6 +201,7 @@ def discover_accounts(
     subscription_id: str,
     *,
     resource_group: str | None = None,
+    subscription_name: str = "",
 ) -> list[AccountOption]:
     """List only Foundry/Azure OpenAI accounts in the selected subscription."""
     options: list[AccountOption] = []
@@ -212,9 +215,55 @@ def discover_accounts(
                 resource_group=str(account.get("resource_group") or resource_group or ""),
                 location=str(account.get("location") or ""),
                 kind=kind,
+                subscription_id=subscription_id,
+                subscription_name=subscription_name,
             )
         )
     return sorted(options, key=lambda item: (item.name.casefold(), item.resource_group.casefold()))
+
+
+def discover_accounts_in_scope(
+    client_factory: Callable[[str], Any],
+    subscriptions: Sequence[SubscriptionOption] | Sequence[str],
+    *,
+    resource_group: str | None = None,
+    on_subscription: Callable[[str, int], None] | None = None,
+    on_error: Callable[[str, Exception], None] | None = None,
+) -> list[AccountOption]:
+    """Discover Foundry accounts across every subscription in scope.
+
+    One unreadable subscription never hides the rest: the failure is reported
+    through ``on_error`` and discovery continues. Accounts are returned for
+    *all* subscriptions, never just the first one that answered.
+    """
+    discovered: list[AccountOption] = []
+    seen: set[tuple[str, str, str]] = set()
+    for entry in subscriptions:
+        subscription_id = entry if isinstance(entry, str) else entry.subscription_id
+        name = "" if isinstance(entry, str) else entry.display_name
+        try:
+            found = discover_accounts(
+                client_factory(subscription_id),
+                subscription_id,
+                resource_group=resource_group,
+                subscription_name=name,
+            )
+        except Exception as exc:  # noqa: BLE001 - one subscription never blocks the rest
+            if on_error is not None:
+                on_error(subscription_id, exc)
+            continue
+        for account in found:
+            key = (account.subscription_id, account.resource_group.casefold(), account.name.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            discovered.append(account)
+        if on_subscription is not None:
+            on_subscription(subscription_id, len(found))
+    return sorted(
+        discovered,
+        key=lambda item: (item.subscription_name.casefold(), item.name.casefold(), item.resource_group.casefold()),
+    )
 
 
 def enrich_deployment(raw: dict[str, Any]) -> DeploymentRecord:
@@ -302,3 +351,35 @@ def selected_deployments(
         else:
             resolved.append(match)
     return resolved, missing
+
+
+def discover_inventory(
+    client_factory: Callable[[str], Any],
+    accounts: Sequence[AccountOption],
+    *,
+    on_account: Callable[[AccountOption, int], None] | None = None,
+    on_error: Callable[[AccountOption, Exception], None] | None = None,
+) -> list[tuple[AccountOption, list[DeploymentRecord]]]:
+    """Discover every deployment in every account in scope.
+
+    The whole inventory is returned per account, so nothing is silently dropped
+    and a later selection step never has to guess which account a deployment
+    belongs to.
+    """
+    inventory: list[tuple[AccountOption, list[DeploymentRecord]]] = []
+    for account in accounts:
+        try:
+            records = discover_deployments(
+                client_factory(account.subscription_id),
+                account.subscription_id,
+                account.resource_group,
+                account.name,
+            )
+        except Exception as exc:  # noqa: BLE001 - one account never blocks the rest
+            if on_error is not None:
+                on_error(account, exc)
+            continue
+        inventory.append((account, records))
+        if on_account is not None:
+            on_account(account, len(records))
+    return inventory

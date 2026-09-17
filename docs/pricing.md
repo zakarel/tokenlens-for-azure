@@ -94,6 +94,21 @@ separate states, because they are separate problems:
 
 `unknown` is never offered as a pricing override key.
 
+The guided workflow never asks what to do about an unresolved rate. There is
+only one safe answer, so it states the reason, continues the full assessment
+with cost withheld for those deployments only, and prints one remediation
+command:
+
+```text
+1 deployment(s) have no exact rate in the packaged verified catalog or your
+customer catalog for that exact model, version, and deployment mode.
+The full assessment continues: usage, throughput, and PTU evidence are
+collected, and cost is withheld for those deployments only. A rate is never
+guessed from a related model or family.
+To add a contracted rate: tokenlens-azure pricing set-rate --model ministral-3b
+  --input-per-million X --output-per-million Y --effective-from YYYY-MM-DD
+```
+
 ## What the report shows
 
 Cost analysis renders one decision state, its impact, and one action. The

@@ -7,29 +7,31 @@ command actually contacts Azure.
 from __future__ import annotations
 
 from .models import (
-    ANALYSIS_GOALS,
     LOOKBACK_CHOICES,
     AccountOption,
     CollectionSummary,
     DeploymentOutcome,
     DeploymentRecord,
+    FoundryAccountTarget,
     FoundryWorkflowConfig,
     NoninteractiveError,
     RunState,
     SubscriptionOption,
+    TargetScope,
     WorkflowError,
 )
 
 __all__ = [
-    "ANALYSIS_GOALS",
     "AccountOption",
     "CollectionSummary",
     "DeploymentOutcome",
     "DeploymentRecord",
+    "FoundryAccountTarget",
     "FoundryWorkflowConfig",
     "LOOKBACK_CHOICES",
     "NoninteractiveError",
     "RunState",
     "SubscriptionOption",
+    "TargetScope",
     "WorkflowError",
 ]

@@ -622,7 +622,14 @@ def collect_metrics(
                 # same window produces identical identifiers, so an import can
                 # detect and drop duplicates.
                 event_id=deterministic_event_id(
-                    "azure_monitor", stamp.isoformat(), deployment, model_name, model_version
+                    "azure_monitor",
+                    subscription_id,
+                    resource_group,
+                    account,
+                    stamp.isoformat(),
+                    deployment,
+                    model_name,
+                    model_version,
                 ),
                 timestamp=stamp,
                 bucket_minutes=window.granularity_minutes,

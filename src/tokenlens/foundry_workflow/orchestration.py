@@ -33,6 +33,7 @@ from .models import (
     CollectionSummary,
     DeploymentOutcome,
     DeploymentRecord,
+    FoundryAccountTarget,
     FoundryWorkflowConfig,
     RunState,
     WorkflowError,
@@ -49,6 +50,7 @@ __all__ = [
     "generate_report",
     "install_command",
     "missing_collector_packages",
+    "run_directory",
     "run_state_from",
 ]
 
@@ -201,7 +203,7 @@ def dedicated_workload_assignments(config: FoundryWorkflowConfig) -> dict[str, s
                 dedicated[key] = mapping.name
             else:
                 shared.add(key)
-    for deployment in config.foundry.deployments:
+    for deployment in config.foundry.all_deployments:
         key = canonical_workload_id(deployment.name)
         if key in shared:
             continue
@@ -222,6 +224,57 @@ def _readiness_by_deployment(
     }
 
 
+def run_directory(config: FoundryWorkflowConfig, *, now: datetime, base: Path | None = None) -> tuple[Path, str]:
+    """Return the directory this run writes to, plus its run identifier.
+
+    Every guided run is isolated in ``<output_dir>/runs/run-<UTC stamp>``. The
+    report is then built from that directory alone, so a stale file left in the
+    base directory by an earlier run can never re-enter a fresh report. Nothing
+    is ever deleted: historical runs stay exactly where they were written.
+    """
+    root = Path(base if base is not None else config.collection.output_dir)
+    if not config.collection.isolate_runs:
+        return root, ""
+    stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+    candidate = root / "runs" / f"run-{stamp}"
+    suffix = 2
+    while candidate.exists():
+        candidate = root / "runs" / f"run-{stamp}-{suffix}"
+        suffix += 1
+    return candidate, candidate.name
+
+
+def _ensure_private_directory(path: Path) -> None:
+    """Create a directory chain that only the current user can read.
+
+    Only levels this call creates are tightened; an existing directory's
+    permissions are never changed underneath the user.
+    """
+    current = Path(path.anchor) if path.anchor else Path()
+    for part in path.parts[1:] if path.anchor else path.parts:
+        current = current / part
+        if current.exists():
+            continue
+        current.mkdir(mode=0o700)
+
+
+def _account_targets(
+    config: FoundryWorkflowConfig,
+    deployments: Sequence[DeploymentRecord] | None,
+) -> list[FoundryAccountTarget]:
+    """Every configured account, optionally narrowed to explicit deployments."""
+    targets = config.foundry.targets
+    if deployments is None:
+        return targets
+    wanted = {item.name.casefold() for item in deployments}
+    narrowed: list[FoundryAccountTarget] = []
+    for target in targets:
+        selected = [item for item in target.deployments if item.name.casefold() in wanted]
+        if selected:
+            narrowed.append(target.model_copy(update={"deployments": selected}))
+    return narrowed
+
+
 def collect_deployments(
     config: FoundryWorkflowConfig,
     *,
@@ -230,18 +283,19 @@ def collect_deployments(
     progress: Callable[[str, str], None] | None = None,
     customer_catalog: PricingCatalog | None = None,
 ) -> CollectionSummary:
-    """Collect Azure Monitor aggregates for each selected deployment.
+    """Collect Azure Monitor aggregates for every selected deployment.
 
-    One deployment's failure never stops the others. The exit status is derived
-    from the outcomes: ``failed`` when nothing succeeded, ``partial`` when some
-    did, ``succeeded`` when all did.
+    Accounts are collected in order, and one deployment's — or one account's —
+    failure never stops the others. The exit status is derived from the
+    outcomes: ``failed`` when nothing succeeded, ``partial`` when some did,
+    ``succeeded`` when all did.
     """
     services = services or WorkflowServices()
-    target = config.foundry
-    selected = list(deployments if deployments is not None else target.deployments)
-    if not selected:
+    targets = _account_targets(config, deployments)
+    if not targets or not any(target.deployments for target in targets):
         raise WorkflowError("No deployment is selected. Run `tokenlens-azure foundry configure` first.")
-    if not (target.subscription_id and target.resource_group and target.account):
+    incomplete = [target for target in targets if not (target.subscription_id and target.resource_group and target.account)]
+    if incomplete:
         raise WorkflowError(
             "The subscription, resource group, and account must be configured before collection."
         )
@@ -253,14 +307,92 @@ def collect_deployments(
             + f"). Install them with: {install_command()}"
         )
 
-    from ..foundry.monitor import CollectionWindow, resource_uri
+    from ..foundry.monitor import CollectionWindow
 
-    resources = services.resource_client(target.subscription_id)
-    account_metadata = resources.get_account(target.resource_group, target.account)
-    region = str(account_metadata.get("location") or target.region or "")
-    endpoint = discovery.metrics_endpoint_for_region(region, override=target.metrics_endpoint)
-    uri = resource_uri(target.subscription_id, target.resource_group, target.account)
-    available = list(resources.list_metric_definitions(uri))
+    started = services.now()
+    window = CollectionWindow.for_days(config.collection.lookback_days, now=started)
+    assignments = dedicated_workload_assignments(config)
+    destination, run_id = run_directory(config, now=started)
+    _ensure_private_directory(destination)
+    writer = TelemetryWriter(TelemetryConfig.from_env(output_dir=destination))
+    summary = CollectionSummary(
+        lookback_days=config.collection.lookback_days,
+        window_start=window.start.isoformat().replace("+00:00", "Z"),
+        window_end=window.end.isoformat().replace("+00:00", "Z"),
+        output_dir=safe_display_path(config.collection.output_dir),
+        run_dir=str(destination),
+        run_id=run_id,
+        accounts=[target.account for target in targets],
+    )
+    order = [
+        f"{target.account}/{item.name}"
+        for target in targets
+        for item in target.deployments
+    ]
+    for target in targets:
+        _collect_account(
+            target,
+            config=config,
+            services=services,
+            window=window,
+            assignments=assignments,
+            customer_catalog=customer_catalog,
+            writer=writer,
+            summary=summary,
+            progress=progress,
+        )
+    summary.outcomes.sort(
+        key=lambda item: order.index(item.key) if item.key in order else len(order)
+    )
+    summary.unresolved_pricing = [
+        item.deployment
+        for item in summary.outcomes
+        if item.status == "succeeded" and item.pricing_status not in {"exact_public_rate", "customer_override"}
+    ]
+    return summary
+
+
+def _collect_account(
+    target: FoundryAccountTarget,
+    *,
+    config: FoundryWorkflowConfig,
+    services: WorkflowServices,
+    window: Any,
+    assignments: dict[str, str],
+    customer_catalog: PricingCatalog | None,
+    writer: TelemetryWriter,
+    summary: CollectionSummary,
+    progress: Callable[[str, str], None] | None,
+) -> None:
+    """Collect one account's deployments into the shared run summary."""
+    from ..foundry.monitor import resource_uri
+
+    selected = list(target.deployments)
+    try:
+        resources = services.resource_client(target.subscription_id)
+        account_metadata = resources.get_account(target.resource_group, target.account)
+        region = str(account_metadata.get("location") or target.region or "")
+        endpoint = discovery.metrics_endpoint_for_region(region, override=target.metrics_endpoint)
+        uri = resource_uri(target.subscription_id, target.resource_group, target.account)
+        available = list(resources.list_metric_definitions(uri))
+    except Exception as exc:  # noqa: BLE001 - one account never hides the others
+        category, message = _classify(exc)
+        for deployment in selected:
+            if progress is not None:
+                progress(deployment.name, "failed")
+            summary.outcomes.append(
+                DeploymentOutcome(
+                    deployment=deployment.name,
+                    account=target.account,
+                    resource_group=target.resource_group,
+                    status="failed",
+                    error_category=category,
+                    message=message,
+                    identity_resolved=bool(deployment.model),
+                )
+            )
+        return
+
     inventory = [
         {"name": item.name, "model": item.model, "model_version": item.model_version, "sku": item.sku}
         for item in target.deployments
@@ -269,27 +401,18 @@ def collect_deployments(
     # rather than failing later as an opaque empty metric response.
     stale: set[str] = set()
     try:
-        live = {item.name.casefold() for item in discovery.discover_deployments(
-            resources, target.subscription_id, target.resource_group, target.account
-        )}
+        live = {
+            item.name.casefold()
+            for item in discovery.discover_deployments(
+                resources, target.subscription_id, target.resource_group, target.account
+            )
+        }
     except Exception:  # noqa: BLE001 - discovery is best effort, never fatal
         live = set()
     if live:
         stale = {item.name for item in selected if item.name.casefold() not in live}
         selected = [item for item in selected if item.name not in stale]
-    window = CollectionWindow.for_days(config.collection.lookback_days, now=services.now())
-    assignments = dedicated_workload_assignments(config)
     readiness = _readiness_by_deployment(selected, customer_catalog=customer_catalog)
-
-    writer = TelemetryWriter(
-        TelemetryConfig.from_env(output_dir=Path(config.collection.output_dir))
-    )
-    summary = CollectionSummary(
-        lookback_days=config.collection.lookback_days,
-        window_start=window.start.isoformat().replace("+00:00", "Z"),
-        window_end=window.end.isoformat().replace("+00:00", "Z"),
-        output_dir=safe_display_path(config.collection.output_dir),
-    )
 
     def _collect_one(deployment: DeploymentRecord) -> tuple[DeploymentRecord, Any, Exception | None]:
         try:
@@ -318,18 +441,19 @@ def collect_deployments(
             # must never be reported as a per-deployment collection failure.
             return deployment, None, exc
 
-    workers = max(1, min(int(config.collection.max_concurrency), len(selected)))
+    workers = max(1, min(int(config.collection.max_concurrency), len(selected) or 1))
     if workers == 1:
         results = [_collect_one(deployment) for deployment in selected]
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             results = list(pool.map(_collect_one, selected))
 
-    order = [entry.name for entry in target.deployments]
     for name in sorted(stale):
         summary.outcomes.append(
             DeploymentOutcome(
                 deployment=name,
+                account=target.account,
+                resource_group=target.resource_group,
                 status="skipped",
                 error_category="deployment_not_found",
                 message=(
@@ -349,6 +473,8 @@ def collect_deployments(
             summary.outcomes.append(
                 DeploymentOutcome(
                     deployment=deployment.name,
+                    account=target.account,
+                    resource_group=target.resource_group,
                     status="failed",
                     error_category=category,
                     message=message,
@@ -365,6 +491,8 @@ def collect_deployments(
             summary.outcomes.append(
                 DeploymentOutcome(
                     deployment=deployment.name,
+                    account=target.account,
+                    resource_group=target.resource_group,
                     status="failed",
                     error_category="file_write_failed",
                     message="The collected records could not be written to the output directory.",
@@ -389,6 +517,8 @@ def collect_deployments(
         summary.outcomes.append(
             DeploymentOutcome(
                 deployment=deployment.name,
+                account=target.account,
+                resource_group=target.resource_group,
                 status="succeeded",
                 identity_resolved=any(
                     record.model_name not in {"", "unknown"} for record in result.records
@@ -406,10 +536,6 @@ def collect_deployments(
                 duplicates_skipped=duplicates,
             )
         )
-    summary.outcomes.sort(
-        key=lambda item: order.index(item.deployment) if item.deployment in order else len(order)
-    )
-    return summary
 
 
 def _family_for(deployment: DeploymentRecord) -> str:
@@ -471,6 +597,10 @@ def generate_report(
         raise WorkflowError(
             "No telemetry was found to analyze. Run `tokenlens-azure foundry collect` first."
         )
+    # The provenance line states how many files were actually read, not how
+    # many directories were named, so a run-scoped report never over- or
+    # under-states its evidence.
+    file_count = len([part for part in str(source).split(",") if part.strip()]) or len(sources)
     catalog = customer_catalog if customer_catalog is not None else load_customer_catalog()
     reference = load_bundled_reference_catalog() if config.pricing.use_reference_catalog else None
     task_events = _load_task_events(config)
@@ -482,12 +612,12 @@ def generate_report(
     )
     report = analyze(
         records,
-        f"{len(sources)} local telemetry source" + ("" if len(sources) == 1 else "s"),
+        f"{file_count} local telemetry file" + ("" if file_count == 1 else "s"),
         customer_catalog=catalog,
         reference_catalog=reference,
         use_bundled_reference=config.pricing.use_reference_catalog,
         data_classification="local_real",
-        source_files=len(sources),
+        source_files=file_count,
         workload_mappings=list(config.workloads.mappings),
         workload_identities=identities,
         task_events=task_events or None,
@@ -523,6 +653,7 @@ def run_state_from(
         lookback_days=summary.lookback_days,
         successful_deployments=len(summary.succeeded),
         failed_deployments=len(summary.failed),
+        accounts_collected=len(summary.accounts),
         identity_coverage_percent=(
             portfolio.technical_workload_coverage_percent if portfolio is not None else 0.0
         ),
@@ -545,5 +676,6 @@ def run_state_from(
         ),
         report=result.display_path if result is not None else None,
         report_generated_at=stamp if result is not None else None,
+        run_directory=safe_display_path(summary.run_dir) if summary.run_dir else None,
         collection_status=summary.status,
     )

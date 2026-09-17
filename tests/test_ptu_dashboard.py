@@ -290,8 +290,59 @@ def test_partner_model_renders_ptu_not_applicable_without_a_curve():
     assert data.summary.total_tokens is not None
     rendered = report_html(report)
     assert "PTU Not Applicable" in rendered
-    assert "consumption/marketplace offer" in rendered
+    assert "partner/Marketplace model billed per token or in provider credit units" in rendered
+    # A partner model is never described as an unsupported model.
+    assert "Model not supported" not in rendered
     assert "ptu-cost-explorer" not in rendered
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["claude-opus-5-test-synthetic", "ministral-3b-test-synthetic"],
+)
+def test_partner_and_marketplace_models_report_ptu_not_applicable(model):
+    """Anthropic CCU and Mistral Marketplace billing have no Azure PTU purchase."""
+    records = [
+        request_record(
+            timestamp=datetime(2026, 9, 10, tzinfo=UTC) + timedelta(minutes=5 * index),
+            deployment=f"{model}-prod",
+            model=model,
+        )
+        for index in range(MINIMUM_ACTIVE_BUCKETS + 10)
+    ]
+    report = analyze(records, "partner", generated_at="2026-09-14T13:00:00Z")
+    assessment = report.ptu_analysis.deployments[0]
+    assert assessment.eligibility_status == "ptu_not_applicable"
+    assert assessment.recommendation == "PTU not applicable"
+    assert assessment.suggested_ptu is None
+    # Sufficient evidence never turns an inapplicable purchase into a number.
+    assert assessment.dashboard.summary.state == "ptu_not_applicable"
+    assert "provider credit units" in assessment.note
+    assert "Model not supported" not in assessment.note
+
+
+def test_a_model_absent_from_the_capacity_catalog_asks_for_capacity_data():
+    """A first-party model with no exact capacity row is a data gap, not a verdict."""
+    model = "gpt-5.6-luna-test-synthetic"
+    records = [
+        request_record(
+            timestamp=datetime(2026, 9, 10, tzinfo=UTC) + timedelta(minutes=5 * index),
+            deployment="luna-prod",
+            model=model,
+        )
+        for index in range(MINIMUM_ACTIVE_BUCKETS + 10)
+    ]
+    report = analyze(records, "capacity", generated_at="2026-09-14T13:00:00Z")
+    assessment = report.ptu_analysis.deployments[0]
+    assert assessment.eligibility_status == "model_capacity_unavailable"
+    assert assessment.recommendation == "Capacity data required"
+    assert assessment.recommendation != "Model not supported"
+    assert assessment.dashboard.summary.state == "capacity_unavailable"
+    assert "verified capacity catalog" in assessment.note
+    rendered = report_html(report)
+    assert "Capacity data required" in rendered
+    assert "PTU not applicable" not in rendered
+    assert "Model not supported" not in rendered
 
 
 def test_pricing_required_state_keeps_tokens_and_draws_no_zero_dollar_bars():
