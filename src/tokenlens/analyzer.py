@@ -24,6 +24,13 @@ from .ptu import analyze_ptu
 from .reference import load_bundled_reference_catalog
 from .tasks import reconstruct_tasks
 from .rules import RULES, evaluate_rules
+from .workloads import (
+    WorkloadIdentity,
+    WorkloadMapping,
+    build_portfolio,
+    merge_identities,
+    task_metrics_by_workload,
+)
 
 
 DEFAULT_REPORT_CONFIG = {
@@ -395,6 +402,9 @@ def analyze(
     mixed_source_policy: str = "reject",
     data_classification: str = "unknown",
     source_files: int | None = None,
+    workload_mappings: list[WorkloadMapping] | None = None,
+    workload_identities: list[WorkloadIdentity] | None = None,
+    task_events: list[TaskEvent | dict[str, object]] | None = None,
 ) -> AnalysisReport:
     """Analyze all records once and expose the same rule engine per deployment.
 
@@ -531,6 +541,32 @@ def analyze(
         )
 
     report.ptu_analysis = analyze_ptu(records, deployments, cost_resolver=_ptu_cost_resolver)
+    # Workload economics reuses the same resolver, so workload totals reconcile
+    # exactly with the deployment and model totals rendered elsewhere.
+    observed_deployments = [item.summary.deployment_name for item in deployments]
+    identities = (
+        list(workload_identities)
+        if workload_identities is not None
+        else merge_identities(observed_deployments, mappings=workload_mappings or ())
+    )
+    task_metrics = {}
+    if task_events:
+        trajectories = reconstruct_tasks(
+            task_events,
+            customer_catalog=customer_catalog,
+            reference_catalog=reference_catalog,
+            required_currency=pricing_currency,
+        )
+        task_metrics = task_metrics_by_workload(trajectories)
+        report.task_economics = calculate_task_economics(trajectories)
+    report.workloads = build_portfolio(
+        records,
+        cost_resolver=_ptu_cost_resolver,
+        identities=identities,
+        mappings=workload_mappings or (),
+        reporting_currency=pricing_currency,
+        task_metrics=task_metrics,
+    )
     return report
 
 

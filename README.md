@@ -38,6 +38,8 @@ TokenLens:
 - recommends concrete Azure actions;
 - estimates analyzed cost with exact model and deployment-mode pricing matches;
 - evaluates PTU suitability, sizing, break-even, and hybrid spillover economics;
+- groups cost by workload, not only by model or token, with an explicit Unassigned rollup;
+- creates one deployment-backed technical workload automatically for every discovered deployment;
 - emits terminal, JSON, SARIF, and self-contained HTML reports;
 - compares a candidate trace set with a baseline;
 - runs advisory by default, with opt-in CI regression thresholds.
@@ -125,10 +127,11 @@ independent estimates into a misleading aggregate (for example, `100%–100%`).
 
 <p align="center"><em>Deterministic synthetic data · Click any image to open the enlarged PNG.</em></p>
 
-The report has four self-contained views:
+The report has five self-contained views:
 
 - **Overview** combines consumption, estimated analyzed cost, pricing coverage, and priority actions.
-- **Cost analysis** shows exact model/mode prices, cost composition, unresolved pricing, and model/deployment spend.
+- **Cost analysis** states one pricing decision state, four primary KPIs, cost composition, and a **View by** toggle across workload, deployment, model, and token component. Technical provenance is collapsed behind *Technical pricing details*.
+- **Workloads** is the workload economics view: technical and business scopes, portfolio table, cost and daily trend charts, an explicit Unassigned rollup, an identity-versus-pricing readiness table, and task economics where task evidence exists.
 - **Usage &amp; diagnostics** keeps the corrected multicolor model mix, visible model summary, deployment usage, and all findings.
 - **PTU advisor** is a per-deployment decision dashboard: recommendation banner with evidence confidence, six At a Glance metrics, four evidence charts with synchronized zoom and expansion, capacity sizing, PAYG versus PTU + spillover economics, rationale, and a print/JSON export.
 
@@ -248,9 +251,139 @@ such as `tokenlens-report-20260914-082311Z.html`; collisions receive `-2`,
 `-3`, and so on. Text remains on stdout. Use `--output` when a script needs a
 stable path.
 
-### First-run Foundry capture (Entra ID)
+### One command: `tokenlens-azure foundry`
 
-TokenLens analysis is offline. Collection is an explicit, separate step using
+The guided workflow replaces the manual sequence below. It discovers your Azure
+resources, collects the right telemetry, reports pricing readiness, generates
+the report, and opens it.
+
+```bash
+az login
+.venv/bin/python -m pip install -e ".[foundry,foundry-claude,foundry-monitor]"
+.venv/bin/tokenlens-azure foundry
+```
+
+The normal path asks four questions:
+
+1. Azure subscription
+2. Foundry account
+3. Deployments (multi-select)
+4. Analysis window
+
+```text
+TokenLens Foundry setup
+
+Step 1/4 · Azure subscription
+  1. Production Subscription · 1234abcd…9012 (Azure CLI active)
+  2. Sandbox Subscription · 5678efgh…3456
+
+Step 3/4 · Deployments
+  1. ◉ reasoning-prod   gpt-4.1 v2026-04-14   Global Standard   ✓ Exact public rate
+  2. ◉ coding-prod      claude-opus-5 v2      Global Standard   ⚠ Model identified, rate unavailable
+  3. ○ compact-prod     ministral-3b v1       Regional Standard ⚠ Model identified, rate unavailable
+
+Technical workloads created automatically
+✓ reasoning-prod — deployment-backed workload · Needs configuration
+✓ coding-prod — deployment-backed workload · Needs configuration
+
+Collection complete
+2 / 2 deployments succeeded
+14-day window
+model-identity-coverage=100%
+token-pricing-coverage=52%
+report=reports/tokenlens-report-20260915-081200Z.html
+```
+
+Deployment mode, provider family, inference API, account endpoints, and the
+regional Azure Monitor endpoint are detected from exact Azure metadata. Nothing
+is inferred from a name, and an unknown mode stays `unknown` rather than
+defaulting to Global. The workflow never makes an inference call; smoke testing
+remains a separate, explicitly billable command.
+
+#### Repeat and change setup
+
+```bash
+.venv/bin/tokenlens-azure foundry refresh       # same settings, idempotent re-collection
+.venv/bin/tokenlens-azure foundry configure     # change subscription/account/deployments/window
+.venv/bin/tokenlens-azure foundry status        # configuration, coverage, and last run
+.venv/bin/tokenlens-azure foundry pricing       # exact pricing state per deployment
+```
+
+#### Noninteractive automation
+
+```bash
+.venv/bin/tokenlens-azure foundry collect \
+  --subscription SUBSCRIPTION_ID \
+  --resource-group RESOURCE_GROUP \
+  --account ACCOUNT \
+  --deployment DEPLOYMENT_A \
+  --deployment DEPLOYMENT_B \
+  --days 14 \
+  --format html \
+  --output-dir reports
+```
+
+Noninteractive runs never prompt and never fall back to an ambiguous ambient
+Azure CLI context. Exit codes are stable:
+
+| Code | Meaning |
+|---|---|
+| `0` | Every selected deployment collected |
+| `3` | Partial success — some deployments collected, some failed |
+| `1` | No deployment succeeded, or a required value was missing |
+| `2` | The requested operation is deliberately deferred (`pricing sync`) |
+
+A non-TTY environment prints help instead of waiting for an answer.
+
+#### What the workflow stores
+
+`.tokenlens.yml` gains a versioned, credential-free block. Existing keys are
+preserved, and a version 1 configuration migrates automatically on first write:
+
+```yaml
+version: 2
+foundry:
+  subscription_id_env: AZURE_SUBSCRIPTION_ID   # the ID itself is stored user-locally
+  resource_group: "..."
+  account: "..."
+  region: eastus2
+  deployments:
+    - name: reasoning-prod
+      model: gpt-4.1
+      model_version: "2026-04-14"
+      sku: GlobalStandard
+      deployment_mode: global
+      provider_family: azure_openai
+      inference_api: openai
+collection:
+  lookback_days: 14
+  granularity_minutes: 5
+  output_dir: local-traces/foundry-metrics
+  task_events_dir: null
+report:
+  format: html
+  output_dir: reports
+  open: true
+workloads:
+  defaults:
+    create_for_each_deployment: true
+    scope: technical
+    type: ai_deployment
+  mappings: []
+```
+
+No key, token, connection string, endpoint, or subscription ID is written into
+`.tokenlens.yml`. The remembered subscription, the customer pricing catalog, and
+run state (last collection, coverage, and the relative report path) are kept
+outside the repository in the platform application-data directory — or in
+`TOKENLENS_CONFIG_DIR` when set — with user-only permissions. `.tokenlens.yml`
+still names your Azure resource group, account, and deployments, so do not stage
+it.
+
+### Advanced: individual collection commands
+
+The commands below remain available for automation and for the paths the guided
+workflow does not cover. TokenLens analysis is offline. Collection is an explicit, separate step using
 the Entra ID credential chain—no API key is required.
 
 #### Which collection path do I need?
@@ -687,15 +820,30 @@ into your own pricing configuration and fill in only the models you have a
 confirmed rate for; as shipped, every entry is commented out so it loads as
 an empty catalog instead of a misleading `$0.00`.
 
-Cost analysis stays useful at every coverage level. At 0% coverage the tab
-still shows token volume, request counts, the unresolved reason per model,
-and a remediation link to `pricing-audit` — never three zero-width bars that
-could be mistaken for a resolved $0 cost. At partial coverage, the composition
-chart adds a hatched "unresolved (excluded)" segment sized by excluded token
-share, and the model/deployment tables gain **Billing basis** and
-**Source/status** columns. Overview's Estimated cost KPI uses adaptive
-precision (as many decimals as needed) so a genuinely nonzero micro-cost is
-never rounded down to `$0.00`.
+Cost analysis stays useful at every coverage level, and it states each level
+exactly once.
+
+| Coverage | What the tab renders |
+|---|---|
+| 0% | One warning banner, one remediation action, and `No costs to chart until pricing is configured.` Token volume and request counts stay visible. Conditional KPI cards are omitted rather than rendered as `Unavailable`. |
+| Partial | Priced components plus a hatched unpriced segment and one concise `Partial estimate · N% of tokens priced` badge. |
+| Complete | The normal component chart, with no success essay. |
+
+Status is communicated with a shared availability component rather than ad hoc
+strings, so the same situation always reads the same way:
+
+| State | Symbol | Meaning |
+|---|---|---|
+| Complete/available | `✓` | Green — exact identity, fully priced |
+| Partial/action required | `⚠` | Amber — you can remediate it |
+| Blocking/error | `✕` | Red — reserved for identity or collection failures |
+| Informational/not applicable | `i` | Blue — PTU not applicable, observed-only note |
+| Unavailable/not measured | `—` | Neutral grey — the source cannot provide it |
+
+Colour never carries meaning alone: every badge pairs a symbol with explicit
+text, and the palette uses WCAG-AA foreground tokens on the navy surface.
+Overview's Estimated cost KPI uses adaptive precision (as many decimals as
+needed) so a genuinely nonzero micro-cost is never rounded down to `$0.00`.
 
 ### PTU Advisor dashboard
 
@@ -863,6 +1011,190 @@ join late result and review events by opaque event ID, retain open tasks across
 lookback windows, and publish only private HTML/JSON artifacts. Raw streams are
 never uploaded by TokenLens.
 
+## Workload economics
+
+The report answers **"what does each application, agent, or business process
+cost?"** — not only "how many tokens did this model use?".
+
+Two levels are modelled and never used interchangeably:
+
+| Level | Question answered | Requirement |
+|---|---|---|
+| **Workload economics** | What does this application/agent/process cost? | A workload label; outcomes optional |
+| **Task economics** | What does one solved business task cost? | Explicit `task_id`, `task_type`, and outcomes |
+
+### Every deployment always has a technical workload
+
+For every discovered deployment TokenLens creates one deployment-backed
+**technical workload** automatically:
+
+```yaml
+id: deployment:reasoning-prod
+name: reasoning-prod
+scope: technical
+type: ai_deployment
+source: system_default
+configuration_status: needs_configuration
+allocation: deployment_total
+```
+
+This means *all traffic and cost for this deployment are visible as one
+technical workload*. It does **not** mean TokenLens inferred that the deployment
+serves one business workload. The Workloads tab is therefore populated even when
+you skip workload configuration, and default IDs stay stable across refresh.
+
+### Business workloads are always explicit
+
+Workload identity may come only from:
+
+1. the request telemetry field `workload`;
+2. the OpenTelemetry attribute `tokenlens.workload`;
+3. an explicit deployment-to-workload mapping you configure;
+4. APIM/Application Insights metadata mapped explicitly to `workload`.
+
+It is never inferred from prompt text, model name, token shape, user identity,
+resource name, or a deployment-name heuristic.
+
+```python
+client = instrument_openai(
+    existing_client,
+    workload="support-assistant",
+    deployment_mode="global",
+)
+```
+
+```text
+tokenlens.workload = support-assistant
+tokenlens.environment = production
+```
+
+### Dedicated versus shared deployments
+
+A deployment may be mapped to one workload only when it is dedicated to that
+workload:
+
+```yaml
+workloads:
+  mappings:
+    - id: support-assistant
+      name: Support assistant
+      type: agent
+      environment: production
+      allocation: dedicated
+      deployments:
+        - support-prod
+```
+
+When a deployment is shared, Azure Monitor reports its aggregate cost but cannot
+allocate it between workloads. TokenLens says so and keeps the untagged
+remainder in an explicit **Unassigned** rollup rather than dividing cost evenly,
+proportionally, or by request count:
+
+```text
+Unassigned workload
+12,000 tokens cannot be attributed to a business workload.
+Tag requests with tokenlens.workload or map a dedicated deployment.
+```
+
+Business allocations plus Unassigned always reconcile exactly with the technical
+workload total.
+
+### Workload commands
+
+```bash
+.venv/bin/tokenlens-azure foundry workloads list
+.venv/bin/tokenlens-azure foundry workloads configure
+.venv/bin/tokenlens-azure foundry workloads status
+.venv/bin/tokenlens-azure foundry workloads export-template
+```
+
+`export-template` writes a credential-free YAML template containing deployment
+names and workload attributes only — never a cost, prompt, request ID, tenant
+ID, or subscription ID.
+
+### Coverage is reported in three separate numbers
+
+```text
+Technical workload coverage: 100%
+Business workload identity coverage: 62%
+Pricing coverage: 78%
+```
+
+Complete technical coverage never implies business identity coverage, and
+neither implies that costs resolved.
+
+### Task economics drill-down
+
+Tag task events with an explicit `workload` and point the workflow at them:
+
+```bash
+.venv/bin/tokenlens-azure foundry collect --task-events tokenlens-traces ...
+```
+
+Cost per attempted, closed, solved, and correctly solved task then appears
+beneath the workload each event is tagged with. Without task evidence, workload
+economics remains available and task metrics read `Not measured` — never `$0`.
+
+## Pricing resolution and the deferred sync
+
+Pricing is never guessed from a related model or family. Resolution order:
+
+1. observed per-call cost;
+2. customer catalog;
+3. synchronized verified public catalog;
+4. packaged verified catalog;
+5. unresolved.
+
+```bash
+.venv/bin/tokenlens-azure pricing status    # which catalogs exist (offline)
+.venv/bin/tokenlens-azure pricing verify    # currency, expiry, and confidence checks (offline)
+.venv/bin/tokenlens-azure pricing set-rate  # record one exact contracted rate
+.venv/bin/tokenlens-azure pricing sync      # deferred, see below
+```
+
+### `pricing sync` is deferred
+
+`tokenlens-azure pricing sync` does not contact the network and exits with code
+`2`. TokenLens will publish a synchronized public rate only when it can attribute
+that rate to a documented, machine-readable source with a deterministic parser,
+committed fixtures, an effective date, a retrieval timestamp, a content hash, and
+`verified` confidence. Until that source is wired in, synchronizing would be
+indistinguishable from guessing a rate, so the command reports the deferral and
+points at the customer-rate workflow instead.
+
+### Recording a contracted rate
+
+```bash
+.venv/bin/tokenlens-azure pricing set-rate \
+  --model YOUR_MODEL \
+  --input-per-million 1.25 \
+  --output-per-million 5.00 \
+  --effective-from 2026-01-01 \
+  --note "Negotiated enterprise agreement"
+```
+
+The values are echoed for confirmation before anything is written. Rates are
+stored user-locally (`~/.config/tokenlens/pricing/customer.yml` or the
+platform equivalent) with user-only permissions, never in the repository, and
+are always labelled `customer_override` in the report. TokenLens never converts
+currencies: a rate in a second currency is rejected rather than converted.
+
+### What the report says when pricing is unresolved
+
+Cost analysis renders one state, its impact, and one action:
+
+```text
+⚠ Pricing setup required
+21,600 tokens across 1 model are not priced, so cost totals are withheld.
+[Resolve pricing]
+```
+
+Identity failures are counted and remediated separately from missing rates:
+`unknown` is a collection identity error, never a pricing override key. Usage
+and operational analysis stay available; only the monetary comparison is
+withheld.
+
+
 ## Eight diagnostics
 
 | Rule | Detects |
@@ -1012,9 +1344,55 @@ monitor:
   granularity_minutes: 5
 ```
 
+`tokenlens-azure foundry configure` writes the version 2 workflow blocks
+(`foundry`, `collection`, `pricing`, `report`, `workloads`) alongside whatever
+else is already in the file. A version 1 document migrates automatically:
+`foundry.deployments` entries expand from bare names into exact
+name/model/version/SKU/mode records, and `monitor.lookback_days` moves to
+`collection.lookback_days`. Unrelated keys — including the `report` materiality
+thresholds the analyzer reads — are preserved, and every write is atomic with
+user-only permissions.
+
 Credentials, access tokens, tenant secrets, API keys, and bearer tokens are
-never stored. Subscription identity is referenced by environment-variable name,
-never written into the file.
+never stored. Subscription identity may be referenced by environment-variable
+name, and account endpoints are discovered at run time rather than written into
+the file.
+
+### Where local state lives
+
+| Path | Contents | Location |
+|---|---|---|
+| `.tokenlens.yml` | Credential-free configuration: resource group, account, region, deployments, window, workloads | Repository root — **never stage it**; it names your Azure resources |
+| `local-traces/foundry-metrics/` | Aggregate metric buckets | Repository root, git-ignored |
+| `tokenlens-traces/` | Request telemetry | Repository root, git-ignored |
+| `reports/` | Generated HTML/JSON reports | Repository root, git-ignored |
+| `~/.config/tokenlens/foundry-target.json` | The remembered subscription ID | User-local, `0600` |
+| `~/.config/tokenlens/pricing/customer.yml` | Customer rates | User-local, `0600` |
+| `~/.config/tokenlens/foundry-run-state.json` | Last run coverage and the relative report path | User-local, `0600` |
+
+The subscription ID is an Azure tenant identifier, so it is deliberately kept
+**out of** `.tokenlens.yml` — that file sits in your repository and could be
+committed. The workflow still remembers your selection; it just stores it
+user-locally. A legacy `foundry.subscription_id` already in the file keeps
+working and is never re-written.
+
+Set `TOKENLENS_CONFIG_DIR` to relocate the user-local directory, for example in
+a sandbox or CI image. Nothing in run state contains an access token, a tenant
+secret, a prompt, a response, a request ID, a full endpoint, or an absolute path
+containing a username.
+
+## Troubleshooting the guided workflow
+
+| Symptom | Cause and fix |
+|---|---|
+| `collector-extras=missing` | Install the extras with the exact command the wizard prints, then rerun. Nothing is installed automatically. |
+| `error=A subscription is required` in automation | Pass `--subscription`. Noninteractive runs never fall back to an ambiguous ambient Azure CLI context. |
+| `deployment_not_found` for a deployment that used to work | The deployment left the account inventory. Run `tokenlens-azure foundry configure` to update the selection; historical workload data is retained. |
+| `authorization` for one deployment | The signed-in principal needs Monitoring Reader on the account. Other deployments still collect. |
+| Exit code `3` | Partial success. Some deployments collected and the report was generated; check the per-deployment table. |
+| `Model identity missing` in the report | Azure Monitor returned no model dimension for that slice. Recollect or enrich it — do not add a pricing override for `unknown`. |
+| Workloads tab shows only technical rows | No business identity is configured. Run `tokenlens-azure foundry workloads configure`, or tag requests with `workload`. |
+| `pricing-sync=deferred` | Expected. See [docs/pricing.md](docs/pricing.md) and use `pricing set-rate` for contracted rates. |
 
 ## License
 

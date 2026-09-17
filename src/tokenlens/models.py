@@ -244,6 +244,63 @@ class DataQualityIssue(BaseModel):
     detail: str
 
 
+class AvailabilityState(BaseModel):
+    """One shared statement about whether a value is available.
+
+    Every card, table cell, empty state, export, and screen-reader description
+    consumes this instead of an ad hoc string, so the same situation is always
+    described with the same words, symbol, and colour meaning.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal[
+        "available",
+        "partial",
+        "missing_actionable",
+        "missing_blocking",
+        "not_measured",
+        "not_applicable",
+    ]
+    label: str
+    reason: str | None = None
+    action_id: str | None = None
+
+    @property
+    def symbol(self) -> str:
+        return {
+            "available": "✓",
+            "partial": "⚠",
+            "missing_actionable": "⚠",
+            "missing_blocking": "✕",
+            "not_measured": "—",
+            "not_applicable": "i",
+        }[self.status]
+
+    @property
+    def tone(self) -> str:
+        """Semantic colour token name; red is reserved for blocking errors."""
+        return {
+            "available": "success",
+            "partial": "warning",
+            "missing_actionable": "warning",
+            "missing_blocking": "danger",
+            "not_measured": "neutral",
+            "not_applicable": "info",
+        }[self.status]
+
+    @property
+    def text(self) -> str:
+        """Plain-text rendering for terminals, exports, and screen readers."""
+        return f"{self.symbol} {self.label}" + (f" — {self.reason}" if self.reason else "")
+
+
+#: Reusable states. Copy rules: one idea per sentence, and no "Pricing
+#: unavailable" where the section heading already establishes pricing context.
+NOT_MEASURED = AvailabilityState(status="not_measured", label="Not measured")
+NOT_APPLICABLE = AvailabilityState(status="not_applicable", label="Not applicable")
+
+
 class AnalysisReport(BaseModel):
     tool: str = "TokenLens for Azure"
     version: str
@@ -259,3 +316,6 @@ class AnalysisReport(BaseModel):
     report_metadata: dict[str, Any] = Field(default_factory=dict)
     task_economics: Any | None = None
     ptu_analysis: Any | None = None
+    #: Technical and business workload economics. Always present for a resolved
+    #: deployment inventory, even when no business identity is configured.
+    workloads: Any | None = None

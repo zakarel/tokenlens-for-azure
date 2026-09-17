@@ -25,14 +25,20 @@ from .telemetry import TelemetryConfig, TelemetryWriter
 app = typer.Typer(
     help=(
         "Offline LLM token-efficiency diagnostics with Azure-first guidance.\n\n"
+        "Start here:\n"
+        "  tokenlens-azure foundry             Guided setup, collection, and report\n\n"
         "Three collection paths:\n"
         "  1. Smoke test one deployment       tokenlens-azure smoke-test-foundry\n"
         "  2. Collect application telemetry   instrument once with tokenlens.integrations, then analyze\n"
-        "  3. Collect Azure Monitor metrics   tokenlens-azure collect-foundry-metrics\n\n"
+        "  3. Collect Azure Monitor metrics   tokenlens-azure foundry collect\n\n"
         "Collection commands contact Azure explicitly. Analysis is always offline."
     ),
     invoke_without_command=True,
 )
+
+from .foundry_cli import register as _register_workflow  # noqa: E402 - app must exist first
+
+_register_workflow(app)
 
 
 @app.callback()

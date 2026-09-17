@@ -41,6 +41,9 @@ class _CommonEvent(BaseModel):
     attempt_id: str | None = Field(default=None, min_length=1, max_length=200)
     execution_strategy: str | None = Field(default=None, min_length=1, max_length=100)
     strategy_version: str | None = Field(default=None, min_length=1, max_length=100)
+    #: Explicit business workload label. It is supplied by instrumentation or an
+    #: import mapping and is never inferred from prompts, models, or deployments.
+    workload: str | None = Field(default=None, min_length=1, max_length=100)
 
     @field_validator("timestamp")
     @classmethod

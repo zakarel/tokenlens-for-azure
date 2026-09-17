@@ -415,6 +415,7 @@ def collect_metrics(
     scope: ResourceScope | None = None,
     deployment_modes: dict[str, str] | None = None,
     default_deployment_mode: str = "unknown",
+    workload_assignments: Mapping[str, str] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> CollectionResult:
@@ -437,6 +438,10 @@ def collect_metrics(
     no explicit entry in ``deployment_modes``. It stays ``unknown`` unless the
     caller supplies one: PTU sizing and pricing differ between Global and
     Regional deployments, so the mode is never inferred.
+
+    ``workload_assignments`` maps a deployment name to a business workload and
+    may contain *dedicated* deployments only. A shared deployment's aggregate
+    cannot be allocated between workloads, so it is never tagged here.
     """
     result = CollectionResult(
         window_start=window.start,
@@ -609,6 +614,7 @@ def collect_metrics(
         )
         if metrics.input_tokens or metrics.output_tokens or metrics.requests:
             result.active_buckets += 1
+        assigned_workload = (workload_assignments or {}).get(deployment)
         result.records.append(
             MetricBucketRecord(
                 source="azure_monitor",
@@ -626,6 +632,9 @@ def collect_metrics(
                 deployment_mode=(deployment_modes or {}).get(deployment, default_deployment_mode),
                 scope=scope or ResourceScope(),
                 metrics=metrics,
+                workload=assigned_workload,
+                workload_source="deployment_mapping" if assigned_workload else None,
+                allocation_confidence="exact_dedicated_deployment" if assigned_workload else None,
                 missing_metrics=bucket_missing,
                 metric_provenance=dict(state.provenance),
                 status_codes=status_counts or None,
