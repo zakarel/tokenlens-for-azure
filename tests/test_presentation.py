@@ -90,7 +90,7 @@ def test_duplicate_models_combine_but_deployments_stay_separate():
     assert len(models) == 2
     assert models[0].requests == 2
     assert sum(item.total_tokens for item in models) == report.summary.total_tokens
-    assert sum(item.requests for item in models) == report.summary.requests_analyzed
+    assert sum(item.requests or 0 for item in models) == report.summary.requests_analyzed
 
 
 def test_generated_report_has_two_accessible_chart_views_and_metadata():
@@ -99,15 +99,41 @@ def test_generated_report_has_two_accessible_chart_views_and_metadata():
     payload = json.loads(report_json(report))
     assert 'role="tablist"' in html
     assert 'role="tabpanel"' in html
-    assert 'Token share by model' in html
+    # One model in scope, so composition replaces a single-slice donut.
+    assert 'Token composition' in html
     assert 'Token usage by deployment' in html
     assert "overview_min_impact_tokens" in payload["report_metadata"]["materiality"]
     # Scoped to the executive views: the PTU Advisor tab carries its own
-    # documented evidence-confidence and data-quality sections.
+    # documented evidence-confidence sections.
     executive_views = html.split("<body>", 1)[1].split('<section class="tab-panel ptu"', 1)[0]
     assert "confidence" not in executive_views.lower()
-    assert "Data quality" not in executive_views
-    assert "Not evaluated" not in executive_views
+
+
+def test_multiple_models_keep_the_share_donut():
+    report = analyze(
+        [
+            parsed(
+                {
+                    "deployment_name": "reasoning-prod",
+                    "model_name": "Claude-opus-5",
+                    "messages": [],
+                    "usage": {"input_tokens": 1000000, "output_tokens": 100},
+                }
+            ),
+            parsed(
+                {
+                    "deployment_name": "general-prod",
+                    "model_name": "gpt-4.1",
+                    "messages": [],
+                    "usage": {"input_tokens": 400000, "output_tokens": 100},
+                }
+            ),
+        ],
+        "synthetic.jsonl",
+    )
+    html = report_html(report)
+    assert "Token share by model" in html
+    assert 'class="donut' in html
 
 
 def test_synthetic_fixture_has_requested_totals():

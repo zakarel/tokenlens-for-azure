@@ -126,6 +126,35 @@ def test_three_model_customer_catalog_yields_full_coverage_and_billing_basis():
     assert "Azure token rate" in rendered
 
 
+def test_report_pricing_provenance_selects_customer_catalog():
+    catalog = PricingCatalog(
+        catalog_name="synthetic-customer-catalog",
+        source_url="https://example.com/customer-pricing",
+        retrieved_at="2026-09-14",
+        prices=[
+            PriceEntry(
+                provider="azure_foundry",
+                model=MICROSOFT_MODEL,
+                region="global",
+                effective_from="2026-01-01",
+                input_per_million=1.0,
+                output_per_million=4.0,
+            )
+        ],
+    )
+    report = analyze(
+        [trace(deployment="dep", model=MICROSOFT_MODEL)],
+        "fixture",
+        customer_catalog=catalog,
+        use_bundled_reference=False,
+        generated_at="2026-09-14T13:00:00Z",
+    )
+    pricing = report.report_metadata["pricing"]
+    assert pricing["catalog_selected"] == "synthetic-customer-catalog"
+    assert pricing["source_url"] == "https://example.com/customer-pricing"
+    assert pricing["retrieved_at"] == "2026-09-14"
+
+
 def test_removing_one_rate_produces_exact_partial_coverage_not_rounded_to_full():
     partial_catalog = full_customer_catalog()
     partial_catalog.prices = [price for price in partial_catalog.prices if price.model != MINISTRAL_LIKE_MODEL]

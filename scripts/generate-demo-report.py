@@ -269,8 +269,12 @@ request_customer_catalog = PricingCatalog(
 )
 report = analyze(
     records,
-    "examples/multi-deployment-portfolio.jsonl",
+    "synthetic demo fixture",
     generated_at="2026-09-14T23:59:00+00:00",
+    # Only demo generation may claim synthetic provenance; it is never inferred
+    # from an output location.
+    data_classification="synthetic",
+    source_files=1,
     report_config={
         "overview_min_impact_percent": 1.0,
         "overview_min_impact_tokens": 100000,

@@ -385,8 +385,14 @@ def test_request_level_and_aggregate_fixtures_agree_on_throughput():
     request_report = analyze(request_records, "requests", generated_at="2026-09-14T13:00:00Z")
     left = aggregate_report.ptu_analysis.deployments[0]
     right = request_report.ptu_analysis.deployments[0]
-    assert left.average_tpm == pytest.approx(right.average_tpm)
-    assert left.p95_tpm == pytest.approx(right.p95_tpm)
+    # Aggregate analysis uses the elapsed-window basis for headline economics;
+    # compare the active-window throughput with the request-level fixture.
+    assert left.dashboard.summary.active_average_weighted_tpm == pytest.approx(
+        right.dashboard.summary.active_average_weighted_tpm
+    )
+    assert left.dashboard.summary.active_p95_weighted_tpm == pytest.approx(
+        right.dashboard.summary.active_p95_weighted_tpm
+    )
     assert left.observed_buckets == right.observed_buckets
 
 

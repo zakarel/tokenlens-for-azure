@@ -11,3 +11,7 @@ tokenlens-report.html
 tokenlens.json
 tokenlens.sarif
 
+local-traces/
+foundry-traces/
+tokenlens-traces/
+reports/

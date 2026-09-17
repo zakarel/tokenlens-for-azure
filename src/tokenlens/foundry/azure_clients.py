@@ -14,6 +14,7 @@ from datetime import timedelta
 from typing import Any, Iterable, Sequence
 
 from .monitor import CollectorError, resource_uri
+from .metrics_catalog import CAPABILITY_BY_NAME
 
 MONITOR_EXTRA_HINT = "Install the collector extras: pip install 'tokenlens-azure[foundry-monitor]'"
 
@@ -50,6 +51,9 @@ class AzureMonitorMetricsClient:
 
     def __init__(self, client: Any) -> None:
         self._client = client
+        #: Metric names Azure rejected during this run, with the reason. They are
+        #: reported, never silently dropped.
+        self.rejected_metrics: dict[str, str] = {}
 
     @classmethod
     def create(
@@ -89,7 +93,8 @@ class AzureMonitorMetricsClient:
         if hasattr(self._client, "query_resources"):
             metrics: list[Any] = []
             for metric_name in metric_names:
-                aggregation = "Average" if metric_name.casefold() in {"latency", "normalizedtimetofirstbyte"} else "Total"
+                capability = CAPABILITY_BY_NAME.get(metric_name.casefold())
+                aggregation = capability.aggregation if capability else "Total"
                 try:
                     results = self._client.query_resources(
                         resource_ids=[resource],
@@ -101,11 +106,13 @@ class AzureMonitorMetricsClient:
                         filter=filter,
                     )
                 except Exception as exc:
-                    # Some Azure metrics exist only at account/API scope and
-                    # reject a deployment dimension filter. Preserve the
-                    # deployment-scoped metrics and let the collector report
-                    # the unsupported field as missing.
+                    # A 400 here means the metric/dimension combination this
+                    # resource exposes differs from its published definition.
+                    # The deployment-scoped metrics are preserved and the
+                    # collector reports the unsupported field as missing rather
+                    # than aborting the whole collection.
                     if getattr(exc, "status_code", None) == 400:
+                        self.rejected_metrics[metric_name] = "Azure rejected this metric/dimension combination (400)"
                         continue
                     raise
                 if results:
@@ -173,7 +180,13 @@ class AzureResourceClient:
             "location": getattr(selected, "location", ""),
         }
 
-    def list_metric_definitions(self, resource: str) -> Iterable[str]:
+    def list_metric_definitions(self, resource: str) -> Iterable[dict[str, Any]]:
+        """Yield metric definitions *with their dimensions*.
+
+        Dimensions are what make a query safe: a metric that does not support
+        ``ModelDeploymentName`` is excluded before the request instead of
+        returning an Azure 400 that looks like a missing metric.
+        """
         if not has_package("azure.mgmt.monitor"):
             raise CollectorError("azure-mgmt-monitor is not installed. " + MONITOR_EXTRA_HINT)
         from azure.mgmt.monitor import MonitorManagementClient  # type: ignore[import-not-found]
@@ -183,8 +196,17 @@ class AzureResourceClient:
         for definition in client.metric_definitions.list(resource):
             name = getattr(definition, "name", None)
             value = getattr(name, "value", None) if name is not None else None
-            if value:
-                yield str(value)
+            if not value:
+                continue
+            dimensions = [
+                str(getattr(dimension, "value", "") or getattr(dimension, "name", ""))
+                for dimension in (getattr(definition, "dimensions", None) or [])
+            ]
+            yield {
+                "name": str(value),
+                "dimensions": [item for item in dimensions if item],
+                "unit": str(getattr(definition, "unit", "") or "") or None,
+            }
 
 
 def _resource_group_of(resource_id: str) -> str:

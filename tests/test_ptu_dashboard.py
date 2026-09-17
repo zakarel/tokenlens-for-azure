@@ -197,6 +197,7 @@ def test_rate_limit_metrics_are_counted_not_derived(full_report):
 def test_confidence_is_deterministic_and_documented():
     high, components = _confidence(
         active_buckets=4000,
+        observed_buckets=4000,
         elapsed_buckets=4000,
         observed_days=14,
         outcome_coverage=1.0,
@@ -204,23 +205,31 @@ def test_confidence_is_deterministic_and_documented():
         pricing_coverage=1.0,
         capacity_known=True,
         mode_known=True,
+        identity_known=True,
     )
     assert high == 100.0
     assert sum(item.weight for item in components) == pytest.approx(1.0)
-    # Zero-filled missing buckets must never earn continuity credit.
-    padded, _ = _confidence(
-        active_buckets=100,
-        elapsed_buckets=4000,
+    # A complete collection of a mostly idle window keeps full completeness but
+    # loses active-sample credit: the two are separate components.
+    sparse, sparse_components = _confidence(
+        active_buckets=2,
+        observed_buckets=4032,
+        elapsed_buckets=4032,
         observed_days=14,
         outcome_coverage=1.0,
-        latency_coverage=1.0,
-        pricing_coverage=1.0,
-        capacity_known=True,
+        latency_coverage=0.0,
+        pricing_coverage=0.0,
+        capacity_known=False,
         mode_known=True,
+        identity_known=True,
     )
-    assert padded < high
+    assert sparse < high
+    by_name = {item.name: item for item in sparse_components}
+    assert by_name["Collection completeness"].score == 1.0
+    assert by_name["Active sample size"].score == pytest.approx(0.02)
     empty, _ = _confidence(
         active_buckets=0,
+        observed_buckets=0,
         elapsed_buckets=0,
         observed_days=0,
         outcome_coverage=0.0,
@@ -228,6 +237,7 @@ def test_confidence_is_deterministic_and_documented():
         pricing_coverage=0.0,
         capacity_known=False,
         mode_known=False,
+        identity_known=False,
     )
     assert empty == 0.0
 
@@ -329,6 +339,7 @@ def test_every_banner_state_has_a_label():
         "ptu_recommended",
         "borderline",
         "payg_recommended",
+        "collection_identity_error",
         "insufficient_evidence",
         "pricing_unavailable",
         "ptu_not_applicable",
@@ -362,12 +373,14 @@ def test_six_at_a_glance_cards_describe_the_selected_deployment(full_html):
         "Scope",
         "Typical Throughput",
         "Busy-Hour Throughput",
+        "Requests",
         "Total Tokens",
         "Daily Average Tokens",
         "Rate-Limit Events",
+        "Request Outcomes",
     ):
         assert f">{label}" in glance
-    assert glance.count('class="card glance-card"') == 6
+    assert glance.count('class="card glance-card"') == 8
     assert "example-support-prod" in glance
 
 
@@ -416,7 +429,9 @@ def test_embedded_payload_is_aggregate_only_and_exportable(full_html):
 def test_print_export_view_includes_every_section(full_html):
     style = full_html.split("<style>", 1)[1].split("</style>", 1)[0]
     assert "@media print" in style
-    assert ".tab-panel.ptu,body.ptu-print .tab-panel.ptu{display:block!important}" in style
+    assert "body.ptu-print .tab-panel.ptu{display:block!important}" in style
+    # A plain print keeps every panel; only the PTU export button narrows it.
+    assert "\n  .tab-panel{display:none!important}" not in style
     assert "break-inside:avoid" in style
     assert 'data-ptu-print="example-support-prod-0"' in full_html
 
@@ -426,7 +441,8 @@ def test_responsive_rules_cover_required_breakpoints(full_html):
     assert ".glance-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))" in style
     assert "@media(max-width:1180px){.glance-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}" in style
     assert "@media(max-width:900px){.evidence-grid,.rationale-grid{grid-template-columns:1fr}}" in style
-    assert "@media(max-width:620px){.glance-grid{grid-template-columns:1fr}" in style
+    assert "@media(max-width:620px){.rationale-panel{padding:12px}" in style
+    assert ".glance-grid{grid-template-columns:1fr}" in style
     assert "@media(prefers-reduced-motion:reduce)" in style
 
 

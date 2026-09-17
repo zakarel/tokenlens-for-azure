@@ -67,12 +67,17 @@ def test_distinct_fingerprints_do_not_produce_a_repetition_finding():
 def test_missing_telemetry_is_reported_as_not_evaluated_not_as_efficiency():
     records = [canonical(index, fingerprint=None, system_tokens=None) for index in range(5)]
     report = analyze(records, "contentless", generated_at="2026-09-14T13:00:00Z")
-    unevaluated = {item.rule_id: item for item in report.findings if item.evidence.get("evaluation_status") == "not_evaluated"}
-    assert set(unevaluated) == {"TL001", "TL002", "TL003", "TL004", "TL007"}
-    for finding in unevaluated.values():
-        assert finding.severity == "info"
-        assert finding.estimated_savings.unit == "none"
-        assert "not evidence that the workload is efficient" in finding.detail
+    unevaluated = {item.rule_id: item for item in report.diagnostics.evaluations if item.status == "not_evaluated"}
+    # Content-dependent rules, retry inference, and model sizing all require
+    # evidence this source does not carry.
+    assert set(unevaluated) == {"TL001", "TL002", "TL003", "TL004", "TL005", "TL007", "TL008"}
+    for evaluation in unevaluated.values():
+        assert evaluation.missing_fields
+        assert "not evidence that the workload is efficient" in evaluation.detail
+    # A not-evaluated rule is coverage, never a finding.
+    assert not [item for item in report.findings if item.rule_id in unevaluated]
+    assert report.summary.findings == len(report.findings)
+    assert report.summary.not_evaluated_rules == len(unevaluated)
     rendered = report_html(report)
     assert "not evaluated" in rendered.casefold()
 
@@ -80,9 +85,9 @@ def test_missing_telemetry_is_reported_as_not_evaluated_not_as_efficiency():
 def test_fingerprint_evidence_suppresses_the_not_evaluated_notice_for_that_rule():
     records = [canonical(index) for index in range(10)]
     report = analyze(records, "contentless", generated_at="2026-09-14T13:00:00Z")
-    statuses = {item.rule_id: item.evidence.get("evaluation_status") for item in report.findings}
-    assert statuses.get("TL001") != "not_evaluated"
-    assert statuses.get("TL002") == "not_evaluated"
+    statuses = {item.rule_id: item.status for item in report.diagnostics.evaluations}
+    assert statuses["TL001"] == "finding"
+    assert statuses["TL002"] == "not_evaluated"
 
 
 def test_content_bearing_traces_keep_their_existing_diagnostics():
@@ -96,6 +101,6 @@ def test_content_bearing_traces_keep_their_existing_diagnostics():
     }
     records = [next(iter_records(io.StringIO(json.dumps(raw) + "\n"))) for _ in range(4)]
     report = analyze(records, "content", generated_at="2026-09-14T13:00:00Z")
-    assert not [item for item in report.findings if item.evidence.get("evaluation_status") == "not_evaluated"]
+    assert not [item for item in report.diagnostics.evaluations if item.status == "not_evaluated" and item.rule_id == "TL001"]
     prefix = next(item for item in report.findings if item.rule_id == "TL001")
     assert prefix.evidence.get("evidence_source") is None

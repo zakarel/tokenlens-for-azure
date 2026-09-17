@@ -4,10 +4,11 @@ import base64
 import html
 import json
 import math
+from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-from .models import AnalysisReport, DeploymentAnalysis, Finding
+from .models import AnalysisReport, DeploymentAnalysis, Finding, RuleEvaluation
 from .economics import TaskEconomicsReport
 from .ptu import ELIGIBILITY_STATUS_LABELS, PtuCostCurve, PtuDeploymentAssessment, PtuPortfolioAssessment, PtuThroughputSeries
 from .ptu_report import (
@@ -95,6 +96,127 @@ def _display_name(value: str, *, unknown: str) -> str:
     return unknown if value in {"", "unknown", "None"} else value
 
 
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _human_timestamp(value: str) -> str:
+    """Render a generated timestamp for people; ISO stays in JSON and tooltips."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    parsed = parsed.astimezone(UTC)
+    return f"{parsed.day} {_MONTHS[parsed.month - 1]} {parsed.year} · {parsed:%H:%M} UTC"
+
+
+def _source_summary(report: AnalysisReport) -> str:
+    """Describe the input without ever rendering a local path.
+
+    Source paths are user-private: they can contain account names, project
+    names, and directory structure. The report states how much was read and
+    over what window instead.
+    """
+    metadata = report.report_metadata or {}
+    files = metadata.get("source_files")
+    if not isinstance(files, int) or files <= 0:
+        files = len([part for part in str(report.source).split(",") if part.strip()]) or 1
+    aggregate = report.summary.aggregate
+    if aggregate is not None and aggregate.window_start and aggregate.window_end:
+        days = max(1, round((aggregate.window_end - aggregate.window_start).total_seconds() / 86_400))
+        window = f"{days}-day window"
+    else:
+        window = "observed window"
+    unit = "file" if files == 1 else "files"
+    kind = "metric" if report.summary.analysis_unit == "metric_buckets" else "telemetry"
+    return f"{files:,} local {kind} {unit} · {window} · offline analysis"
+
+
+_CLASSIFICATION_LABELS = {
+    "synthetic": "Offline synthetic example",
+    "local_real": "Local offline analysis",
+    "unknown": "Local offline analysis",
+}
+
+
+def _classification_label(report: AnalysisReport) -> str:
+    """Only demo generation may claim synthetic data; it is never inferred."""
+    return _CLASSIFICATION_LABELS.get(report.data_classification, "Local offline analysis")
+
+
+def _requests_value(summary) -> str:
+    if not summary.requests_available or summary.requests_observed is None:
+        return "Unavailable"
+    return f"{summary.requests_observed:,}"
+
+
+def _requests_sub(summary) -> str:
+    aggregate = summary.aggregate
+    if aggregate is not None:
+        detail = f"{aggregate.active_buckets:,} active of {aggregate.elapsed_buckets:,} elapsed {aggregate.bucket_minutes}-minute buckets"
+        if not summary.requests_available:
+            return f"Request metric unavailable · {detail}"
+        return detail
+    return f"{summary.retries:,} retries observed" if summary.retries_available else "Retries unavailable"
+
+
+def _tokens_sub(summary) -> str:
+    cached = (
+        f"{summary.cached_tokens:,} cached"
+        if summary.cached_tokens_available
+        else "cached metric unavailable"
+    )
+    fresh = f"{summary.input_tokens:,} input" if summary.input_tokens_available else "input metric unavailable"
+    output = f"{summary.output_tokens:,} output" if summary.output_tokens_available else "output metric unavailable"
+    return f"{fresh} · {cached} · {output}"
+
+
+def _total_tokens_value(summary) -> str:
+    """A total is only a total when every component was actually reported."""
+    if summary.input_tokens_available and summary.output_tokens_available:
+        return f"{summary.total_tokens:,}"
+    return f"{summary.total_tokens:,} partial"
+
+
+_PRICING_STATUS_COPY = {
+    "priced": ("Priced", "Exact rate matched for every observed token"),
+    "partial": ("Partially priced", "Some tokens have no exact rate"),
+    "catalog_missing": ("Model identified, exact rate missing", "Run pricing-audit or add an exact override"),
+    "identity_unresolved": ("Pricing not attempted", "Model identity unresolved during collection"),
+    "currency_mismatch": ("Currency conversion required", "Configure a reporting currency; no conversion is performed"),
+}
+
+
+def _pricing_status_copy(summary) -> tuple[str, str]:
+    return _PRICING_STATUS_COPY.get(summary.pricing_status, ("Unresolved", "No exact model/mode price"))
+
+
+def _data_quality_banner(report: AnalysisReport) -> str:
+    """State what is trustworthy before any number is read."""
+    issues = list(report.data_quality)
+    if not issues:
+        return ""
+    blockers = [item for item in issues if item.severity == "blocker"]
+    warnings = [item for item in issues if item.severity != "blocker"]
+    rows = "".join(
+        f'<li class="dq-{_escape(item.severity)}"><strong>{_escape(item.title)}</strong>'
+        f"<span>{_escape(item.detail)}</span></li>"
+        for item in blockers + warnings
+    )
+    headline = (
+        f"{len(blockers)} blocking data-quality issue(s)"
+        if blockers
+        else f"{len(warnings)} data-quality limitation(s)"
+    )
+    trustworthy = (
+        "Token volumes and window coverage remain usable."
+        if blockers
+        else "All other values reconcile with the analyzed telemetry."
+    )
+    return f"""<section class="data-quality{' blocking' if blockers else ''}" role="note" aria-label="Data quality">
+      <div class="dq-head"><strong>{_escape(headline)}</strong><span>{_escape(trustworthy)}</span></div>
+      <ul>{rows}</ul></section>"""
+
+
 def _finding_impact(finding: Finding) -> str:
     estimate = finding.estimated_savings
     if estimate.unit == "calls":
@@ -117,47 +239,210 @@ def _impact_percent(finding: Finding) -> str:
     return f"{finding.impact_min_percent:.1f}–{maximum:.1f}%"
 
 
-def _finding_card(finding: Finding, *, compact: bool = False) -> str:
+def _finding_card(finding: Finding, *, compact: bool = False, denominator: str = "") -> str:
     recommendation = finding.azure_recommendation
+    # Impact share and evidence strength are different statements and are
+    # rendered as different values.
+    share = _impact_percent(finding)
+    basis = f" of {denominator}" if denominator and finding.impact_max_percent is not None else ""
     return f"""<article class="finding-card {_escape(finding.severity)}">
       <div class="finding-rule">{_escape(finding.rule_id)}</div>
       <div class="finding-copy"><strong>{_escape(finding.title)}</strong>
         <span>{_escape(finding.detail if not compact else recommendation.action)}</span></div>
-      <div class="finding-impact"><strong>{_escape(_impact_percent(finding))}</strong>
-        <span>{_escape(_finding_impact(finding))} · {_escape(impact_category(finding))}</span></div>
+      <div class="finding-impact"><strong>{_escape(share)}{_escape(basis)}</strong>
+        <span>{_escape(_finding_impact(finding))} · {_escape(impact_category(finding))} · evidence {_escape(finding.confidence)}</span></div>
       <div class="finding-action"><strong>{_escape(recommendation.capability)}</strong>
         <span>{_escape(recommendation.action if not compact else recommendation.service)}</span></div>
     </article>"""
 
 
-def _finding_cards(findings: list[Finding], *, compact: bool = False) -> str:
+def _finding_cards(
+    findings: list[Finding],
+    *,
+    compact: bool = False,
+    empty: str | None = None,
+    denominator: str = "",
+) -> str:
     if not findings:
-        return '<p class="empty">No addressable opportunities were detected in this trace set.</p>'
-    return "".join(_finding_card(item, compact=compact) for item in findings)
+        message = empty or "No addressable opportunity was detected by the diagnostics that ran."
+        return f'<p class="empty">{_escape(message)}</p>'
+    return "".join(_finding_card(item, compact=compact, denominator=denominator) for item in findings)
+
+
+def _no_findings_message(report: AnalysisReport) -> str:
+    """Distinguish "nothing to fix" from "nothing could be checked"."""
+    if report.diagnostics.source == "aggregate":
+        return (
+            "No request-level diagnostic can run against aggregate metric buckets, so no finding was produced. "
+            "This is a coverage gap, not a clean bill of health."
+        )
+    if report.diagnostics.not_evaluated and not report.diagnostics.no_issue:
+        return "Every applicable diagnostic lacked the evidence it needs; see Not evaluated for the exact gaps."
+    return "Every applicable diagnostic ran and found no addressable opportunity."
 
 
 def _deployment_rows(report: AnalysisReport) -> str:
+    rollups = deployment_rollups(report)
+    if not rollups:
+        return '<p class="empty">No deployments observed.</p>'
+    if len(rollups) == 1:
+        # A single deployment always holds 100% of its own portfolio. An
+        # absolute usage summary carries information; a full-width bar does not.
+        item = rollups[0]
+        requests = f"{item.requests:,}" if item.requests is not None else "Unavailable"
+        window = _window_text(item)
+        cached = f"{item.cached_tokens:,}" if item.cached_tokens_available else "Metric unavailable"
+        return f"""<div class="single-usage">
+          <div><strong>{_escape(_display_name(item.deployment_name, unknown="Unknown deployment"))}</strong>
+            <small>{_escape(_model_label(item))} · {_escape(item.deployment_mode.title())}</small></div>
+          <dl class="single-usage-grid">
+            <div><dt>Total tokens</dt><dd>{item.total_tokens:,}</dd></div>
+            <div><dt>Input</dt><dd>{item.input_tokens:,}</dd></div>
+            <div><dt>Cached input</dt><dd>{_escape(cached)}</dd></div>
+            <div><dt>Output</dt><dd>{item.output_tokens:,}</dd></div>
+            <div><dt>Requests</dt><dd>{_escape(requests)}</dd></div>
+            <div><dt>Observed window</dt><dd>{_escape(window)}</dd></div>
+          </dl></div>"""
     rows = []
-    for item in deployment_rollups(report):
+    for item in rollups:
         name = _display_name(item.deployment_name, unknown="Unknown deployment")
         model = _display_name(item.model_name, unknown="Unknown model")
+        volume = f"{item.requests:,} requests" if item.requests is not None else f"{item.active_buckets:,} active buckets"
         rows.append(
             f"""<div class="portfolio-row">
               <div><strong>{_escape(name)}</strong><small>{_escape(model)}</small></div>
-              <div class="portfolio-bar" aria-label="{_escape(chart_label(name, item.total_tokens, item.token_share_percent))}"><span style="width:{max(1, item.token_share_percent)}%"></span></div>
-              <div class="portfolio-value"><strong>{item.total_tokens:,}</strong><small>{item.token_share_percent:.1f}% · {item.requests:,} requests</small></div>
+              <div class="portfolio-bar" role="img" aria-label="{_escape(chart_label(name, item.total_tokens, item.token_share_percent))}"><span style="width:{max(1, item.token_share_percent)}%"></span></div>
+              <div class="portfolio-value"><strong>{item.total_tokens:,}</strong><small>{item.token_share_percent:.1f}% · {_escape(volume)}</small></div>
             </div>"""
         )
-    return "".join(rows) or '<p class="empty">No deployments observed.</p>'
+    return "".join(rows)
 
 
-def _overview_actions(findings: list[Finding]) -> str:
-    if not findings:
-        return '<p class="empty">No prioritized Azure actions.</p>'
-    return "".join(
-        f'<li><strong>{_escape(item.azure_recommendation.capability)}</strong><span>{_escape(item.azure_recommendation.action)}</span></li>'
-        for item in findings
+def _model_label(item) -> str:
+    model = _display_name(item.model_name, unknown="Unknown model")
+    version = getattr(item, "model_version", None)
+    return f"{model} · version {version}" if version else model
+
+
+def _window_text(item) -> str:
+    start, end = getattr(item, "window_start", None), getattr(item, "window_end", None)
+    if not start or not end:
+        return "Not reported by source"
+    try:
+        first = datetime.fromisoformat(start)
+        last = datetime.fromisoformat(end)
+    except ValueError:
+        return "Not reported by source"
+    days = max(1, round((last - first).total_seconds() / 86_400))
+    active = getattr(item, "active_days", 0)
+    return f"{days} day(s) · {active} active day(s)"
+
+
+def _overview_actions(findings: list[Finding], report: AnalysisReport) -> str:
+    """Only actions backed by an evaluated finding are promoted.
+
+    Missing evidence is reported as missing evidence. It is never presented as
+    an optimisation recommendation.
+    """
+    if findings:
+        return "".join(
+            f'<li><strong>{_escape(item.azure_recommendation.capability)}</strong><span>{_escape(item.azure_recommendation.action)}</span></li>'
+            for item in findings
+        )
+    if report.diagnostics.source == "aggregate" or report.diagnostics.not_evaluated:
+        return (
+            '<li class="not-evaluated"><strong>Request-level optimisation not evaluated</strong>'
+            "<span>Instrument the SDK or import OpenTelemetry to analyse prompt, retry, and cache efficiency. "
+            "No request-level diagnostic ran against this telemetry.</span></li>"
+        )
+    return '<li class="not-evaluated"><strong>No prioritized Azure actions</strong><span>Every applicable diagnostic ran and found no addressable issue.</span></li>'
+
+
+def _diagnostic_sections(report: AnalysisReport) -> str:
+    """Mutually exclusive diagnostic sections.
+
+    A rule appears exactly once: as an evaluated finding, as evaluated with no
+    issue, or in the not-evaluated coverage matrix. "Not evaluated" is never
+    rendered as an opportunity and never counted as a finding.
+    """
+    evaluations = report.diagnostics.evaluations
+    findings_by_rule = {finding.rule_id: finding for finding in report.findings}
+    evaluated = [item for item in evaluations if item.status == "finding" and item.rule_id in findings_by_rule]
+    no_issue = [item for item in evaluations if item.status == "no_issue"]
+    not_evaluated = [item for item in evaluations if item.status == "not_evaluated"]
+    material = {finding.rule_id for finding in overview_findings(report)}
+    additional = [
+        findings_by_rule[item.rule_id]
+        for item in evaluated
+        if item.rule_id not in material
+    ]
+
+    denominator = f"{report.summary.input_tokens:,} input tokens"
+    finding_cards = _finding_cards(
+        [findings_by_rule[item.rule_id] for item in evaluated],
+        empty=_no_findings_message(report),
+        denominator=denominator,
     )
+    no_issue_rows = "".join(
+        f'<li><strong>{_escape(item.rule_id)} {_escape(item.title)}</strong><span>{_escape(item.detail)}</span></li>'
+        for item in no_issue
+    ) or '<li class="empty">No rule completed without a finding.</li>'
+    coverage_rows = "".join(
+        f'<tr><th scope="row">{_escape(item.rule_id)} {_escape(item.title)}</th>'
+        f'<td>{_escape(", ".join(item.applicable_sources) or "request")}</td>'
+        f'<td>{_escape(", ".join(item.missing_fields) or "—")}</td>'
+        f"<td>{_escape(item.detail)}</td></tr>"
+        for item in not_evaluated
+    )
+    coverage = (
+        f"""<section class="panel analytics-section not-evaluated-panel"><div class="panel-head"><div>
+          <h2>Not evaluated</h2><small>{len(not_evaluated):,} rule(s) had no supporting evidence. These are coverage gaps, not findings, and are excluded from every finding count.</small></div></div>
+          <div class="table-scroll"><table class="data-table"><caption>Diagnostic applicability and missing evidence</caption>
+          <thead><tr><th scope="col">Rule</th><th scope="col">Applies to</th><th scope="col">Missing evidence</th><th scope="col">Why</th></tr></thead>
+          <tbody>{coverage_rows}</tbody></table></div></section>"""
+        if not_evaluated
+        else ""
+    )
+    return f"""<section class="panel analytics-section"><div class="panel-head"><div><h2>Evaluated findings</h2>
+      <small>{len(evaluated):,} rule(s) ran against supporting evidence and detected an addressable issue.</small></div></div>
+      <div class="finding-list">{finding_cards}</div></section>
+    <section class="panel analytics-section"><div class="panel-head"><div><h2>Evaluated — no issue detected</h2>
+      <small>{len(no_issue):,} rule(s) ran and found nothing addressable.</small></div></div>
+      <ul class="status-list">{no_issue_rows}</ul></section>
+    {coverage}
+    <section class="panel analytics-section additional"><div class="panel-head"><div><h2>Additional evaluated opportunities</h2>
+      <small>{len(additional):,} evaluated finding(s) below the Overview materiality threshold.</small></div></div>
+      {_finding_cards(additional, denominator=denominator) if additional else '<p class="empty">Every evaluated finding is already shown in Overview.</p>'}</section>"""
+
+
+def _composition_card(report: AnalysisReport) -> str:
+    """Single-model composition instead of a meaningless one-slice donut."""
+    summary = report.summary
+    models = model_rollups(report)
+    item = models[0] if models else None
+    cached_label = f"{summary.cached_tokens:,}" if summary.cached_tokens_available else "Metric unavailable"
+    parts = [
+        ("Input (uncached)", max(0, summary.input_tokens - (summary.cached_tokens if summary.cached_tokens_available else 0)), "#73c7ff"),
+        ("Cached input", summary.cached_tokens if summary.cached_tokens_available else 0, "#ffc857"),
+        ("Output", summary.output_tokens, "#57d68b"),
+    ]
+    total = max(1, sum(value for _, value, _ in parts))
+    bars = "".join(
+        f'<div class="bar-row"><span>{_escape(label)}</span>'
+        f'<div class="bar-track"><i style="width:{value / total * 100:.1f}%;background:{color}"></i></div>'
+        f"<strong>{value:,}</strong></div>"
+        for label, value, color in parts
+    )
+    name = _escape(_model_label(item)) if item else "Unknown model"
+    return f"""<article class="chart-card"><h2>Token composition</h2>
+      <p>One model is in scope, so composition replaces a single-slice share chart.</p>
+      <div class="composition" role="img" aria-label="Token composition for {name}: {summary.input_tokens:,} input, {_escape(cached_label)} cached, {summary.output_tokens:,} output">{bars}</div>
+      <div class="table-scroll"><table class="data-table"><caption>Token composition for {name}</caption>
+      <thead><tr><th scope="col">Component</th><th scope="col">Tokens</th></tr></thead>
+      <tbody><tr><th scope="row">Input</th><td>{summary.input_tokens:,}</td></tr>
+      <tr><th scope="row">Cached input</th><td>{_escape(cached_label)}</td></tr>
+      <tr><th scope="row">Output</th><td>{summary.output_tokens:,}</td></tr>
+      <tr><th scope="row">Total</th><td>{summary.total_tokens:,}</td></tr></tbody></table></div></article>"""
 
 
 def _donut_chart(report: AnalysisReport) -> tuple[str, str]:
@@ -186,7 +471,17 @@ def _donut_chart(report: AnalysisReport) -> tuple[str, str]:
       <text x="100" y="96" text-anchor="middle" class="donut-total">{report.summary.total_tokens:,}</text>
       <text x="100" y="113" text-anchor="middle" class="donut-label">total tokens</text>
     </svg>"""
-    return svg, _model_table(report)
+    # The donut's own text alternative stays compact; the full model summary is
+    # a separate panel, so the same table is never rendered twice.
+    rows = "".join(
+        f'<tr><th scope="row">{_escape(_model_label(item))}</th><td>{item.total_tokens:,}</td>'
+        f"<td>{item.token_share_percent:.1f}%</td></tr>"
+        for item in models
+    )
+    table = f"""<div class="table-scroll"><table class="data-table"><caption>Token share by model</caption>
+      <thead><tr><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead>
+      <tbody>{rows or '<tr><td colspan="3">No model usage observed.</td></tr>'}</tbody></table></div>"""
+    return svg, table
 
 
 def _column_chart(report: AnalysisReport) -> tuple[str, str]:
@@ -207,10 +502,13 @@ def _column_chart(report: AnalysisReport) -> tuple[str, str]:
         # Cached input is a subset of input, so chart it as a separate portion
         # while subtracting it from the regular input segment to keep columns
         # reconciled with the report's total token count.
+        # Cached input is a subset of input. When the metric is unavailable it is
+        # omitted entirely rather than drawn as a zero-height segment.
+        cached_value = item.cached_tokens if item.cached_tokens_available else 0
         parts = [
-            ("input", max(0, item.input_tokens - item.cached_tokens)),
+            ("input", max(0, item.input_tokens - cached_value)),
             ("output", item.output_tokens),
-            ("cached", item.cached_tokens),
+            ("cached", cached_value),
         ]
         for key, value in parts:
             if not value:
@@ -225,7 +523,7 @@ def _column_chart(report: AnalysisReport) -> tuple[str, str]:
         label = item.deployment_name
         rows.append(
             f'<tr><th scope="row">{_escape(label)}</th><td>{_escape(item.model_name)}</td><td>{item.input_tokens:,}</td>'
-            f'<td>{item.output_tokens:,}</td><td>{item.cached_tokens:,}</td><td>{item.total_tokens:,}</td>'
+            f'<td>{item.output_tokens:,}</td><td>{_escape(f"{item.cached_tokens:,}" if item.cached_tokens_available else "Unavailable")}</td><td>{item.total_tokens:,}</td>'
             f'<td>{_escape(_money(item.estimated_cost_usd, currency=item.pricing_currency))}</td></tr>'
         )
         rects.append(
@@ -241,10 +539,10 @@ def _column_chart(report: AnalysisReport) -> tuple[str, str]:
       <line x1="38" y1="{chart_top}" x2="38" y2="{chart_bottom}" class="axis"></line>
       {''.join(rects)}
     </svg>"""
-    table = f"""<table class="data-table"><caption>Accessible deployment token usage data</caption>
+    table = f"""<div class="table-scroll"><table class="data-table"><caption>Accessible deployment token usage data</caption>
       <thead><tr><th scope="col">Deployment</th><th scope="col">Model</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Cached</th><th scope="col">Total</th><th scope="col">Est. cost</th></tr></thead>
       <tbody>{''.join(rows) or '<tr><td colspan="7">No deployment usage observed.</td></tr>'}</tbody>
-    </table>"""
+    </table></div>"""
     return svg, table
 
 
@@ -264,12 +562,33 @@ def _analytics_deployment_sections(report: AnalysisReport) -> str:
             None,
         )
         findings = analysis.findings if analysis else []
+        aggregate = analysis.summary.aggregate if analysis else None
+        requests = f"{deployment.requests:,}" if deployment.requests is not None else "Unavailable"
+        cached = f"{deployment.cached_tokens:,}" if deployment.cached_tokens_available else "Metric unavailable"
+        retries = f"{deployment.retries:,}" if deployment.retries_available else "Unavailable"
+        status_codes = (
+            " · ".join(f"HTTP {code}: {count:,}" for code, count in aggregate.status_codes.items())
+            if aggregate and aggregate.status_codes
+            else ("Outcome metric unavailable" if aggregate else "")
+        )
+        bucket_line = (
+            f'<span>Buckets <strong>{aggregate.active_buckets:,} active / {aggregate.observed_buckets:,} observed / {aggregate.elapsed_buckets:,} elapsed</strong></span>'
+            if aggregate
+            else ""
+        )
+        outcome_line = f'<span>Outcomes <strong>{_escape(status_codes)}</strong></span>' if status_codes else ""
+        not_evaluated = analysis.diagnostics.not_evaluated if analysis else 0
+        coverage_line = (
+            f'<p class="muted">{not_evaluated:,} diagnostic(s) not evaluated for this deployment; only evaluated findings are listed.</p>'
+            if not_evaluated
+            else ""
+        )
         sections.append(
             f"""<details class="deployment-details"><summary><strong>{_escape(_display_name(deployment.deployment_name, unknown="Unknown deployment"))}</strong>
-              <span>{_escape(deployment.model_name)} · {deployment.requests:,} requests · {deployment.total_tokens:,} tokens</span></summary>
+              <span>{_escape(_model_label(deployment))} · {_escape(requests)} requests · {deployment.total_tokens:,} tokens</span></summary>
               <div class="detail-body"><div class="mini-stats"><span>Input <strong>{deployment.input_tokens:,}</strong></span>
-              <span>Output <strong>{deployment.output_tokens:,}</strong></span><span>Cached <strong>{deployment.cached_tokens:,}</strong></span>
-              <span>Retries <strong>{deployment.retries:,}</strong></span></div>{_finding_cards(findings)}</div>
+              <span>Output <strong>{deployment.output_tokens:,}</strong></span><span>Cached <strong>{_escape(cached)}</strong></span>
+              <span>Retries <strong>{_escape(retries)}</strong></span>{bucket_line}{outcome_line}</div>{coverage_line}{_finding_cards(findings)}</div>
             </details>"""
         )
     return "".join(sections) or '<p class="empty">No deployments observed.</p>'
@@ -334,11 +653,24 @@ def _cost_composition(report: AnalysisReport) -> str:
     if summary.estimated_cost_usd is None:
         reasons = ", ".join(_unresolved_reason_label(r) for r in summary.unresolved_reasons) or "no exact model/mode price"
         overrides = ", ".join(summary.suggested_override_keys)
+        headline, reason = _pricing_status_copy(summary)
+        unit = "metric bucket" if summary.analysis_unit == "metric_buckets" else "request"
+        plural = "" if summary.unresolved_requests == 1 else "s"
+        # The remediation depends on *why* pricing failed: identity, catalog
+        # coverage, and currency policy are different problems.
+        action = (
+            '<a href="#tab=usage" data-tab-link="usage">Fix collection identity first: the model and version must resolve before any rate can apply</a>'
+            if summary.pricing_status == "identity_unresolved"
+            else f'<a href="#tab=cost" data-tab-link="cost">Run <code>tokenlens-azure pricing-audit</code>{f" (suggested keys: {_escape(overrides)})" if overrides else ""} or add a customer catalog override</a>'
+            if summary.pricing_status == "catalog_missing"
+            else '<a href="#tab=cost" data-tab-link="cost">Configure a reporting currency; TokenLens never converts currencies</a>'
+        )
         return (
-            '<div class="cost-empty"><strong>No priced components yet</strong>'
-            f'<span>{summary.unresolved_requests:,} requests / {summary.unresolved_tokens:,} tokens are unresolved · {_escape(reasons)}</span>'
-            f'<span>Token volume and request counts remain visible below even though no rate resolved.</span>'
-            f'<a href="#cost" data-tab-link="cost">Run <code>tokenlens-azure pricing-audit</code>{f" (suggested keys: {_escape(overrides)})" if overrides else ""} or add a customer catalog override</a></div>'
+            f'<div class="cost-empty"><strong>No priced components yet · {_escape(headline)}</strong>'
+            f'<span>{_escape(reason)}</span>'
+            f'<span>{summary.unresolved_requests:,} unresolved {unit}{plural} / {summary.unresolved_tokens:,} tokens · {_escape(reasons)}</span>'
+            f'<span>Token volume and observed counts remain visible below even though no rate resolved.</span>'
+            f'{action}</div>'
         )
     components = [
         ("Fresh input", summary.fresh_input_cost_usd, "var(--accent)"),
@@ -371,8 +703,9 @@ def _unresolved_models_section(report: AnalysisReport) -> str:
     if not models:
         return ""
     rows = "".join(
-        f'<div class="unresolved-row"><div><strong>{_escape(item.model_name)}</strong>'
-        f'<span>{_escape(item.deployment_mode.title())} · {item.unresolved_requests:,} of {item.requests:,} requests</span></div>'
+        f'<div class="unresolved-row"><div><strong>{_escape(_model_label(item))}</strong>'
+        f'<span>{_escape(item.deployment_mode.title())} · {item.unresolved_requests:,} unresolved of '
+        f'{_escape(f"{item.requests:,} requests" if item.requests is not None else f"{item.active_buckets:,} active buckets")}</span></div>'
         f'<div><strong>{item.unresolved_tokens:,} tokens excluded</strong>'
         f'<span>{_escape(", ".join(_unresolved_reason_label(r) for r in item.unresolved_reasons) or "no exact model/mode price")}</span></div>'
         f'<div><strong>Suggested override key</strong><span><code>{_escape(", ".join(item.suggested_override_keys) or item.canonical_model_key)}</code></span></div></div>'
@@ -391,8 +724,8 @@ def _cost_analysis_panel(report: AnalysisReport) -> str:
     top_model = max(priced_models, key=lambda item: item.estimated_cost_usd or 0, default=None)
     composition = _cost_composition(report)
     model_rows = "".join(
-        f"<tr><th scope=\"row\">{_escape(item.model_name)}</th><td>{_escape(item.deployment_mode.title())}</td>"
-        f"<td>{item.requests:,}</td><td>{item.total_tokens:,}</td><td>{_escape(_billing_basis_label(item.pricing_billing_basis))}</td>"
+        f"<tr><th scope=\"row\">{_escape(_model_label(item))}</th><td>{_escape(item.deployment_mode.title())}</td>"
+        f"<td>{_escape(f'{item.requests:,}' if item.requests is not None else 'Unavailable')}</td><td>{item.total_tokens:,}</td><td>{_escape(_billing_basis_label(item.pricing_billing_basis))}</td>"
         f"<td>{_rate(item.input_price_per_million, currency=item.pricing_currency)} / "
         f"{_rate(item.cached_input_price_per_million, currency=item.pricing_currency)} / {_rate(item.output_price_per_million, currency=item.pricing_currency)}</td>"
         f"<td>{_money(item.estimated_cost_usd, currency=item.pricing_currency)}</td><td>{item.pricing_coverage_requests_percent:.1f}%</td>"
@@ -412,7 +745,13 @@ def _cost_analysis_panel(report: AnalysisReport) -> str:
     source_link = (
         f'<a href="{_escape(source_url)}">Microsoft Foundry pricing</a>'
         if isinstance(source_url, str) and source_url.startswith("https://")
-        else "bundled pricing catalog"
+        else "No source URL applies until a catalog entry matches"
+    )
+    # A CCU caveat only belongs in a report that actually contains Claude traffic.
+    claude_note = (
+        " Claude-family billing basis is a CCU-derived dollar-equivalent estimate, not an Azure token meter."
+        if any((item.pricing_publisher or "").casefold() == "anthropic" for item in models)
+        else ""
     )
     customer_catalog = pricing.get("customer_catalog_name")
     customer_note = (
@@ -420,38 +759,46 @@ def _cost_analysis_panel(report: AnalysisReport) -> str:
         if customer_catalog
         else ""
     )
+    status_headline, status_reason = _pricing_status_copy(summary)
     cost_sub = (
-        f"{summary.pricing_coverage_tokens_percent:.1f}% of tokens priced"
+        f"{summary.pricing_coverage_tokens_percent:.1f}% of observed tokens priced"
         if summary.estimated_cost_usd is not None
-        else "0% priced · see pricing-audit below"
+        else status_reason
     )
     basis_label = _pricing_source_label(summary.pricing_source) if summary.estimated_cost_usd is not None else "Unresolved"
     unresolved_sub = (
-        f"{summary.unresolved_tokens:,} tokens · {summary.unresolved_requests:,} requests"
-        if summary.unresolved_requests
-        else "None · fully priced"
+        f"{summary.unresolved_tokens:,} tokens excluded from the total"
+        if summary.unresolved_tokens
+        else "None · every observed token is priced"
     )
+    # A pricing snapshot date is only meaningful when an entry actually matched;
+    # otherwise it implies the catalog priced this workload.
+    reference_date = pricing.get("retrieved_at") if summary.estimated_cost_usd is not None else None
+    top_model_label = _model_label(top_model) if top_model else ("Unavailable · " + status_headline)
     return f"""<section class="metrics cost-metrics">
-      <div class="card"><div class="label">Estimated cost</div><div class="value">{_money(summary.estimated_cost_usd, currency=summary.pricing_currency)}</div><div class="sub">{cost_sub}</div></div>
-      <div class="card"><div class="label">Pricing coverage</div><div class="value">{summary.pricing_coverage_requests_percent:.1f}%</div><div class="sub">{summary.pricing_coverage_tokens_percent:.1f}% of tokens · requests above</div></div>
-      <div class="card"><div class="label">Estimate basis</div><div class="value cost-name">{_escape(basis_label)}</div><div class="sub">{_escape(summary.pricing_billing_basis and _billing_basis_label(summary.pricing_billing_basis) or "N/A")}</div></div>
-      <div class="card"><div class="label">Unresolved spend</div><div class="value cost-name">{summary.unresolved_requests:,} req</div><div class="sub">{unresolved_sub}</div></div>
-      <div class="card"><div class="label">Highest cost model</div><div class="value cost-name">{_escape(top_model.model_name if top_model else "Unavailable")}</div><div class="sub">{_money(top_model.estimated_cost_usd, currency=top_model.pricing_currency) if top_model else "No exact price"}</div></div>
-      <div class="card"><div class="label">Reference date</div><div class="value cost-name">{_escape(pricing.get("retrieved_at") or "Unavailable")}</div><div class="sub">{_escape(summary.pricing_currency)} estimate · not an invoice</div></div>
+      <div class="card"><div class="label">Priced cost</div><div class="value">{_money(summary.estimated_cost_usd, currency=summary.pricing_currency)}</div><div class="sub">{_escape(cost_sub)}</div></div>
+      <div class="card"><div class="label">Priced token coverage</div><div class="value">{summary.pricing_coverage_tokens_percent:.1f}%</div><div class="sub">{summary.total_tokens - summary.unresolved_tokens:,} of {summary.total_tokens:,} tokens</div></div>
+      <div class="card"><div class="label">Unpriced tokens</div><div class="value cost-name">{summary.unresolved_tokens:,}</div><div class="sub">{_escape(unresolved_sub)}</div></div>
+      <div class="card"><div class="label">Rate source</div><div class="value cost-name">{_escape(basis_label)}</div><div class="sub">{_escape(summary.pricing_billing_basis and _billing_basis_label(summary.pricing_billing_basis) or "No billing basis selected")}</div></div>
+      <div class="card"><div class="label">Highest cost model</div><div class="value cost-name">{_escape(top_model_label)}</div><div class="sub">{_money(top_model.estimated_cost_usd, currency=top_model.pricing_currency) if top_model else _escape(status_reason)}</div></div>
+      <div class="card"><div class="label">Pricing snapshot</div><div class="value cost-name">{_escape(reference_date or "Not applied")}</div><div class="sub">{_escape(summary.pricing_currency)} estimate · {_escape("matched catalog entry" if reference_date else "no catalog entry matched")}</div></div>
     </section>
     <p class="analytics-intro">Costs use observed values first, then exact customer or bundled reference prices. Unmatched models remain visible with volume, unresolved reason, and a remediation path — they are never folded into a misleading "Pricing unavailable" total when other calls are priced.</p>
     <section class="grid"><article class="chart-card"><h2>Cost composition</h2><p>Components reconcile only when every covered call has token rates; excluded tokens are shown separately, never as a zero-cost bar.</p>{composition}</article>
-    <article class="chart-card"><h2>Pricing provenance</h2><p>Reference pricing is bundled for offline analysis.</p>
-      <div class="provenance"><strong>{_escape(pricing.get("catalog_name") or "No catalog")}</strong>
-      <span>Retrieved {_escape(pricing.get("retrieved_at") or "unknown")} · {_escape(pricing.get("currency") or "USD")}</span>
+    <article class="chart-card"><h2>Pricing provenance</h2><p>Catalogs consulted and the entry actually selected are reported separately.</p>
+      <div class="provenance"><strong>Catalogs consulted: {_escape(", ".join(pricing.get("catalogs_consulted") or []) or "None")}</strong>
+      <span>Catalog entry selected: <strong>{_escape(pricing.get("catalog_selected") or "None — no exact entry matched")}</strong></span>
+      <span>Unresolved reason: {_escape(status_reason if summary.estimated_cost_usd is None or summary.unresolved_tokens else "None")}</span>
+      <span>Retrieved {_escape(reference_date or "not applied — no entry matched")} · {_escape(pricing.get("currency") or "USD")}</span>
       {customer_note}
-      <span>{source_link}</span><small>This analysis-date pricing snapshot is applied as an estimate, including to older traces. No currency conversion is performed. Agreements, offers, regions, and later prices may differ. Claude-family billing basis is a CCU-derived dollar-equivalent estimate, not an Azure token meter.</small></div></article></section>
+      <span>Publisher: {_escape(summary.pricing_publisher or "Unresolved")} · Billing basis: {_escape(_billing_basis_label(summary.pricing_billing_basis))}</span>
+      <span>{source_link}</span><small>This analysis-date pricing snapshot is applied as an estimate, including to older traces. No currency conversion is performed. Agreements, offers, regions, and later prices may differ.{claude_note}</small></div></article></section>
     <section class="panel table-panel"><h2>Cost by model and deployment mode</h2><p>Rates are input / cached input / output per 1M tokens.</p>
-      <table class="data-table"><caption>Model pricing and analyzed cost</caption><thead><tr><th>Model</th><th>Mode</th><th>Requests</th><th>Tokens</th><th>Billing basis</th><th>Reference rates</th><th>Est. cost</th><th>Coverage</th><th>Source/status</th></tr></thead>
-      <tbody>{model_rows or '<tr><td colspan="9">No model usage observed.</td></tr>'}</tbody></table></section>
+      <div class="table-scroll"><table class="data-table"><caption>Model pricing and analyzed cost</caption><thead><tr><th>Model</th><th>Mode</th><th>Requests</th><th>Tokens</th><th>Billing basis</th><th>Reference rates</th><th>Est. cost</th><th>Coverage</th><th>Source/status</th></tr></thead>
+      <tbody>{model_rows or '<tr><td colspan="9">No model usage observed.</td></tr>'}</tbody></table></div></section>
     <section class="panel table-panel"><h2>Cost by deployment</h2>
-      <table class="data-table"><caption>Deployment cost rollup</caption><thead><tr><th>Deployment</th><th>Model</th><th>Mode</th><th>Tokens</th><th>Billing basis</th><th>Est. cost</th><th>Coverage</th><th>Source/status</th></tr></thead>
-      <tbody>{deployment_rows or '<tr><td colspan="8">No deployments observed.</td></tr>'}</tbody></table></section>
+      <div class="table-scroll"><table class="data-table"><caption>Deployment cost rollup</caption><thead><tr><th>Deployment</th><th>Model</th><th>Mode</th><th>Tokens</th><th>Billing basis</th><th>Est. cost</th><th>Coverage</th><th>Source/status</th></tr></thead>
+      <tbody>{deployment_rows or '<tr><td colspan="8">No deployments observed.</td></tr>'}</tbody></table></div></section>
     {_unresolved_models_section(report)}
     <footer>tokenlens-for-azure · created by Tzahi Ariel</footer>"""
 
@@ -628,16 +975,18 @@ def _ptu_panel(report: AnalysisReport) -> str:
                 eligibility_explanation=_ELIGIBILITY_EXPLANATIONS.get(item.eligibility_status, ""),
             )
         )
-    return f"""<section class="metrics ptu-metrics">
+    # The selected deployment's recommendation comes first. Portfolio counters
+    # are context for that decision, not the headline.
+    return f"""<p class="analytics-intro">The PTU Advisor renders one deployment at a time. Recommendation, confidence, metrics, evidence charts, capacity sizing, economics, and exports all describe the selected deployment only; unrelated model or deployment slices are never merged into one recommendation.</p>
+    {selector(pairs)}
+    {''.join(dashboards) or '<p class="empty">No deployments observed.</p>'}
+    <section class="metrics ptu-metrics" aria-label="Portfolio summary counters">
       <div class="card"><div class="label">PTU recommended</div><div class="value">{analysis.recommended_deployments:,}</div><div class="sub">Strong workload fit</div></div>
       <div class="card"><div class="label">Borderline</div><div class="value">{analysis.borderline_deployments:,}</div><div class="sub">Validate with load testing</div></div>
       <div class="card"><div class="label">PAYG recommended</div><div class="value">{analysis.payg_deployments:,}</div><div class="sub">PAYG fits observed demand</div></div>
       <div class="card"><div class="label">Insufficient / unsupported</div><div class="value">{analysis.insufficient_deployments:,}</div><div class="sub">Needs evidence or capacity data</div></div>
       <div class="card"><div class="label">Time bucket</div><div class="value">{analysis.bucket_minutes} min</div><div class="sub">Offline trace aggregation</div></div>
     </section>
-    <p class="analytics-intro">The PTU Advisor renders one deployment at a time. Recommendation, confidence, metrics, evidence charts, capacity sizing, economics, and exports all describe the selected deployment only; unrelated model or deployment slices are never merged into one recommendation.</p>
-    {selector(pairs)}
-    {''.join(dashboards) or '<p class="empty">No deployments observed.</p>'}
     {_ptu_legacy_summary(analysis)}
     <section class="panel ptu-source"><strong>Method source</strong><span>Adapted from the MIT-licensed <a href="{_escape(analysis.source_repository)}">PTU Advisor</a> at revision <code>{_escape(analysis.source_revision[:12])}</code>.</span></section>
     <footer>tokenlens-for-azure · created by Tzahi Ariel</footer>"""
@@ -668,76 +1017,152 @@ def _ptu_legacy_summary(analysis: PtuPortfolioAssessment) -> str:
 def report_html(report: AnalysisReport) -> str:
     summary = report.summary
     overview = overview_findings(report)
-    additional = additional_opportunities(report)
     actions = top_recommendations(overview)
-    donut_svg, donut_table = _donut_chart(report)
+    models = model_rollups(report)
+    # A donut needs at least two slices to communicate anything.
+    multi_model = len(models) > 1
+    donut_svg, donut_table = _donut_chart(report) if multi_model else ("", "")
     column_svg, column_table = _column_chart(report)
     hidden_count = max(0, len(report.findings) - len(overview))
     config = report.report_metadata.get("materiality", {})
     cost_panel = _cost_analysis_panel(report)
     ptu_panel = _ptu_panel(report)
+    banner = _data_quality_banner(report)
+    pricing_headline, pricing_reason = _pricing_status_copy(summary)
+    deployment_label = "Single selected route" if len(report.deployments) == 1 else "Separate workload routes"
+    deployment_word = "deployment" if len(report.deployments) == 1 else "deployments"
+    cost_sub_overview = (
+        f"{summary.pricing_coverage_tokens_percent:.1f}% of tokens priced"
+        if summary.estimated_cost_usd is not None
+        else pricing_reason
+    )
+    model_chart = (
+        f'''<article class="chart-card"><h2>Token share by model</h2><p>Case variants of the same model family combine into one model slice.</p><div class="donut-wrap">{donut_svg}<div class="legend">{"".join(f'<div class="legend-row"><span class="swatch" style="background:{["#73c7ff","#57d68b","#ffc857","#ff8fa3","#b9a7ff","#5eead4","#f4a261"][i % 7]}"></span>{_escape(m.model_name)} · {m.total_tokens:,} · {m.token_share_percent:.1f}%</div>' for i, m in enumerate(models))}</div></div>{donut_table}</article>'''
+        if multi_model
+        else _composition_card(report)
+    )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TokenLens for Azure — Report</title>
 <style>
 :root{{--bg:#11213b;--surface:#172a49;--surface-2:#1d3559;--border:#35527a;--text:#f3f7ff;--muted:#b5c5dc;--soft:#d2deee;--accent:#73c7ff;--green:#57d68b;--amber:#ffc857;--pink:#ff8fa3;--shadow:0 12px 30px rgba(0,0,0,.22)}}
-*{{box-sizing:border-box}}html,body{{min-height:100%}}html{{background:var(--bg)}}body{{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:14px/1.4 "Segoe UI",Aptos,Calibri,Arial,sans-serif}}main{{width:100%;min-height:100vh;margin:0;padding:clamp(16px,1.5vw,28px)}}header{{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:14px}}.logo{{width:min(275px,55vw);height:auto;display:block}}.meta{{text-align:right;color:var(--muted);font-size:12px;line-height:1.5}}.meta strong{{color:var(--text);font-size:12px;margin-left:5px}}h1,h2,h3,p{{margin:0}}h2{{font-size:17px;letter-spacing:-.02em}}h3{{font-size:14px}}small,.muted{{display:block;color:var(--muted);font-size:12px}}.card,.panel,.chart-card,.kpi,.chart{{background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow)}}.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px}}.card,.kpi{{padding:11px 13px;min-height:76px}}.kpi b{{display:block;font-size:22px;color:var(--accent);margin-top:4px}}.kpi span,.label{{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}}.value{{font-size:22px;font-weight:700;letter-spacing:-.04em;margin-top:4px}}.sub{{font-size:12px;color:var(--muted);margin-top:2px}}.accent{{color:var(--accent)}}.overview-grid{{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(280px,.9fr);gap:12px;margin-bottom:12px}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}.panel-head{{padding:11px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:baseline;gap:12px}}.panel-head a,.tab{{color:var(--link,var(--accent));font-weight:700}}.portfolio{{padding:0 14px}}.portfolio-row{{display:grid;grid-template-columns:1.15fr 2fr 145px;gap:12px;align-items:center;padding:9px 0;border-bottom:1px solid var(--border)}}.portfolio-row:last-child{{border-bottom:0}}.portfolio-row strong{{font-size:12px}}.portfolio-row small{{margin-top:1px;font-size:12px}}.portfolio-bar{{height:9px;border-radius:9px;background:var(--surface-2);overflow:hidden}}.portfolio-bar span{{height:100%;display:block;background:var(--accent);border-radius:9px}}.portfolio-value{{text-align:right}}.portfolio-value strong{{display:block;font-size:12px}}.portfolio-value small{{font-size:12px}}.actions{{padding:9px 14px 10px}}.actions ol{{padding:0 0 0 20px;margin:0}}.actions li{{padding:5px 0 5px 2px;border-bottom:1px solid var(--border)}}.actions li:last-child{{border-bottom:0}}.actions li strong,.actions li span{{display:block;font-size:12px}}.actions li span{{color:var(--muted);font-size:12px;margin-top:1px}}.finding-panel{{margin-bottom:12px}}.finding-list{{display:grid;grid-template-columns:repeat(3,1fr)}}.finding-card{{display:grid;grid-template-columns:52px minmax(0,1.3fr) minmax(86px,.8fr);gap:9px;align-items:start;padding:10px 12px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}}.finding-card:nth-child(3n){{border-right:0}}.finding-card:last-child{{border-bottom:0}}.finding-rule{{font:700 10px Consolas,monospace;border-left:4px solid var(--accent);padding-left:6px;color:var(--soft)}}.finding-card.high .finding-rule{{border-color:var(--pink)}}.finding-card.medium .finding-rule{{border-color:var(--amber)}}.finding-card.low .finding-rule{{border-color:var(--accent)}}.finding-copy strong,.finding-impact strong,.finding-action strong{{display:block;font-size:12px}}.finding-copy span,.finding-impact span,.finding-action span{{display:block;color:var(--muted);font-size:12px;margin-top:2px}}.finding-impact strong{{color:var(--accent)}}.finding-action{{grid-column:2 / -1}}.finding-action strong{{color:var(--green)}}.tabs{{margin-top:4px}}.tab-list{{display:flex;gap:5px;border-bottom:1px solid var(--border);margin-bottom:14px}}.tab{{border:1px solid transparent;border-bottom:0;border-radius:8px 8px 0 0;background:transparent;padding:8px 13px;color:var(--muted);cursor:pointer;font:700 12px inherit}}.tab[aria-selected="true"]{{color:var(--text);background:var(--surface);border-color:var(--border)}}.tab:focus-visible,.donut-segment:focus-visible,.columns rect:focus-visible,summary:focus-visible{{outline:3px solid var(--amber);outline-offset:2px}}.js .tab-panel:not(.active){{display:none}}.tab-panel{{min-height:200px}}.analytics-intro{{color:var(--muted);font-size:12px;margin-bottom:12px}}.chart-grid{{display:grid;grid-template-columns:1fr 1.35fr;gap:12px;margin-bottom:12px}}.chart-card,.chart{{padding:14px;min-width:0}}.chart-card h2,.chart h2{{margin-bottom:3px}}.chart-card > p,.chart p{{color:var(--muted);font-size:12px;margin-bottom:10px}}.bar-row{{display:grid;grid-template-columns:150px 1fr 100px;align-items:center;gap:8px;margin:9px 0;font-size:12px}}.bar-track{{height:12px;background:var(--surface-2);border-radius:8px;overflow:hidden}}.bar-track i{{display:block;height:100%;background:var(--accent);border-radius:8px}}.donut-wrap{{display:flex;align-items:center;gap:12px;min-height:220px}}.donut{{width:220px;max-width:42%;overflow:visible}}.donut-total{{fill:var(--text);font-size:16px;font-weight:700}}.donut-label{{fill:var(--muted);font-size:11px}}.columns{{width:100%;height:auto;min-height:220px;overflow:visible}}.columns .axis,.axis{{stroke:var(--border);stroke-width:1}}.axis-label{{fill:var(--soft);font-size:12px}}.axis-value{{fill:var(--muted);font-size:11px}}svg text{{fill:var(--muted)}}svg circle{{fill:var(--green);stroke:var(--text);stroke-width:1}}.legend{{display:grid;gap:4px;min-width:130px}}.legend-row{{font-size:12px;color:var(--soft)}}.swatch{{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:0}}.data-table,.task table{{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px;color:var(--soft)}}.data-table caption,.task caption{{text-align:left;color:var(--muted);font-size:12px;margin-bottom:4px}}.data-table th,.data-table td,.task th,.task td{{padding:5px 6px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}}.data-table th:first-child,.data-table td:first-child,.task th:first-child,.task td:first-child{{text-align:left}}.data-table thead th,.task thead th{{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}}.table-panel{{padding:14px;margin-bottom:12px;overflow:auto}}.scenario-list{{margin:0;padding-left:20px}}.scenario-list li{{padding:6px 0;border-bottom:1px solid var(--border)}}.scenario-list small{{display:block;color:var(--muted)}}.analytics-section{{margin-bottom:12px}}.analytics-section > .panel-head{{margin-bottom:0}}.details-list{{display:grid;gap:7px}}.deployment-details{{background:var(--surface);border:1px solid var(--border);border-radius:9px;overflow:hidden}}summary{{cursor:pointer;padding:10px 13px;list-style-position:inside}}summary span{{color:var(--muted);font-size:11px;margin-left:10px}}.detail-body{{border-top:1px solid var(--border);padding:10px 13px}}.mini-stats{{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-bottom:7px}}.mini-stats strong{{color:var(--text);margin-left:3px}}.detail-body .finding-card{{background:var(--surface-2);border:1px solid var(--border);border-radius:7px;margin-top:6px;grid-template-columns:52px minmax(0,1.3fr) minmax(86px,.8fr)}}.additional{{border-left:3px solid var(--amber)}}.empty{{padding:12px 14px;color:var(--muted);font-size:12px}}footer{{text-align:center;color:var(--muted);font-size:10px;letter-spacing:.04em;margin-top:12px}}@media(max-width:960px){{main{{padding:16px}}.metrics{{grid-template-columns:repeat(3,1fr)}}.overview-grid,.chart-grid,.grid{{grid-template-columns:1fr}}.finding-list{{grid-template-columns:1fr}}.finding-card,.finding-card:nth-child(3n){{border-right:0}}.donut-wrap{{justify-content:center}}}}@media(max-width:620px){{header{{display:block}}.meta{{text-align:left;margin-top:8px}}.metrics{{grid-template-columns:repeat(2,1fr)}}.portfolio-row{{grid-template-columns:1fr 100px}}.portfolio-bar{{grid-column:1 / -1;grid-row:2}}.portfolio-value{{text-align:right}}.donut-wrap{{display:block}}.donut{{display:block;max-width:220px;margin:auto}}.data-table{{display:block;overflow-x:auto}}summary span{{display:block;margin:3px 0 0 21px}}}}@media print{{@page{{size:landscape;margin:.35in}}body{{background:#fff;color:#11213b;font-size:10px}}main{{max-width:none;padding:0}}header{{border-color:#9aa8ba}}.card,.panel,.chart-card,.kpi,.chart,.deployment-details{{box-shadow:none;background:#fff;border-color:#9aa8ba}}.metrics{{gap:5px}}.value{{font-size:16px}}.overview{{min-height:6.8in;page-break-after:always}}.usage{{page-break-before:always}}.tab-list{{display:none}}.js .tab-panel:not(.active){{display:block}}.finding-card,.portfolio-row{{border-color:#b8c2cf}}.finding-copy span,.finding-impact span,.finding-action span,.analytics-intro,.data-table caption,small,.muted{{color:#46556b}}.data-table th,.data-table td{{border-color:#b8c2cf}}footer{{color:#46556b}}}}
-.donut-segment,.donut-track{{fill:none}}.cost-name{{font-size:15px;line-height:1.2}}.cost-bar{{display:grid;grid-template-columns:130px 1fr 110px;gap:9px;align-items:center;margin:12px 0;font-size:12px}}.cost-track{{height:14px;background:var(--surface-2);border-radius:8px;overflow:hidden;display:flex}}.cost-track i.excluded,.cost-track i.covered.partial{{background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.4) 0 5px,rgba(255,255,255,.08) 5px 10px);background-color:var(--muted)}}.cost-bar.partial span{{color:var(--amber)}}.cost-empty{{display:grid;gap:6px;padding:14px;border:1px dashed var(--border);border-radius:9px;background:var(--surface-2)}}.cost-empty strong{{font-size:13px}}.cost-empty span{{font-size:12px;color:var(--muted)}}.cost-empty a{{font-size:12px;font-weight:700}}.unresolved-list{{display:grid;gap:8px;margin-top:8px}}.unresolved-row{{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:8px;padding:8px 10px;border:1px solid var(--border);border-left:3px solid var(--amber);border-radius:7px;background:var(--surface-2);font-size:12px}}.unresolved-row strong{{display:block;font-size:12px}}.unresolved-row span{{display:block;color:var(--muted);font-size:12px;margin-top:2px}}.cost-track i{{display:block;height:100%;border-radius:8px}}.cost-bar strong{{text-align:right}}.provenance{{display:grid;gap:7px;font-size:12px}}.provenance{{font-size:12px}}.provenance span,.provenance small{{color:var(--muted)}}a{{color:var(--accent)}}.ptu-list{{display:grid;gap:12px}}.ptu-card{{padding:14px}}.ptu-head{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:11px}}.ptu-recommendation{{color:var(--accent);font-size:14px}}.dimension-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-bottom:11px}}.dimension{{padding:8px;border:1px solid var(--border);border-left:4px solid var(--muted);border-radius:7px;background:var(--surface-2)}}.dimension.positive{{border-left-color:var(--green)}}.dimension.neutral{{border-left-color:var(--amber)}}.dimension.negative{{border-left-color:var(--pink)}}.dimension strong,.dimension span,.dimension small{{display:block}}.dimension strong{{font-size:11px}}.dimension span{{font-size:12px;color:var(--soft);margin-top:2px}}.dimension small{{font-size:11px;margin-top:2px}}.ptu-stats{{display:grid;grid-template-columns:repeat(8,1fr);gap:7px}}.ptu-stats span{{font-size:11px;color:var(--muted);text-transform:uppercase}}.ptu-stats strong{{display:block;color:var(--text);font-size:11px;text-transform:none;margin-top:3px}}.ptu-note{{font-size:12px;color:var(--muted);margin-top:10px}}.ptu-evidence-note{{font-size:12px;color:var(--amber);margin:10px 0;padding:10px 12px;border:1px dashed var(--border);border-radius:8px;background:var(--surface-2)}}.eligibility-badge{{font-weight:700;padding:1px 6px;border-radius:5px;background:var(--surface-2);color:var(--soft)}}.eligibility-badge.eligible_sufficient_evidence{{color:var(--green)}}.eligibility-badge.eligible_insufficient_evidence,.eligibility-badge.pricing_unavailable,.eligibility-badge.deployment_mode_unavailable{{color:var(--amber)}}.eligibility-badge.model_capacity_unavailable,.eligibility-badge.ptu_not_applicable{{color:var(--pink)}}.ptu-graphs{{margin-top:12px}}.ptu-source{{display:flex;gap:8px;padding:12px;margin-top:12px;font-size:11px}}@media(max-width:960px){{.dimension-grid{{grid-template-columns:1fr 1fr}}.ptu-stats{{grid-template-columns:repeat(4,1fr)}}}}@media(max-width:620px){{.cost-bar{{grid-template-columns:80px 1fr}}.cost-bar strong{{grid-column:2}}.dimension-grid,.ptu-stats{{grid-template-columns:1fr 1fr}}.ptu-head{{display:block}}.ptu-recommendation{{display:block;margin-top:5px}}}}
+*{{box-sizing:border-box}}html,body{{min-height:100%}}html{{background:var(--bg)}}body{{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:14px/1.4 "Segoe UI",Aptos,Calibri,Arial,sans-serif}}main{{width:100%;min-height:100vh;margin:0;padding:clamp(16px,1.5vw,28px)}}header{{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:14px}}.logo{{width:min(275px,55vw);height:auto;display:block}}.meta{{text-align:right;color:var(--muted);font-size:12px;line-height:1.5}}.meta strong{{color:var(--text);font-size:12px;margin-left:5px}}h1,h2,h3,p{{margin:0}}h2{{font-size:17px;letter-spacing:-.02em}}h3{{font-size:14px}}small,.muted{{display:block;color:var(--muted);font-size:12px}}.card,.panel,.chart-card,.kpi,.chart{{background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow)}}.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px}}.card,.kpi{{padding:11px 13px;min-height:76px}}.kpi b{{display:block;font-size:22px;color:var(--accent);margin-top:4px}}.kpi span,.label{{color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}}.value{{font-size:22px;font-weight:700;letter-spacing:-.04em;margin-top:4px}}.sub{{font-size:12px;color:var(--muted);margin-top:2px}}.accent{{color:var(--accent)}}.overview-grid{{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(280px,.9fr);gap:12px;margin-bottom:12px}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}.panel-head{{padding:11px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:baseline;gap:12px}}.panel-head a,.tab{{color:var(--link,var(--accent));font-weight:700}}.portfolio{{padding:0 14px}}.portfolio-row{{display:grid;grid-template-columns:1.15fr 2fr 145px;gap:12px;align-items:center;padding:9px 0;border-bottom:1px solid var(--border)}}.portfolio-row:last-child{{border-bottom:0}}.portfolio-row strong{{font-size:12px}}.portfolio-row small{{margin-top:1px;font-size:12px}}.portfolio-bar{{height:9px;border-radius:9px;background:var(--surface-2);overflow:hidden}}.portfolio-bar span{{height:100%;display:block;background:var(--accent);border-radius:9px}}.portfolio-value{{text-align:right}}.portfolio-value strong{{display:block;font-size:12px}}.portfolio-value small{{font-size:12px}}.actions{{padding:9px 14px 10px}}.actions ol{{padding:0 0 0 20px;margin:0}}.actions li{{padding:5px 0 5px 2px;border-bottom:1px solid var(--border)}}.actions li:last-child{{border-bottom:0}}.actions li strong,.actions li span{{display:block;font-size:12px}}.actions li span{{color:var(--muted);font-size:12px;margin-top:1px}}.finding-panel{{margin-bottom:12px}}.finding-list{{display:grid;grid-template-columns:repeat(3,1fr)}}.finding-card{{display:grid;grid-template-columns:52px minmax(0,1.3fr) minmax(86px,.8fr);gap:9px;align-items:start;padding:10px 12px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}}.finding-card:nth-child(3n){{border-right:0}}.finding-card:last-child{{border-bottom:0}}.finding-rule{{font:700 12px Consolas,monospace;border-left:4px solid var(--accent);padding-left:6px;color:var(--soft)}}.finding-card.high .finding-rule{{border-color:var(--pink)}}.finding-card.medium .finding-rule{{border-color:var(--amber)}}.finding-card.low .finding-rule{{border-color:var(--accent)}}.finding-copy strong,.finding-impact strong,.finding-action strong{{display:block;font-size:12px}}.finding-copy span,.finding-impact span,.finding-action span{{display:block;color:var(--muted);font-size:12px;margin-top:2px}}.finding-impact strong{{color:var(--accent)}}.finding-action{{grid-column:2 / -1}}.finding-action strong{{color:var(--green)}}.tabs{{margin-top:4px}}.tab-list{{display:flex;gap:5px;border-bottom:1px solid var(--border);margin-bottom:14px;position:sticky;top:0;z-index:6;background:var(--bg);overflow-x:auto;scrollbar-width:none;max-width:100%}}.tab-list::-webkit-scrollbar{{display:none}}.tab{{border:1px solid transparent;border-bottom:0;border-radius:8px 8px 0 0;background:transparent;padding:10px 13px;color:var(--muted);cursor:pointer;font:700 13px inherit;white-space:nowrap;min-height:44px;flex:0 0 auto}}.tab-short{{display:none}}.tab[aria-selected="true"]{{color:var(--text);background:var(--surface);border-color:var(--border)}}.tab:focus-visible,.donut-segment:focus-visible,.columns rect:focus-visible,summary:focus-visible{{outline:3px solid var(--amber);outline-offset:2px}}.js .tab-panel:not(.active){{display:none}}.tab-panel{{min-height:200px}}.analytics-intro{{color:var(--muted);font-size:12px;margin-bottom:12px}}.chart-grid{{display:grid;grid-template-columns:1fr 1.35fr;gap:12px;margin-bottom:12px}}.chart-card,.chart{{padding:14px;min-width:0}}.chart-card h2,.chart h2{{margin-bottom:3px}}.chart-card > p,.chart p{{color:var(--muted);font-size:12px;margin-bottom:10px}}.bar-row{{display:grid;grid-template-columns:150px 1fr 100px;align-items:center;gap:8px;margin:9px 0;font-size:12px}}.bar-track{{height:12px;background:var(--surface-2);border-radius:8px;overflow:hidden}}.bar-track i{{display:block;height:100%;background:var(--accent);border-radius:8px}}.donut-wrap{{display:flex;align-items:center;gap:12px;min-height:220px}}.donut{{width:220px;max-width:42%;overflow:visible}}.donut-total{{fill:var(--text);font-size:16px;font-weight:700}}.donut-label{{fill:var(--muted);font-size:12px}}.columns{{width:100%;height:auto;min-height:220px;overflow:visible}}.columns .axis,.axis{{stroke:var(--border);stroke-width:1}}.axis-label{{fill:var(--soft);font-size:12px}}.axis-value{{fill:var(--muted);font-size:12px}}svg text{{fill:var(--muted)}}svg circle{{fill:var(--green);stroke:var(--text);stroke-width:1}}.legend{{display:grid;gap:4px;min-width:130px}}.legend-row{{font-size:12px;color:var(--soft)}}.swatch{{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:0}}.data-table,.task table{{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px;color:var(--soft)}}.data-table caption,.task caption{{text-align:left;color:var(--muted);font-size:12px;margin-bottom:4px}}.data-table th,.data-table td,.task th,.task td{{padding:5px 6px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}}.data-table th:first-child,.data-table td:first-child,.task th:first-child,.task td:first-child{{text-align:left}}.data-table thead th,.task thead th{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}}.table-panel{{padding:14px;margin-bottom:12px;overflow:auto}}.table-scroll{{max-width:100%;overflow-x:auto}}.chart-card .data-table,.table-panel .data-table{{max-width:none}}.scenario-list{{margin:0;padding-left:20px}}.scenario-list li{{padding:6px 0;border-bottom:1px solid var(--border)}}.scenario-list small{{display:block;color:var(--muted)}}.analytics-section{{margin-bottom:12px}}.analytics-section > .panel-head{{margin-bottom:0}}.details-list{{display:grid;gap:7px}}.deployment-details{{background:var(--surface);border:1px solid var(--border);border-radius:9px;overflow:hidden}}summary{{cursor:pointer;padding:10px 13px;list-style-position:inside}}summary span{{color:var(--muted);font-size:12px;margin-left:10px}}.detail-body{{border-top:1px solid var(--border);padding:10px 13px}}.mini-stats{{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-bottom:7px}}.mini-stats strong{{color:var(--text);margin-left:3px}}.detail-body .finding-card{{background:var(--surface-2);border:1px solid var(--border);border-radius:7px;margin-top:6px;grid-template-columns:52px minmax(0,1.3fr) minmax(86px,.8fr)}}.additional{{border-left:3px solid var(--amber)}}.empty{{padding:12px 14px;color:var(--muted);font-size:12px}}footer{{text-align:center;color:var(--muted);font-size:11px;letter-spacing:.04em;margin-top:12px}}@media(max-width:960px){{main{{padding:16px}}.metrics{{grid-template-columns:repeat(3,1fr)}}.overview-grid,.chart-grid,.grid{{grid-template-columns:1fr}}.finding-list{{grid-template-columns:1fr}}.finding-card,.finding-card:nth-child(3n){{border-right:0}}.donut-wrap{{justify-content:center}}}}@media(max-width:620px){{header{{display:block}}.meta{{text-align:left;margin-top:8px;font-size:12px}}.tab-full{{display:none}}.tab-short{{display:inline}}.tab{{padding:11px 14px;font-size:13px}}.single-usage-grid{{grid-template-columns:1fr 1fr}}.metrics{{grid-template-columns:repeat(2,1fr)}}.portfolio-row{{grid-template-columns:1fr 100px}}.portfolio-bar{{grid-column:1 / -1;grid-row:2}}.portfolio-value{{text-align:right}}.donut-wrap{{display:block}}.donut{{display:block;max-width:220px;margin:auto}}.data-table{{display:block;overflow-x:auto}}summary span{{display:block;margin:3px 0 0 21px}}}}@media print{{@page{{size:landscape;margin:.35in}}body{{background:#fff;color:#11213b;font-size:11px}}main{{max-width:none;padding:0}}header{{border-color:#9aa8ba}}.card,.panel,.chart-card,.kpi,.chart,.deployment-details{{box-shadow:none;background:#fff;border-color:#9aa8ba}}.metrics{{gap:5px}}.value{{font-size:16px}}.overview{{min-height:6.8in;page-break-after:always}}.usage{{page-break-before:always}}.tab-list{{display:none}}.js .tab-panel:not(.active){{display:block}}.finding-card,.portfolio-row{{border-color:#b8c2cf}}.finding-copy span,.finding-impact span,.finding-action span,.analytics-intro,.data-table caption,small,.muted{{color:#46556b}}.data-table th,.data-table td{{border-color:#b8c2cf}}footer{{color:#46556b}}}}
+.donut-segment,.donut-track{{fill:none}}.cost-name{{font-size:15px;line-height:1.2}}.cost-bar{{display:grid;grid-template-columns:130px 1fr 110px;gap:9px;align-items:center;margin:12px 0;font-size:12px}}.cost-track{{height:14px;background:var(--surface-2);border-radius:8px;overflow:hidden;display:flex}}.cost-track i.excluded,.cost-track i.covered.partial{{background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.4) 0 5px,rgba(255,255,255,.08) 5px 10px);background-color:var(--muted)}}.cost-bar.partial span{{color:var(--amber)}}.cost-empty{{display:grid;gap:6px;padding:14px;border:1px dashed var(--border);border-radius:9px;background:var(--surface-2)}}.cost-empty strong{{font-size:13px}}.cost-empty span{{font-size:12px;color:var(--muted)}}.cost-empty a{{font-size:12px;font-weight:700}}.unresolved-list{{display:grid;gap:8px;margin-top:8px}}.unresolved-row{{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:8px;padding:8px 10px;border:1px solid var(--border);border-left:3px solid var(--amber);border-radius:7px;background:var(--surface-2);font-size:12px}}.unresolved-row strong{{display:block;font-size:12px}}.unresolved-row span{{display:block;color:var(--muted);font-size:12px;margin-top:2px}}.cost-track i{{display:block;height:100%;border-radius:8px}}.cost-bar strong{{text-align:right}}.provenance{{display:grid;gap:7px;font-size:12px}}.provenance{{font-size:12px}}.provenance span,.provenance small{{color:var(--muted)}}a{{color:var(--accent)}}.ptu-list{{display:grid;gap:12px}}.ptu-card{{padding:14px}}.ptu-head{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:11px}}.ptu-recommendation{{color:var(--accent);font-size:14px}}.dimension-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-bottom:11px}}.dimension{{padding:8px;border:1px solid var(--border);border-left:4px solid var(--muted);border-radius:7px;background:var(--surface-2)}}.dimension.positive{{border-left-color:var(--green)}}.dimension.neutral{{border-left-color:var(--amber)}}.dimension.negative{{border-left-color:var(--pink)}}.dimension strong,.dimension span,.dimension small{{display:block}}.dimension strong{{font-size:12px}}.dimension span{{font-size:12px;color:var(--soft);margin-top:2px}}.dimension small{{font-size:12px;margin-top:2px}}.ptu-stats{{display:grid;grid-template-columns:repeat(8,1fr);gap:7px}}.ptu-stats span{{font-size:12px;color:var(--muted);text-transform:uppercase}}.ptu-stats strong{{display:block;color:var(--text);font-size:12px;text-transform:none;margin-top:3px}}.ptu-note{{font-size:12px;color:var(--muted);margin-top:10px}}.ptu-evidence-note{{font-size:12px;color:var(--amber);margin:10px 0;padding:10px 12px;border:1px dashed var(--border);border-radius:8px;background:var(--surface-2)}}.eligibility-badge{{font-weight:700;padding:1px 6px;border-radius:5px;background:var(--surface-2);color:var(--soft)}}.eligibility-badge.eligible_sufficient_evidence{{color:var(--green)}}.eligibility-badge.eligible_insufficient_evidence,.eligibility-badge.pricing_unavailable,.eligibility-badge.deployment_mode_unavailable{{color:var(--amber)}}.eligibility-badge.model_capacity_unavailable,.eligibility-badge.ptu_not_applicable{{color:var(--pink)}}.ptu-graphs{{margin-top:12px}}.ptu-source{{display:flex;gap:8px;padding:12px;margin-top:12px;font-size:12px}}@media(max-width:960px){{.dimension-grid{{grid-template-columns:1fr 1fr}}.ptu-stats{{grid-template-columns:repeat(4,1fr)}}}}@media(max-width:620px){{.cost-bar{{grid-template-columns:80px 1fr}}.cost-bar strong{{grid-column:2}}.dimension-grid,.ptu-stats{{grid-template-columns:1fr 1fr}}.ptu-head{{display:block}}.ptu-recommendation{{display:block;margin-top:5px}}}}
+.data-quality{{display:grid;gap:8px;padding:12px 14px;margin-bottom:12px;border:1px solid var(--border);border-left:5px solid var(--amber);border-radius:10px;background:var(--surface)}}.data-quality.blocking{{border-left-color:var(--pink)}}.dq-head{{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline}}.dq-head strong{{font-size:13px}}.dq-head span{{color:var(--muted);font-size:12px}}.data-quality ul{{margin:0;padding-left:18px;display:grid;gap:4px}}.data-quality li{{font-size:12px;color:var(--soft)}}.data-quality li strong{{display:inline;font-size:12px}}.data-quality li span{{display:block;color:var(--muted);font-size:12px}}.data-quality li.dq-blocker strong::before{{content:"Blocker · ";color:var(--pink)}}.data-quality li.dq-warning strong::before{{content:"Limitation · ";color:var(--amber)}}.single-usage{{padding:12px 14px;display:grid;gap:8px}}.single-usage-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0}}.single-usage-grid div{{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:8px 10px}}.single-usage-grid dt{{color:var(--muted);font-size:12px}}.single-usage-grid dd{{margin:2px 0 0;font-size:13px;font-weight:700}}.status-list{{margin:0;padding:10px 14px 12px 32px;display:grid;gap:6px}}.status-list li{{font-size:13px;color:var(--soft)}}.status-list li span{{display:block;color:var(--muted);font-size:12px}}.status-list li.empty{{list-style:none;margin-left:-18px;color:var(--muted)}}.actions li.not-evaluated strong{{color:var(--amber)}}.composition{{display:grid;gap:4px;margin-bottom:8px}}.not-evaluated-panel{{border-left:3px solid var(--muted)}}
+
 {PTU_DASHBOARD_CSS}
 </style></head><body><main>
 <header><div><img class="logo" src="data:image/png;base64,{_logo_data_uri().split(',',1)[1]}" alt="TokenLens for Azure logo"></div>
-<div class="meta">Generated<strong>{_escape(report.generated_at)}</strong> · Source<strong>{_escape(report.source)}</strong> · Offline synthetic example</div></header>
+<div class="meta">Generated<strong title="{_escape(report.generated_at)}">{_escape(_human_timestamp(report.generated_at))}</strong>
+· Source<strong>{_escape(_source_summary(report))}</strong> · {_escape(_classification_label(report))}</div></header>
+{banner}
 <div class="tabs"><div class="tab-list" role="tablist" aria-label="Report views">
-<button class="tab" id="overview-tab" role="tab" aria-selected="true" aria-controls="overview-panel" tabindex="0">Overview</button>
-<button class="tab" id="cost-tab" role="tab" aria-selected="false" aria-controls="cost-panel" tabindex="-1">Cost analysis</button>
-<button class="tab" id="usage-tab" role="tab" aria-selected="false" aria-controls="usage-panel" tabindex="-1">Usage &amp; diagnostics</button>
-<button class="tab" id="ptu-tab" role="tab" aria-selected="false" aria-controls="ptu-panel" tabindex="-1">PTU advisor</button></div>
+<button class="tab" id="overview-tab" role="tab" aria-selected="true" aria-controls="overview-panel" tabindex="0"><span class="tab-full">Overview</span><span class="tab-short" aria-hidden="true">Overview</span></button>
+<button class="tab" id="cost-tab" role="tab" aria-selected="false" aria-controls="cost-panel" tabindex="-1" aria-label="Cost analysis"><span class="tab-full">Cost analysis</span><span class="tab-short" aria-hidden="true">Cost</span></button>
+<button class="tab" id="usage-tab" role="tab" aria-selected="false" aria-controls="usage-panel" tabindex="-1" aria-label="Usage and diagnostics"><span class="tab-full">Usage &amp; diagnostics</span><span class="tab-short" aria-hidden="true">Usage</span></button>
+<button class="tab" id="ptu-tab" role="tab" aria-selected="false" aria-controls="ptu-panel" tabindex="-1" aria-label="PTU advisor"><span class="tab-full">PTU advisor</span><span class="tab-short" aria-hidden="true">PTU</span></button></div>
 <section class="tab-panel overview active" id="overview-panel" role="tabpanel" aria-labelledby="overview-tab">
-<section class="metrics"><div class="card"><div class="label">Requests</div><div class="value">{summary.requests_analyzed:,}</div><div class="sub">{summary.retries:,} retries observed</div></div>
-<div class="card"><div class="label">Total tokens</div><div class="value">{summary.total_tokens:,}</div><div class="sub">{summary.input_tokens:,} input · {summary.output_tokens:,} output</div></div>
-<div class="card"><div class="label">Deployments</div><div class="value">{len(report.deployments):,}</div><div class="sub">Separate workload routes</div></div>
-<div class="card"><div class="label">Estimated cost</div><div class="value accent">{_money(summary.estimated_cost_usd, currency=summary.pricing_currency)}</div><div class="sub">Analyzed trace · covered calls</div></div>
-<div class="card"><div class="label">Pricing coverage</div><div class="value">{summary.pricing_coverage_requests_percent:.1f}%</div><div class="sub">{summary.pricing_coverage_tokens_percent:.1f}% of tokens</div></div></section>
+<section class="metrics"><div class="card"><div class="label">Requests</div><div class="value">{_escape(_requests_value(summary))}</div><div class="sub">{_escape(_requests_sub(summary))}</div></div>
+<div class="card"><div class="label">Total tokens</div><div class="value">{_escape(_total_tokens_value(summary))}</div><div class="sub">{_escape(_tokens_sub(summary))}</div></div>
+<div class="card"><div class="label">Deployments</div><div class="value">{len(report.deployments):,} {_escape(deployment_word)}</div><div class="sub">{_escape(deployment_label)}</div></div>
+<div class="card"><div class="label">Estimated cost</div><div class="value accent">{_money(summary.estimated_cost_usd, currency=summary.pricing_currency)}</div><div class="sub">{_escape(cost_sub_overview)}</div></div>
+<div class="card"><div class="label">Pricing coverage</div><div class="value">{summary.pricing_coverage_tokens_percent:.1f}% priced</div><div class="sub">{_escape(pricing_headline)} · {_escape(pricing_reason)}</div></div></section>
 <section class="overview-grid"><section class="panel"><div class="panel-head"><div><h2>Portfolio usage</h2><small>Token share by deployment</small></div><a href="#usage" data-tab-link="usage">View analytics →</a></div><div class="portfolio">{_deployment_rows(report)}</div></section>
-<aside class="panel"><div class="panel-head"><div><h2>Azure actions</h2><small>Prioritized for a first decision</small></div></div><div class="actions"><ol>{_overview_actions(actions)}</ol></div></aside></section>
-<section class="panel finding-panel"><div class="panel-head"><div><h2>Material findings</h2><small>Overview prioritizes results at or above {float(config.get("overview_min_impact_percent", 1.0)):.1f}% impact or {int(config.get("overview_min_impact_tokens", 100000)):,} tokens.</small></div></div><div class="finding-list">{_finding_cards(overview, compact=True)}</div>
-{f'<p class="empty">{hidden_count:,} additional opportunities are available in Usage analytics.</p>' if hidden_count else ""}</section>
+<aside class="panel"><div class="panel-head"><div><h2>Azure actions</h2><small>Prioritized for a first decision</small></div></div><div class="actions"><ol>{_overview_actions(actions, report)}</ol></div></aside></section>
+<section class="panel finding-panel"><div class="panel-head"><div><h2>Material findings</h2><small>Only diagnostics that ran against supporting evidence appear here, at or above {float(config.get("overview_min_impact_percent", 1.0)):.1f}% impact or {int(config.get("overview_min_impact_tokens", 100000)):,} tokens. Impact share and evidence strength are stated separately, and rules that could not be evaluated are excluded.</small></div></div><div class="finding-list">{_finding_cards(overview, compact=True, empty=_no_findings_message(report), denominator=f"{summary.input_tokens:,} input tokens")}</div>
+{f'<p class="empty">{hidden_count:,} additional evaluated opportunities are available in Usage analytics.</p>' if hidden_count else ""}
+{f'<p class="empty">{report.diagnostics.not_evaluated:,} diagnostic(s) were not evaluated for lack of evidence and are listed under Usage &rarr; Not evaluated.</p>' if report.diagnostics.not_evaluated else ""}</section>
 <footer>tokenlens-for-azure · created by Tzahi Ariel</footer></section>
 <section class="tab-panel usage" id="usage-panel" role="tabpanel" aria-labelledby="usage-tab">
 <p class="analytics-intro">Usage analytics retains every finding. Percentages are relative to the relevant deployment or portfolio, and absolute token or call volume is shown alongside them. Low materiality does not mean invalid; it means lower priority for the first executive decision.</p>
-<section class="chart-grid"><article class="chart-card"><h2>Token share by model</h2><p>Case variants of the same model family combine into one model slice.</p><div class="donut-wrap">{donut_svg}<div class="legend">{''.join(f'<div class="legend-row"><span class="swatch" style="background:{["#73c7ff","#57d68b","#ffc857","#ff8fa3","#b9a7ff","#5eead4","#f4a261"][i % 7]}"></span>{_escape(m.model_name)} · {m.total_tokens:,} · {m.token_share_percent:.1f}%</div>' for i,m in enumerate(model_rollups(report)))}</div></div>{donut_table}</article>
-<article class="chart-card"><h2>Token usage by deployment</h2><p>Input, output, and cached tokens are stacked; deployments remain separate.</p>{column_svg}<div class="legend"><span class="legend-row"><span class="swatch" style="background:#73c7ff"></span>Input (uncached)</span><span class="legend-row"><span class="swatch" style="background:#57d68b"></span>Output</span><span class="legend-row"><span class="swatch" style="background:#ffc857"></span>Cached input</span></div>{column_table}</article></section>
-<section class="panel analytics-section"><div class="panel-head"><div><h2>All findings</h2><small>Material and lower-impact opportunities are retained for investigation.</small></div></div><div class="finding-list">{_finding_cards(report.findings)}</div></section>
-<section class="panel analytics-section additional"><div class="panel-head"><div><h2>Additional opportunities</h2><small>{len(additional):,} lower-impact finding(s) retained outside Overview.</small></div></div>{_finding_cards(additional)}</section>
-<section class="analytics-section"><div class="panel-head"><div><h2>Deployment details</h2><small>Expand a deployment for its findings and token breakdown.</small></div></div><div class="details-list">{_analytics_deployment_sections(report)}</div></section>
+<section class="chart-grid">{model_chart}
+<article class="chart-card"><h2>Token usage by deployment</h2><p>Input, output, and cached tokens are stacked; deployments remain separate. Cached input is omitted, never drawn as zero, when the metric is unavailable.</p>{column_svg}<div class="legend"><span class="legend-row"><span class="swatch" style="background:#73c7ff"></span>Input (uncached)</span><span class="legend-row"><span class="swatch" style="background:#57d68b"></span>Output</span><span class="legend-row"><span class="swatch" style="background:#ffc857"></span>Cached input</span></div>{column_table}</article></section>
+<section class="panel table-panel"><h2>Model summary</h2><div class="table-scroll">{_model_table(report)}</div></section>
+{_diagnostic_sections(report)}
+<section class="analytics-section"><div class="panel-head"><div><h2>Deployment details</h2><small>Expand a deployment for its evaluated findings, metric coverage, and bucket counts.</small></div></div><div class="details-list">{_analytics_deployment_sections(report)}</div></section>
 <footer>tokenlens-for-azure · created by Tzahi Ariel</footer></section>
 <section class="tab-panel cost" id="cost-panel" role="tabpanel" aria-labelledby="cost-tab">{cost_panel}</section>
 <section class="tab-panel ptu" id="ptu-panel" role="tabpanel" aria-labelledby="ptu-tab">{ptu_panel}</section>
 </div></main>
 <script>
 document.documentElement.classList.add("js");
+/* One router owns location.hash for the whole report: #tab=<name> plus an
+   optional &deployment=<slug> for the PTU tab. The PTU panel reads and writes
+   its parameter through this router only, so the URL, the visible panel, and
+   aria-selected can never disagree. */
+window.tokenlensRouter = (function() {{
+  const names = ["overview", "cost", "usage", "ptu"];
+  const listeners = [];
+  function parse() {{
+    const raw = (location.hash || "").replace(/^#/, "");
+    const state = {{tab: "overview", deployment: null}};
+    if (!raw) return state;
+    if (raw.indexOf("=") === -1) {{
+      /* Legacy #cost / #usage / #ptu links stay valid. */
+      state.tab = names.indexOf(raw.toLowerCase()) >= 0 ? raw.toLowerCase() : "overview";
+      return state;
+    }}
+    raw.split("&").forEach(function(part) {{
+      const pair = part.split("=");
+      const key = decodeURIComponent(pair[0] || "").toLowerCase();
+      const value = decodeURIComponent(pair.slice(1).join("=") || "");
+      if (key === "tab" && names.indexOf(value.toLowerCase()) >= 0) state.tab = value.toLowerCase();
+      else if (key === "deployment" && value) state.deployment = value;
+      else if (key === "ptu" && value) {{ state.tab = "ptu"; state.deployment = value; }}
+    }});
+    return state;
+  }}
+  let current = parse();
+  function serialize(state) {{
+    let hash = "#tab=" + state.tab;
+    if (state.tab === "ptu" && state.deployment) hash += "&deployment=" + encodeURIComponent(state.deployment);
+    return hash;
+  }}
+  function write(state, push) {{
+    current = {{tab: state.tab, deployment: state.deployment}};
+    const hash = serialize(current);
+    if (history.replaceState && location.hash !== hash) {{
+      if (push) history.pushState(null, "", hash); else history.replaceState(null, "", hash);
+    }}
+  }}
+  function notify(origin) {{ listeners.forEach(function(fn) {{ fn(current, origin); }}); }}
+  window.addEventListener("hashchange", function() {{ current = parse(); notify("hash"); }});
+  window.addEventListener("popstate", function() {{ current = parse(); notify("hash"); }});
+  return {{
+    state: function() {{ return current; }},
+    setTab: function(tab, options) {{
+      write({{tab: tab, deployment: current.deployment}}, (options || {{}}).push);
+      notify("tab");
+    }},
+    setDeployment: function(slug) {{
+      write({{tab: current.tab, deployment: slug}}, false);
+    }},
+    subscribe: function(fn) {{ listeners.push(fn); }}
+  }};
+}})();
 (function() {{
-  const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+  const tabs = Array.from(document.querySelectorAll('.tab-list [role="tab"]'));
   const panels = Array.from(document.querySelectorAll('[role="tabpanel"]'));
-  function activate(name, moveFocus) {{
-    const selected = name === "cost" ? tabs[1] : name === "usage" ? tabs[2] : name === "ptu" ? tabs[3] : tabs[0];
+  const names = ["overview", "cost", "usage", "ptu"];
+  function render(name, moveFocus) {{
+    const index = Math.max(0, names.indexOf(name));
+    const selected = tabs[index];
     tabs.forEach(tab => {{ const active = tab === selected; tab.setAttribute("aria-selected", active); tab.tabIndex = active ? 0 : -1; }});
     panels.forEach(panel => panel.classList.toggle("active", panel.id === selected.getAttribute("aria-controls")));
     if (moveFocus) selected.focus();
-    if (history.replaceState) history.replaceState(null, "", "#" + name);
   }}
-  const names = ["overview", "cost", "usage", "ptu"];
+  function activate(name, moveFocus) {{
+    window.tokenlensRouter.setTab(name, {{push: true}});
+    render(name, moveFocus);
+  }}
   tabs.forEach((tab, index) => tab.addEventListener("click", () => activate(names[index], false)));
   tabs.forEach((tab, index) => tab.addEventListener("keydown", event => {{
     if (event.key === "ArrowRight" || event.key === "ArrowLeft") {{ event.preventDefault(); activate(names[(index + (event.key === "ArrowRight" ? 1 : names.length - 1)) % names.length], true); }}
     if (event.key === "Home" || event.key === "End") {{ event.preventDefault(); activate(event.key === "Home" ? "overview" : "ptu", true); }}
   }}));
   document.querySelectorAll("[data-tab-link]").forEach(link => link.addEventListener("click", event => {{ event.preventDefault(); activate(link.dataset.tabLink, false); }}));
-  const hash = location.hash.toLowerCase();
-  if (hash === "#usage") activate("usage", false);
-  if (hash === "#cost") activate("cost", false);
-  if (hash === "#ptu" || hash.startsWith("#ptu=")) activate("ptu", false);
-  if (hash === "#overview") activate("overview", false);
+  window.tokenlensRouter.subscribe(function(state, origin) {{ if (origin === "hash") render(state.tab, false); }});
+  render(window.tokenlensRouter.state().tab, false);
 }})();
 {PTU_DASHBOARD_JS}
 </script></body></html>"""
@@ -746,14 +1171,18 @@ document.documentElement.classList.add("js");
 def _model_table(report: AnalysisReport) -> str:
     rows = []
     for item in model_rollups(report):
+        requests = f"{item.requests:,}" if item.requests is not None else "Unavailable"
+        cached = f"{item.cached_tokens:,}" if item.cached_tokens_available else "Unavailable"
+        status, reason = _PRICING_STATUS_COPY.get(item.pricing_status, ("Unresolved", "No exact model/mode price"))
         rows.append(
-            f"<tr><th scope=\"row\">{_escape(item.model_name)}<small>{_escape(item.deployment_mode.title())} · {item.requests:,} requests</small></th>"
-            f"<td>{item.total_tokens:,}<small>{item.input_tokens:,} / {item.cached_tokens:,} / {item.output_tokens:,}</small></td>"
+            f"<tr><th scope=\"row\">{_escape(_model_label(item))}<small>{_escape(item.deployment_mode.title())} · {_escape(requests)} requests</small></th>"
+            f"<td>{item.total_tokens:,}<small>{item.input_tokens:,} / {_escape(cached)} / {item.output_tokens:,}</small></td>"
             f"<td>{item.token_share_percent:.1f}%</td>"
+            f"<td>{item.active_buckets:,}<small>of {item.elapsed_buckets:,} elapsed</small></td>"
             f"<td>{_rate(item.input_price_per_million, currency=item.pricing_currency)} / {_rate(item.cached_input_price_per_million, currency=item.pricing_currency)} / {_rate(item.output_price_per_million, currency=item.pricing_currency)}</td>"
-            f"<td>{_money(item.estimated_cost_usd, currency=item.pricing_currency, precision=2)}</td></tr>"
+            f"<td>{_money(item.estimated_cost_usd, currency=item.pricing_currency, precision=2)}<small>{_escape(status)}: {_escape(reason)}</small></td></tr>"
         )
-    return f"""<table class="data-table model-summary"><caption>Model summary · token mix below total is input / cached / output · rates are per 1M tokens</caption><thead><tr><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Share</th><th scope="col">Price I / C / O</th><th scope="col">Est. cost</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="5">No model usage observed.</td></tr>'}</tbody></table>"""
+    return f"""<table class="data-table model-summary"><caption>Model summary · token mix below total is input / cached / output · rates are per 1M tokens · requests come from the request metric, never a bucket count</caption><thead><tr><th scope="col">Model and version</th><th scope="col">Tokens</th><th scope="col">Share</th><th scope="col">Active buckets</th><th scope="col">Price I / C / O</th><th scope="col">Est. cost</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="6">No model usage observed.</td></tr>'}</tbody></table>"""
 
 
 def write_output(content: str, output: str | None) -> None:
@@ -828,12 +1257,17 @@ def task_economics_html(
     ) or "<li>No independent scenarios available.</li>"
     if overview_report is not None:
         overview_summary = overview_report.summary
-        overview_content = f"""<section class="metrics"><div class="kpi"><span>Requests</span><b>{overview_summary.requests_analyzed:,}</b><p>{overview_summary.total_tokens:,} total tokens</p></div>
+        overview_requests = (
+            f"{overview_summary.requests_observed:,}"
+            if overview_summary.requests_available and overview_summary.requests_observed is not None
+            else "Unavailable"
+        )
+        overview_content = f"""<section class="metrics"><div class="kpi"><span>Requests</span><b>{_escape(overview_requests)}</b><p>{overview_summary.total_tokens:,} total tokens</p></div>
 <div class="kpi"><span>Deployments</span><b>{len(overview_report.deployments):,}</b><p>Consumption routes</p></div>
 <div class="kpi"><span>Optimisation scenarios</span><b>{len(overview_report.report_metadata.get("scenarios", [])):,}</b><p>Independent ranges · not additive</p></div>
 <div class="kpi"><span>Findings</span><b>{len(overview_report.findings):,}</b><p>Usage diagnostics</p></div></section>
 <section class="grid"><article class="panel overview-list"><h2>Portfolio usage</h2><p>Token share by deployment</p>{_deployment_rows(overview_report)}</article>
-<article class="panel overview-list"><h2>Azure actions</h2><p>Prioritized for a first decision</p><ol>{_overview_actions(top_recommendations(overview_findings(overview_report)))}</ol></article></section>
+<article class="panel overview-list"><h2>Azure actions</h2><p>Prioritized for a first decision</p><ol>{_overview_actions(top_recommendations(overview_findings(overview_report)), overview_report)}</ol></article></section>
 <section class="panel overview-list"><h2>Material findings</h2><p>Independent scenarios are retained; no aggregate range is summed.</p>{_finding_cards(overview_findings(overview_report), compact=True)}</section>"""
     else:
         overview_content = '<div class="panel fallback"><h2>Consumption Overview</h2><p>Legacy request/deployment overview remains available when request telemetry is supplied.</p></div>'

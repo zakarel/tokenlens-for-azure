@@ -5,10 +5,11 @@ import math
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from .ingest import message_text
-from .models import AzureRecommendation, Estimate, Finding, TraceRecord
+from .models import AzureRecommendation, Estimate, Finding, RuleEvaluation, TraceRecord
 from .tokens import count_chunks, count_messages, count_text, count_tools
 
 
@@ -22,6 +23,102 @@ RULES = [
     {"rule_id": "TL007", "title": "Semantic-cache opportunity", "confidence": "medium"},
     {"rule_id": "TL008", "title": "Possible model over-sizing", "confidence": "low"},
 ]
+
+
+@dataclass(frozen=True)
+class RuleApplicability:
+    """What a diagnostic needs before it is allowed to produce a verdict.
+
+    Aggregate telemetry carries no prompts, no per-request identity, and no
+    retry metadata. Running a request-level heuristic against it does not
+    produce a weak finding — it produces a false one, because "no content"
+    scores identically to "short, bounded content".
+
+    ``required_any`` lists alternative evidence sets. A rule runs when *one*
+    complete set is present, which is what lets the same rule work from raw
+    content or from contentless fingerprints without ever running blind.
+    """
+
+    rule_id: str
+    title: str
+    request_telemetry: bool
+    aggregate_telemetry: bool
+    required_any: tuple[tuple[str, ...], ...]
+    requirement: str
+
+    @property
+    def required_fields(self) -> tuple[str, ...]:
+        return self.required_any[0] if self.required_any else ()
+
+
+RULE_APPLICABILITY: tuple[RuleApplicability, ...] = (
+    RuleApplicability(
+        "TL001",
+        "Repeated system prefix",
+        True,
+        False,
+        (("system_prompt_fingerprint", "system_prompt_tokens"), ("messages",)),
+        "a system-prompt fingerprint with its token count, or request messages",
+    ),
+    RuleApplicability(
+        "TL002",
+        "Conversation-history growth",
+        True,
+        False,
+        (("messages",),),
+        "per-request message content",
+    ),
+    RuleApplicability(
+        "TL003",
+        "Unused tool definitions",
+        True,
+        False,
+        (("tools",),),
+        "tool definitions with their call sites",
+    ),
+    RuleApplicability(
+        "TL004",
+        "Retrieval redundancy",
+        True,
+        False,
+        (("retrieved_chunks",),),
+        "retrieved context chunks",
+    ),
+    RuleApplicability(
+        "TL005",
+        "Retry amplification",
+        True,
+        True,
+        (("retry_of",), ("retry_count",), ("messages",)),
+        "explicit retry metadata, or request content to compare; an aggregate source needs a retry metric",
+    ),
+    RuleApplicability(
+        "TL006",
+        "Output budget over-allocation",
+        True,
+        False,
+        (("max_output_tokens", "output_tokens"),),
+        "a configured output limit and the observed output distribution",
+    ),
+    RuleApplicability(
+        "TL007",
+        "Semantic-cache opportunity",
+        True,
+        False,
+        (("messages",),),
+        "request content for equivalence comparison",
+    ),
+    RuleApplicability(
+        "TL008",
+        "Possible model over-sizing",
+        True,
+        False,
+        (("model_identity", "messages"), ("model_identity", "task_shape_evidence")),
+        "a known model plus request-level task-shape evidence",
+    ),
+)
+
+APPLICABILITY_BY_RULE = {item.rule_id: item for item in RULE_APPLICABILITY}
 
 
 def _finding(
@@ -232,17 +329,32 @@ def _retrieval(records: list[TraceRecord]) -> Finding | None:
 
 
 def _retry(records: list[TraceRecord]) -> Finding | None:
-    retry_indexes = [index for index, record in enumerate(records) if record.retry_of]
+    """Detect retry amplification from explicit retry metadata only.
+
+    Content fingerprint inference is permitted only for request-level telemetry
+    that carries nonempty, privacy-safe request text. An empty message list
+    hashes identically for every record, which previously turned a silent
+    aggregate window into "every request is a retry".
+    """
+    retry_indexes = [
+        index
+        for index, record in enumerate(records)
+        if record.retry_of or int((record.metadata or {}).get("retry_count") or 0) > 0
+    ]
     if not retry_indexes:
         fingerprints: dict[str, int] = defaultdict(int)
+        signatures: list[str | None] = []
         for record in records:
-            fingerprint = hashlib.sha256(message_text(record.messages).encode()).hexdigest()
-            fingerprints[fingerprint] += 1
-        retry_indexes = []
-        for index, record in enumerate(records):
-            fingerprint = hashlib.sha256(message_text(record.messages).encode()).hexdigest()
-            if fingerprints[fingerprint] > 1:
-                retry_indexes.append(index)
+            text = message_text(record.messages).strip()
+            signature = hashlib.sha256(text.encode()).hexdigest() if text else None
+            signatures.append(signature)
+            if signature is not None:
+                fingerprints[signature] += 1
+        retry_indexes = [
+            index
+            for index, signature in enumerate(signatures)
+            if signature is not None and fingerprints[signature] > 1
+        ]
     if not retry_indexes:
         return None
     repeated = sum(records[index].usage.input_tokens or count_messages(records[index].messages, records[index].model) for index in retry_indexes)
@@ -320,33 +432,46 @@ def _cache(records: list[TraceRecord]) -> Finding | None:
 
 
 def _model_size(records: list[TraceRecord]) -> Finding | None:
+    """Flag bounded work on a higher-capability model.
+
+    Two guards keep this honest: the model must be identified, and the bounded
+    verdict must come from observed request content or explicit task metadata.
+    Absence of content is never evidence that a task was small.
+    """
     bounded = 0
     eligible = 0
+    evaluated = 0
     models = Counter()
     for record in records:
-        models[record.model] += 1
+        if not _known_model(record):
+            continue
         user_text = " ".join(
             str(message.get("content", ""))
             for message in record.messages
             if message.get("role") == "user"
         ).lower()
+        task_shape = str((record.metadata or {}).get("task_type") or "").casefold()
+        if not user_text.strip() and not task_shape:
+            continue
+        evaluated += 1
+        models[record.model] += 1
         looks_bounded = any(
-            term in user_text
+            term in user_text or term in task_shape
             for term in ("classify", "extract", "format as json", "yes or no", "categorize")
         )
         if looks_bounded or (len(user_text) < 120 and record.usage.output_tokens < 160):
             bounded += 1
         if "mini" not in record.model.lower() and "nano" not in record.model.lower():
             eligible += 1
-    if not records or bounded / len(records) < 0.2 or eligible / len(records) < 0.2:
+    if not evaluated or bounded / evaluated < 0.2 or eligible / evaluated < 0.2:
         return None
-    share = round(bounded / len(records) * 100)
+    share = round(bounded / evaluated * 100)
     return _finding(
         "TL008",
         "low",
         "Possible model over-sizing",
         f"{share}% of traffic looks bounded or repetitive while using a higher-capability model.",
-        {"bounded_requests": bounded, "requests_analyzed": len(records), "models": dict(models)},
+        {"bounded_requests": bounded, "requests_analyzed": evaluated, "models": dict(models)},
         Estimate(unit="none", note="No savings estimate; quality must be benchmarked."),
         "low",
         "Microsoft Foundry",
@@ -355,54 +480,190 @@ def _model_size(records: list[TraceRecord]) -> Finding | None:
     )
 
 
-#: Diagnostics that cannot run without either request content or the
-#: corresponding contentless measurement. Missing telemetry is reported as
-#: "not evaluated"; it is never treated as evidence of efficiency.
-_CONTENT_DEPENDENT = (
-    ("TL001", "Repeated system prefix", "a system-prompt fingerprint and token count"),
-    ("TL002", "Conversation-history growth", "per-request message content or message-count features"),
-    ("TL003", "Unused tool definitions", "tool definitions or tool-schema token counts"),
-    ("TL004", "Retrieval redundancy", "retrieved context or retrieval token counts"),
-    ("TL007", "Semantic-cache opportunity", "request content for equivalence comparison"),
-)
+def _known_model(record: TraceRecord) -> bool:
+    """A model is known only when it is named; a deployment string is not a model."""
+    model_name = (record.model_name or "").strip().casefold()
+    return bool(model_name) and model_name not in {"unknown", "none"}
 
 
-def _unevaluated(records: list[TraceRecord], evaluated: set[str]) -> list[Finding]:
-    """Report content-dependent diagnostics that had no telemetry to evaluate."""
-    if not records:
-        return []
-    has_content = any(record.messages or record.tools or record.retrieved_chunks for record in records)
-    if has_content:
-        return []
-    findings = []
-    for rule_id, title, requirement in _CONTENT_DEPENDENT:
-        if rule_id in evaluated:
+def _is_aggregate(record: TraceRecord) -> bool:
+    return (record.metadata or {}).get("record_type") == "foundry_metric_bucket"
+
+
+def _available_fields(records: list[TraceRecord]) -> set[str]:
+    """Report the evidence actually present, never what a rule wishes existed."""
+    available: set[str] = set()
+    for record in records:
+        metadata = record.metadata or {}
+        features = metadata.get("content_features") or {}
+        fingerprints = metadata.get("fingerprints") or {}
+        if record.messages:
+            available.update({"messages", "request_fingerprint", "task_shape_evidence"})
+        if record.tools:
+            available.add("tools")
+        if record.retrieved_chunks:
+            available.add("retrieved_chunks")
+        if record.max_output_tokens:
+            available.add("max_output_tokens")
+        if record.usage.output_tokens:
+            available.add("output_tokens")
+        if record.retry_of:
+            available.add("retry_of")
+        if int(metadata.get("retry_count") or 0) > 0:
+            available.add("retry_count")
+        if metadata.get("task_type"):
+            available.add("task_shape_evidence")
+        if features.get("message_count") is not None:
+            available.add("message_count")
+        if features.get("tool_definition_tokens") is not None:
+            available.add("tool_definition_tokens")
+        if features.get("retrieval_tokens") is not None:
+            available.add("retrieval_tokens")
+        if features.get("max_output_tokens") is not None:
+            available.add("max_output_tokens")
+        if features.get("system_prompt_tokens") is not None:
+            available.add("system_prompt_tokens")
+        if fingerprints.get("system_prompt"):
+            available.update({"system_prompt_fingerprint", "request_fingerprint"})
+        if _known_model(record):
+            available.add("model_identity")
+    return available
+
+
+def _source_kind(records: list[TraceRecord]) -> str:
+    kinds = {"aggregate" if _is_aggregate(record) else "request" for record in records}
+    if not kinds:
+        return "none"
+    if len(kinds) > 1:
+        return "mixed"
+    return kinds.pop()
+
+
+def applicable_rules(records: list[TraceRecord]) -> tuple[list[str], list[RuleEvaluation]]:
+    """Split the rule registry into runnable rules and not-evaluated statuses."""
+    source = _source_kind(records)
+    available = _available_fields(records)
+    runnable: list[str] = []
+    blocked: list[RuleEvaluation] = []
+    for rule in RULE_APPLICABILITY:
+        sources = [
+            name
+            for name, allowed in (("request", rule.request_telemetry), ("aggregate", rule.aggregate_telemetry))
+            if allowed
+        ]
+        if source == "none":
             continue
-        findings.append(
-            _finding(
-                rule_id,
-                "info",
-                f"{title}: not evaluated",
-                (
-                    f"This trace set contains contentless telemetry, so {title.casefold()} could not be evaluated. "
-                    f"It requires {requirement}. Absence of a finding here is not evidence that the workload is efficient."
-                ),
-                {"evaluation_status": "not_evaluated", "missing_telemetry": requirement},
-                Estimate(unit="none", note="Not evaluated: required telemetry is absent."),
-                "low",
-                "Application instrumentation",
-                "Contentless request features",
-                "Enable TokenLens content features and fingerprints, or supply request-level traces, to evaluate this diagnostic.",
+        if source == "aggregate" and not rule.aggregate_telemetry:
+            blocked.append(
+                RuleEvaluation(
+                    rule_id=rule.rule_id,
+                    title=rule.title,
+                    status="not_evaluated",
+                    applicable_sources=sources,
+                    required_fields=list(rule.required_fields),
+                    missing_fields=list(rule.required_fields),
+                    detail=(
+                        f"{rule.title} needs {rule.requirement}. This analysis read aggregate metric buckets, "
+                        "which carry no request-level evidence, so the rule was not evaluated. Absence of a "
+                        "finding is not evidence that the workload is efficient."
+                    ),
+                )
             )
-        )
-    return findings
+            continue
+        missing = _missing_evidence(rule, available)
+        if missing:
+            blocked.append(
+                RuleEvaluation(
+                    rule_id=rule.rule_id,
+                    title=rule.title,
+                    status="not_evaluated",
+                    applicable_sources=sources,
+                    required_fields=list(rule.required_fields),
+                    missing_fields=missing,
+                    detail=(
+                        f"{rule.title} needs {rule.requirement}, which this telemetry does not contain. "
+                        "Absence of a finding is not evidence that the workload is efficient."
+                    ),
+                )
+            )
+            continue
+        runnable.append(rule.rule_id)
+    return runnable, blocked
+
+
+def _missing_evidence(rule: RuleApplicability, available: set[str]) -> list[str]:
+    """Return the closest unmet evidence set, or an empty list when the rule can run."""
+    best: list[str] | None = None
+    for group in rule.required_any:
+        missing = [name for name in group if name not in available]
+        if not missing:
+            return []
+        if best is None or len(missing) < len(best):
+            best = missing
+    return best or []
+
+
+@dataclass
+class RuleRun:
+    """Findings plus the coverage statement that explains what was not run."""
+
+    findings: list[Finding]
+    evaluations: list[RuleEvaluation]
+    source: str
+
+    @property
+    def not_evaluated(self) -> list[RuleEvaluation]:
+        return [item for item in self.evaluations if item.status == "not_evaluated"]
+
+
+_RULE_FUNCTIONS: dict[str, Callable[[list[TraceRecord]], Finding | None]] = {
+    "TL001": _prefix,
+    "TL002": _history,
+    "TL003": _tools,
+    "TL004": _retrieval,
+    "TL005": _retry,
+    "TL006": _output_budget,
+    "TL007": _cache,
+    "TL008": _model_size,
+}
+
+
+def evaluate_rules(records: list[TraceRecord]) -> RuleRun:
+    """Run only the diagnostics this telemetry can actually support."""
+    source = _source_kind(records)
+    runnable, blocked = applicable_rules(records)
+    findings: list[Finding] = []
+    evaluations: list[RuleEvaluation] = list(blocked)
+    for rule_id in runnable:
+        rule = APPLICABILITY_BY_RULE[rule_id]
+        finding = _RULE_FUNCTIONS[rule_id](records)
+        if finding is not None:
+            findings.append(finding)
+            evaluations.append(
+                RuleEvaluation(
+                    rule_id=rule_id,
+                    title=rule.title,
+                    status="finding",
+                    applicable_sources=["request"] + (["aggregate"] if rule.aggregate_telemetry else []),
+                    required_fields=list(rule.required_fields),
+                    detail=finding.detail,
+                )
+            )
+        else:
+            evaluations.append(
+                RuleEvaluation(
+                    rule_id=rule_id,
+                    title=rule.title,
+                    status="no_issue",
+                    applicable_sources=["request"] + (["aggregate"] if rule.aggregate_telemetry else []),
+                    required_fields=list(rule.required_fields),
+                    detail=f"{rule.title} was evaluated against this telemetry and no issue was detected.",
+                )
+            )
+    evaluations.sort(key=lambda item: item.rule_id)
+    return RuleRun(findings=findings, evaluations=evaluations, source=source)
 
 
 def run_rules(records: list[TraceRecord]) -> list[Finding]:
-    findings: list[Finding] = []
-    for rule in (_prefix, _history, _tools, _retrieval, _retry, _output_budget, _cache, _model_size):
-        finding = rule(records)
-        if finding:
-            findings.append(finding)
-    findings.extend(_unevaluated(records, {item.rule_id for item in findings}))
-    return findings
+    """Backwards-compatible entry point returning evaluated findings only."""
+    return evaluate_rules(records).findings

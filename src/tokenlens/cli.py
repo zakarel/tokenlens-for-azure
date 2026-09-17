@@ -88,17 +88,32 @@ def _render(report, output_format: str) -> str:
     if output_format == "html":
         return report_html(report)
     summary = report.summary
+    requests = f"{summary.requests_observed:,} requests" if summary.requests_available and summary.requests_observed is not None else "requests unavailable"
+    unit = (
+        f" · {summary.aggregate.active_buckets:,} active of {summary.aggregate.elapsed_buckets:,} elapsed buckets"
+        if summary.aggregate is not None
+        else ""
+    )
     lines = [
         "TokenLens for Azure",
         "─" * 68,
-        f"Analyzed {summary.requests_analyzed:,} requests · {summary.total_tokens:,} total tokens · {len(report.deployments):,} deployments",
+        f"Analyzed {requests} · {summary.total_tokens:,} total tokens · {len(report.deployments):,} deployments{unit}",
         "",
     ]
+    for issue in report.data_quality:
+        lines.append(f"{issue.severity.upper():<8} {issue.title}: {issue.detail}")
+    if report.data_quality:
+        lines.append("")
     for deployment in report.deployments:
         item = deployment.summary
+        deployment_requests = (
+            f"{item.requests_observed:,} requests"
+            if item.requests_available and item.requests_observed is not None
+            else "requests unavailable"
+        )
         lines.append(
             f"Deployment: {item.deployment_name} · model type: {item.model_name} · "
-            f"{item.requests_analyzed:,} requests · {item.total_tokens:,} tokens"
+            f"{deployment_requests} · {item.total_tokens:,} tokens"
         )
     if report.deployments:
         lines.append("")
@@ -127,7 +142,10 @@ def _render(report, output_format: str) -> str:
                 "",
             ]
         )
-    lines.append(f"{len(report.rules)} rules processed · {summary.findings} findings · advisory result")
+    lines.append(
+        f"{len(report.rules)} rules processed · {summary.findings} evaluated finding(s) · "
+        f"{report.diagnostics.not_evaluated} not evaluated · advisory result"
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -154,7 +172,7 @@ def _write_report(content: str, output: str | None, *, output_format: str, outpu
             typer.echo(f"report-path={destination}")
             typer.echo(
                 (
-                    f"traces={report.summary.requests_analyzed} deployments={len(report.deployments)}"
+                    f"traces={report.summary.requests_observed if report.summary.requests_available else 'unavailable'} deployments={len(report.deployments)}"
                     if hasattr(report, "summary")
                     else f"tasks={report.total_attempted_tasks} cohorts={len(report.task_types)}"
                 )
@@ -166,6 +184,23 @@ def _write_report(content: str, output: str | None, *, output_format: str, outpu
     return destination
 
 
+def _safe_source(source: str, *, include_paths: bool) -> tuple[str, int]:
+    """Summarize the input without leaking local paths into a report.
+
+    Source paths can carry account, project, and directory names. The default
+    report states how many files were read; the full paths are available only
+    behind an explicit opt-in.
+    """
+    parts = [part.strip() for part in str(source).split(",") if part.strip()]
+    count = len(parts) or 1
+    if include_paths:
+        return source, count
+    if source == "stdin":
+        return "stdin", 1
+    unit = "file" if count == 1 else "files"
+    return f"{count} local telemetry {unit}", count
+
+
 @app.command("analyze")
 def analyze_command(
     input_paths: list[str] = typer.Argument(..., metavar="INPUT", help="JSONL path, directory, glob, or - for stdin."),
@@ -174,10 +209,28 @@ def analyze_command(
     output_dir: str | None = typer.Option(None, "--output-dir", help="Directory for generated timestamped reports."),
     config: str | None = typer.Option(None, "--config", help="Path to .tokenlens.yml."),
     open_report: bool = typer.Option(False, "--open", help="Open a generated HTML report."),
+    include_source_paths: bool = typer.Option(
+        False,
+        "--include-source-paths",
+        help=(
+            "Write local input paths into the report. Off by default: paths can contain account, "
+            "project, and directory names that should not be shared."
+        ),
+    ),
+    allow_mixed_sources: bool = typer.Option(
+        False,
+        "--allow-mixed-sources",
+        help=(
+            "Analyze request telemetry and Azure Monitor buckets together. Off by default because "
+            "the same traffic would be counted twice."
+        ),
+    ),
     quiet: bool = typer.Option(False, "--quiet", help="Suppress status output."),
 ) -> None:
     """Analyze one or more OpenAI-compatible JSONL traces."""
     _validate_format(output_format)
+    if include_source_paths and not quiet:
+        typer.echo("privacy=source paths will be written into this report")
     try:
         settings = _load_config(config)
         aliases = settings.get("task_aliases") if isinstance(settings.get("task_aliases"), dict) else None
@@ -200,13 +253,19 @@ def analyze_command(
             )
         else:
             records, source = load_records_many(input_paths)
+            label, file_count = _safe_source(source, include_paths=include_source_paths)
             report = analyze(
                 records,
-                source,
+                label,
                 report_config=settings.get("report"),
                 customer_catalog=customer,
                 reference_catalog=reference,
                 use_bundled_reference=pricing.get("use_reference_catalog", True),
+                mixed_source_policy="allow" if allow_mixed_sources else "reject",
+                # Real collection is never labelled synthetic; only the demo
+                # generator may claim synthetic provenance.
+                data_classification="local_real",
+                source_files=file_count,
             )
         _write_report(
             _render(report, output_format),
@@ -654,8 +713,14 @@ def collect_foundry_metrics(
             configured_endpoint
             or metrics_endpoint_for_location(str(account_metadata.get("location") or ""))
         )
+        if not quiet:
+            typer.echo(
+                "metrics-endpoint-source="
+                + ("configured-override" if configured_endpoint else "account-location")
+            )
         metrics_client = _foundry_metrics_client(metrics_endpoint)
         available = list(resources.list_metric_definitions(uri))
+        inventory = _deployment_inventory(resources, subscription_id, resource_group, account, quiet=quiet)
         result = collect_metrics(
             metrics_client=metrics_client,
             subscription_id=subscription_id,
@@ -664,6 +729,7 @@ def collect_foundry_metrics(
             window=CollectionWindow.for_days(lookback),
             available_metrics=available,
             deployments=deployments or None,
+            deployment_inventory=inventory,
             family=family,
             # The confirmed mode applies to every collected deployment, including
             # an unrestricted collection where the deployment names are only
@@ -681,10 +747,35 @@ def collect_foundry_metrics(
         return
     for key, value in result.summary().items():
         typer.echo(f"{key}={value}")
+    for metric_name, reason in getattr(metrics_client, "rejected_metrics", {}).items():
+        typer.echo(f"metric-rejected={metric_name} reason={reason}")
+    for conflict in result.identity_conflicts:
+        typer.echo(f"identity-conflict={conflict}")
     typer.echo(f"records-written={written}")
     typer.echo(f"records-already-present={writer.skipped_duplicates}")
     typer.echo(f"output-dir={Path(output_dir).resolve()}")
     typer.echo(f"next: tokenlens-azure analyze {output_dir} --format html --open")
+
+
+def _deployment_inventory(resources, subscription_id: str, resource_group: str, account: str, *, quiet: bool):
+    """Read the deployment inventory used to resolve exact model identity.
+
+    Discovery is best effort: a principal that can read metrics but not the
+    account's deployments must still be able to collect, with identity resolved
+    from metric dimensions alone.
+    """
+    lister = getattr(resources, "list_deployments", None)
+    if lister is None:
+        return []
+    try:
+        inventory = list(lister(subscription_id, resource_group, account))
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        if not quiet:
+            typer.echo(f"deployment-inventory=unavailable ({type(exc).__name__})")
+        return []
+    if not quiet:
+        typer.echo(f"deployment-inventory={len(inventory)} deployment(s)")
+    return inventory
 
 
 @app.command("connect-foundry")

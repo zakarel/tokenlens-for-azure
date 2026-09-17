@@ -194,9 +194,23 @@ class MetricBucketRecord(_Canonical):
     scope: ResourceScope = Field(default_factory=ResourceScope)
     metrics: BucketMetrics = Field(default_factory=BucketMetrics)
     missing_metrics: list[str] = Field(default_factory=list)
+    #: Canonical field -> the exact source metric that populated it. Provenance
+    #: is recorded per field because one bucket is coalesced from several metric
+    #: series that expose different dimensions.
+    metric_provenance: dict[str, str] = Field(default_factory=dict)
+    #: Per-status request counts when the source exposed a status dimension.
+    #: ``None`` means outcomes were not reported; an empty mapping is never
+    #: written, so a genuine zero 429 stays distinguishable from unavailable.
+    status_codes: dict[str, int] | None = None
+    #: ``complete`` only when every status-code series for the bucket was read,
+    #: which is what makes a zero rate-limit count trustworthy.
+    outcome_coverage: Literal["complete", "partial", "unavailable"] = "unavailable"
     collected_at: datetime | None = None
     window_start: datetime | None = None
     window_end: datetime | None = None
+    #: Elapsed buckets expected in the collection window. It lets analysis
+    #: reconstruct the full timeline without storing an idle record per bucket.
+    expected_buckets: int | None = Field(default=None, ge=0)
 
     @field_validator("timestamp", "collected_at", "window_start", "window_end")
     @classmethod

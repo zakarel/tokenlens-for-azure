@@ -476,6 +476,42 @@ inference call.
 | `No subscription selected` | Run `az account set --subscription ...`, pass `--subscription`, or set `AZURE_SUBSCRIPTION_ID`. |
 | `missing ... credential` from QueryMetrics | Update TokenLens; the collector now constructs the regional client with `DefaultAzureCredential`. |
 | Azure Monitor `status 400` | Update TokenLens; metrics are queried separately so incompatible dimension combinations do not abort collection. |
+| `metric-rejected=NAME reason=...` | Azure refused that metric/dimension combination. Collection continues; the canonical field is reported as missing rather than zero. |
+| `excluded_metrics={'SuccessfulCalls': ...}` | The metric's own definition does not support a `ModelDeploymentName` filter, so it was never queried. Request outcomes come from `ModelRequests` status-code series instead. |
+| `metric series without a ModelDeploymentName dimension` | Collect one deployment at a time with `--deployment`, so usage is never attributed to the wrong route. |
+| `identity-conflict=...` | The deployment inventory and the metric dimensions disagree on model or version. The metric dimension is kept and the conflict is reported; confirm the deployment in the portal. |
+| `deployment-inventory=unavailable` | The signed-in principal can read metrics but not deployments. Collection continues; exact model identity then depends on the metric dimensions alone. |
+| Report says `Collection identity error` | The collected buckets carry no model identity. Re-collect with `--deployment`, or grant read access to the account's deployments. |
+| `This input mixes request-level telemetry with aggregate Azure Monitor buckets` | Analyze each source separately. Pass `--allow-mixed-sources` only when you have proven the two do not describe the same traffic. |
+| Report says `Requests: Unavailable` | The resource exposed no request metric for the window. TokenLens never substitutes the bucket count for a request count. |
+| Report says `Insufficient evidence` with few active buckets | Only buckets with nonzero tokens or requests count as evidence. Collect a representative window before sizing PTU. |
+
+#### Aggregate telemetry semantics
+
+Azure Monitor returns time buckets, not requests. TokenLens keeps four counts
+separate and never interchanges them:
+
+| Count | Meaning |
+|---|---|
+| Elapsed buckets | Intervals the collection window covers (14 days at five minutes = 4,032). |
+| Observed buckets | Intervals for which Azure returned a data point. |
+| Active buckets | Observed intervals with nonzero token or request volume. |
+| Requests | The sum of the request metric — never a bucket count. |
+
+Request outcomes are derived from `ModelRequests` split by `StatusCode`, so a
+zero HTTP 429 count is reported as a genuine zero only when status coverage is
+complete; otherwise it stays unavailable. Request-level diagnostics (prompt
+repetition, retries, caching, model sizing) are **not evaluated** against
+aggregate telemetry: they are listed as coverage gaps and never counted as
+findings.
+
+#### Report privacy
+
+The HTML and JSON reports summarize the input as a file count and window
+(`15 local metric files · 14-day window · offline analysis`) instead of
+rendering local paths. Pass `--include-source-paths` to opt in when you need
+paths for local debugging. Reports are labelled `Local offline analysis`;
+only the bundled demo generator may label a report as synthetic.
 
 #### Privacy model
 
