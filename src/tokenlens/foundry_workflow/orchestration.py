@@ -23,7 +23,7 @@ from ..ingest import InputError, load_records_many, load_task_events_many
 from ..models import AnalysisReport
 from ..output import timestamped_path
 from ..pricing import PricingCatalog
-from ..reference import load_bundled_reference_catalog
+from ..reference import load_effective_reference_catalog
 from ..reports import report_html, report_json, write_output
 from ..telemetry import TelemetryConfig, TelemetryWriter
 from ..workloads import WorkloadMapping, canonical_workload_id, merge_identities, safe_account_scope
@@ -602,7 +602,11 @@ def generate_report(
     # under-states its evidence.
     file_count = len([part for part in str(source).split(",") if part.strip()]) or len(sources)
     catalog = customer_catalog if customer_catalog is not None else load_customer_catalog()
-    reference = load_bundled_reference_catalog() if config.pricing.use_reference_catalog else None
+    reference = (
+        load_effective_reference_catalog(use_public_cache=config.pricing.public_cache)
+        if config.pricing.use_reference_catalog
+        else None
+    )
     task_events = _load_task_events(config)
     identities = merge_identities(
         config.foundry.deployment_names,

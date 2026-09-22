@@ -1,0 +1,32 @@
+<!doctype html>
+<!--
+  Synthetic "schema drift" fixture: the published page still renders a pricing
+  table, but the cache columns have been renamed and merged. The deterministic
+  parser must fail loudly rather than mis-map a column onto a rate.
+-->
+<html lang="en">
+  <head><meta charset="utf-8" /><title>Pricing - Claude Docs</title></head>
+  <body>
+    <main>
+      <h1>Pricing</h1>
+      <table>
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th>Prompt</th>
+            <th>Caching</th>
+            <th>Completion</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Claude Opus 5</td>
+            <td>$5 / MTok</td>
+            <td>included</td>
+            <td>$25 / MTok</td>
+          </tr>
+        </tbody>
+      </table>
+    </main>
+  </body>
+</html>

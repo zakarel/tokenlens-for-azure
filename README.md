@@ -61,7 +61,7 @@ The wizard:
 2. asks whether to inspect all accessible subscriptions or one subscription;
 3. discovers Foundry accounts and every deployment in scope;
 4. asks for the analysis window;
-5. checks pricing readiness;
+5. refreshes cached public pricing if needed, then checks pricing readiness;
 6. collects each deployment with visible progress;
 7. creates technical workloads automatically;
 8. generates and opens the report.
@@ -94,8 +94,9 @@ Step 4/4 · Analysis window
   4. 90 days
 
 Pricing readiness
-  ✓ reasoning-prod · verified retail rate
-  ⚠ coding-prod    · Claude CCU rate unavailable
+  Pricing assumptions: Retail · Global · Standard · Short context · Normal inference
+  ✓ reasoning-prod · exact retail rate
+  ✓ coding-prod    · Claude CCU-equivalent rate
   ⚠ compact-prod   · exact rate unavailable
 
 Collecting deployments
@@ -167,18 +168,31 @@ arbitrarily. Untagged traffic remains visible as **Unassigned**.
 
 ## Pricing
 
-Cost estimation requires an exact match for model, deployment mode, service
-tier, currency, and billing basis.
+Estimates use these defaults wherever telemetry or deployment metadata does not
+state the dimension, and the report says so in bold at the top of Cost analysis:
 
-TokenLens uses verified catalogs and customer-provided contracted rates. It does
-not substitute a related model or silently convert currencies.
+> **Pricing assumptions: Retail · Global · Standard · Short context · Normal inference**
+
+An exact observed or configured dimension — deployment mode, service tier,
+context window, inference mode, or a contracted rate — always overrides a
+default.
+
+Rates come from official sources, cached locally and read offline:
+
+- the **Azure Retail Prices API** for Foundry Models token meters;
+- **Anthropic's published Claude pricing** (USD only), converted to Foundry
+  consumption units at 100 CCU = $1 and labelled as a CCU-derived estimate, not
+  an Azure token meter. Customer-specific private discounts are not included.
+
+Cost estimation still requires an exact match for model, deployment mode,
+service tier, currency, and billing basis. TokenLens does not substitute a
+related model, merge catalogs across currencies, or convert one. Fine-tuning,
+batch, priority, flex, and provisioned meters are excluded from
+normal-inference estimates, and a pricing feed that could not be read to
+completion is reported as truncated rather than cached.
 
 If pricing is unresolved, usage and operational analysis still work. The report
 shows the affected deployment, excluded tokens, reason, and next safe action.
-
-Claude is a special case: Foundry bills it through Anthropic consumption units,
-and an equivalent Azure token rate might not be publicly available. TokenLens
-keeps that cost unresolved rather than inventing a conversion.
 
 See [Pricing methodology](docs/pricing.md).
 

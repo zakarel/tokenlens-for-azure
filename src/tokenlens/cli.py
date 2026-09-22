@@ -17,7 +17,7 @@ from .economics import TaskEconomicsReport
 from .ingest import InputError, load_records_many, load_task_events_many
 from .output import choose_output, economics_text, pricing_audit_text
 from .pricing import PricingCatalog
-from .reference import load_bundled_reference_catalog
+from .reference import load_effective_reference_catalog
 from .presentation import impact_category, is_material, materiality_config
 from .reports import report_html, report_json, report_sarif, write_output
 from .telemetry import TelemetryConfig, TelemetryWriter
@@ -245,7 +245,7 @@ def analyze_command(
         reference = (
             PricingCatalog.model_validate(pricing["reference_catalog"])
             if pricing.get("reference_catalog")
-            else load_bundled_reference_catalog() if pricing.get("use_reference_catalog", True) else None
+            else load_effective_reference_catalog() if pricing.get("use_reference_catalog", True) else None
         )
         events, event_source = load_task_events_many(input_paths, aliases=aliases)
         if events:
@@ -307,7 +307,7 @@ def pricing_audit(
         reference = (
             PricingCatalog.model_validate(pricing["reference_catalog"])
             if pricing.get("reference_catalog")
-            else load_bundled_reference_catalog() if pricing.get("use_reference_catalog", True) else None
+            else load_effective_reference_catalog() if pricing.get("use_reference_catalog", True) else None
         )
         records, source = load_records_many(input_paths)
         report = analyze(
@@ -1063,7 +1063,7 @@ def _guided_setup() -> None:
     )
     use_reference = typer.confirm("Use bundled dated reference prices when customer prices do not resolve?", default=True)
     open_report = typer.confirm("Open the generated HTML report?", default=True)
-    reference = load_bundled_reference_catalog() if use_reference else None
+    reference = load_effective_reference_catalog() if use_reference else None
     # The wizard intentionally asks no cleanup, threshold, or identity questions.
     try:
         events, source = load_task_events_many([selected])
