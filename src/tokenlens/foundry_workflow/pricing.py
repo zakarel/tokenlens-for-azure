@@ -1,17 +1,17 @@
-"""Pricing readiness, customer overrides, and the explicitly deferred sync.
+"""Pricing readiness, customer overrides, and the official public sync.
 
 Pricing is never guessed from a related model or family. Resolution order is:
 
 1. observed per-call cost;
 2. customer catalog;
-3. synchronized verified public catalog;
+3. cached snapshot synchronized from an official public source;
 4. packaged verified catalog;
 5. unresolved.
 
-``tokenlens-azure pricing sync`` is **deferred**. Publishing a rate that was
-parsed from an undocumented, unstable source would be indistinguishable from a
-guess, so the command reports the deferral and points at the customer-rate
-workflow instead of inventing numbers. See ``docs/pricing.md``.
+Where telemetry or deployment metadata does not state a purchasing dimension,
+TokenLens applies one documented set of defaults — retail, global, standard,
+short context, normal inference — and reports them as explicit assumptions.
+See ``docs/pricing.md``.
 """
 
 from __future__ import annotations
@@ -24,26 +24,40 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..pricing import PriceEntry, PricingCatalog, canonical_model_name, infer_publisher
-from ..reference import load_bundled_reference_catalog
-from .configuration import customer_catalog_path, pricing_cache_dir, safe_display_path, _atomic_write
+from ..pricing_sources.assumptions import (
+    ASSUMPTIONS_BANNER,
+    ASSUMPTIONS_WARNING,
+    DEFAULT_PRICING_ASSUMPTIONS,
+)
+from ..pricing_sources.cache import AZURE_RETAIL_SNAPSHOT, CLAUDE_SNAPSHOT, snapshot_path
+from ..pricing_sources.sync import (
+    cached_snapshots,
+    public_pricing_catalog,
+    public_sync_needed,
+    requested_sources,
+)
+from ..reference import load_bundled_reference_catalog, load_effective_reference_catalog
+from .configuration import customer_catalog_path, safe_display_path, _atomic_write
 from .models import DeploymentRecord, WorkflowError
 
 __all__ = [
-    "PRICING_SYNC_DEFERRED_REASON",
+    "ASSUMPTIONS_BANNER",
+    "ASSUMPTIONS_WARNING",
+    "PRICING_ASSUMPTIONS_NOTE",
     "CustomerRate",
     "PricingReadiness",
     "catalog_status",
     "load_customer_catalog",
     "pricing_readiness",
+    "public_snapshot_paths",
     "synchronized_catalog_path",
     "write_customer_rate",
 ]
 
-PRICING_SYNC_DEFERRED_REASON = (
-    "Public pricing synchronization is deferred. TokenLens will only publish a rate it can "
-    "attribute to a documented, machine-readable source with a deterministic parser, an "
-    "effective date, a retrieval timestamp, and a content hash. Until that source is wired in, "
-    "synchronizing would be indistinguishable from guessing a rate."
+PRICING_ASSUMPTIONS_NOTE = (
+    f"{ASSUMPTIONS_BANNER}. {ASSUMPTIONS_WARNING} Rates come from the Azure Retail Prices API "
+    "(Foundry Models) and, for Claude, from Anthropic's official published pricing converted to "
+    "consumption units. A rate is never derived from a related model or family."
 )
 
 PricingState = Literal[
@@ -78,6 +92,8 @@ class PricingReadiness(BaseModel):
     billing_basis: str | None = None
     suggested_override_key: str | None = None
     catalogs_consulted: list[str] = Field(default_factory=list)
+    #: Defaults that were applied because the dimension was not stated.
+    assumed_dimensions: list[str] = Field(default_factory=list)
 
     @property
     def resolved(self) -> bool:
@@ -143,8 +159,16 @@ class CustomerRate(BaseModel):
 
 
 def synchronized_catalog_path() -> Path:
-    """Where a verified public snapshot would be cached once sync ships."""
-    return pricing_cache_dir() / "public-snapshot.yml"
+    """Where the Azure Retail Prices snapshot is cached, user-locally."""
+    return snapshot_path(AZURE_RETAIL_SNAPSHOT)
+
+
+def public_snapshot_paths() -> dict[str, Path]:
+    """Every official-source snapshot file, whether or not it exists yet."""
+    return {
+        "azure_retail_prices": snapshot_path(AZURE_RETAIL_SNAPSHOT),
+        "claude_pricing_docs": snapshot_path(CLAUDE_SNAPSHOT),
+    }
 
 
 def load_customer_catalog(path: Path | str | None = None) -> PricingCatalog | None:
@@ -196,17 +220,38 @@ def write_customer_rate(rate: CustomerRate, *, path: Path | str | None = None) -
     return target
 
 
-def _match(catalog: PricingCatalog | None, model: str, *, service_tier: str = "standard") -> PriceEntry | None:
+def _match(
+    catalog: PricingCatalog | None,
+    model: str,
+    *,
+    service_tier: str = "standard",
+    deployment_mode: str = "unknown",
+) -> PriceEntry | None:
+    """Find the exact entry for a model and, when known, its deployment mode.
+
+    An unknown deployment mode falls back to the documented default (global)
+    rather than accepting whichever mode happens to be listed first.
+    """
     if catalog is None or not model:
         return None
     canonical = canonical_model_name(model)
+    wanted_mode = (deployment_mode or "unknown").strip().casefold()
+    if wanted_mode in {"", "unknown", "none"}:
+        wanted_mode = DEFAULT_PRICING_ASSUMPTIONS.deployment
+    candidates: list[PriceEntry] = []
     for entry in catalog.prices:
         if entry.model_match_rank(canonical) is None:
             continue
         if entry.service_tier.casefold() != service_tier.casefold():
             continue
-        return entry
-    return None
+        candidates.append(entry)
+    if not candidates:
+        return None
+    exact = [item for item in candidates if (item.region or "").casefold() == wanted_mode]
+    pool = exact or [item for item in candidates if not item.region]
+    if not pool:
+        return None
+    return sorted(pool, key=lambda item: (item.source_rank, -item.effective_from.toordinal()))[0]
 
 
 def pricing_readiness(
@@ -222,7 +267,7 @@ def pricing_readiness(
     published rate is never reported as an identity failure and vice versa.
     """
     if reference_catalog is None:
-        reference_catalog = load_bundled_reference_catalog()
+        reference_catalog = load_effective_reference_catalog()
     consulted = [
         catalog.catalog_name for catalog in (customer_catalog, reference_catalog) if catalog is not None
     ]
@@ -242,8 +287,8 @@ def pricing_readiness(
                 )
             )
             continue
-        customer_entry = _match(customer_catalog, model)
-        reference_entry = _match(reference_catalog, model)
+        customer_entry = _match(customer_catalog, model, deployment_mode=deployment.deployment_mode)
+        reference_entry = _match(reference_catalog, model, deployment_mode=deployment.deployment_mode)
         entry = customer_entry or reference_entry
         catalog = customer_catalog if customer_entry is not None else reference_catalog
         if entry is None:
@@ -286,17 +331,30 @@ def pricing_readiness(
                 currency=currency,
                 billing_basis=entry.billing_basis,
                 catalogs_consulted=consulted,
+                assumed_dimensions=list(entry.assumed_dimensions),
             )
         )
     return results
 
 
-def catalog_status(*, customer_catalog: PricingCatalog | None = None) -> dict[str, object]:
-    """Summarize which catalogs are available, without contacting the network."""
+def catalog_status(
+    *,
+    customer_catalog: PricingCatalog | None = None,
+    include_claude: bool | None = None,
+) -> dict[str, object]:
+    """Summarize which catalogs are available, without contacting the network.
+
+    Freshness is judged against the sources that were actually requested, so a
+    user who never asks for Claude is not told forever that a synchronization
+    is overdue.
+    """
     reference = load_bundled_reference_catalog()
-    snapshot = synchronized_catalog_path()
     customer = customer_catalog if customer_catalog is not None else load_customer_catalog()
-    return {
+    snapshots = {snapshot.source: snapshot for snapshot in cached_snapshots()}
+    selected = requested_sources(include_claude=include_claude)
+    status: dict[str, object] = {
+        "pricing-assumptions": ASSUMPTIONS_BANNER,
+        "assumption-override": "exact observed or configured dimensions always win",
         "packaged-catalog": reference.catalog_name,
         "packaged-entries": len(reference.prices),
         "packaged-currency": reference.currency,
@@ -305,11 +363,37 @@ def catalog_status(*, customer_catalog: PricingCatalog | None = None) -> dict[st
             safe_display_path(customer_catalog_path()) if customer is not None else "not configured"
         ),
         "customer-entries": len(customer.prices) if customer is not None else 0,
-        "synchronized-snapshot": (
-            safe_display_path(snapshot) if snapshot.is_file() else "not present (synchronization deferred)"
-        ),
-        "public-sync": "deferred",
     }
+    for source, path in public_snapshot_paths().items():
+        key = source.replace("_", "-")
+        snapshot = snapshots.get(source)
+        status[f"{key}-requested"] = "yes" if source in selected else "no"
+        status[f"{key}-snapshot"] = (
+            safe_display_path(path) if snapshot is not None else "not synchronized"
+        )
+        if snapshot is not None:
+            status[f"{key}-entries"] = len(snapshot.catalog.prices)
+            status[f"{key}-currency"] = snapshot.currency.upper()
+            status[f"{key}-retrieved"] = snapshot.retrieved_at.isoformat()
+            status[f"{key}-content-hash"] = snapshot.content_hash
+            status[f"{key}-quarantined"] = len(snapshot.quarantined)
+    merged = public_pricing_catalog(currency=reference.currency)
+    status["public-sync"] = "cached" if merged is not None else "not synchronized"
+    status["public-sync-entries"] = len(merged.prices) if merged is not None else 0
+    status["public-sync-currency"] = reference.currency.upper()
+    excluded = [
+        f"{snapshot.source} ({snapshot.currency.upper()})"
+        for snapshot in snapshots.values()
+        if snapshot.currency.upper() != reference.currency.upper()
+    ]
+    if excluded:
+        status["public-sync-excluded"] = (
+            ", ".join(excluded) + " — currency differs; TokenLens never converts"
+        )
+    status["public-sync-stale"] = "yes" if public_sync_needed(include_claude=include_claude) else "no"
+    status["public-sync-sources"] = ", ".join(selected)
+    status["resolution-order"] = "observed > customer > public sync > packaged > unresolved"
+    return status
 
 
 def verify_catalogs(*, customer_catalog: PricingCatalog | None = None) -> list[str]:
@@ -323,6 +407,17 @@ def verify_catalogs(*, customer_catalog: PricingCatalog | None = None) -> list[s
     for entry in reference.prices:
         if entry.effective_to and entry.effective_to < today:
             problems.append(f"packaged entry expired and will not be applied: {entry.model}")
+    for snapshot in cached_snapshots():
+        if snapshot.catalog.currency.upper() != reference.currency.upper():
+            problems.append(
+                f"synchronized snapshot {snapshot.source} is denominated in "
+                f"{snapshot.catalog.currency.upper()}; TokenLens never converts currencies"
+            )
+        for entry in snapshot.catalog.prices:
+            if entry.effective_to and entry.effective_to < today:
+                problems.append(
+                    f"synchronized entry expired and will not be applied: {entry.model}"
+                )
     customer = customer_catalog if customer_catalog is not None else None
     if customer is None:
         try:

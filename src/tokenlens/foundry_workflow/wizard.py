@@ -48,7 +48,9 @@ from .orchestration import (
     run_state_from,
 )
 from .pricing import (
-    PRICING_SYNC_DEFERRED_REASON,
+    ASSUMPTIONS_BANNER,
+    ASSUMPTIONS_WARNING,
+    PRICING_ASSUMPTIONS_NOTE,
     PricingReadiness,
     load_customer_catalog,
     pricing_readiness,
@@ -61,6 +63,7 @@ __all__ = [
     "configure",
     "pricing_explanation_lines",
     "preflight",
+    "sync_public_pricing_if_needed",
     "workload_summary_lines",
     "configure_workloads",
 ]
@@ -576,7 +579,99 @@ def pricing_explanation_lines(unresolved: Sequence[PricingReadiness]) -> list[st
             + ", ".join(item.deployment for item in identity)
             + " — `unknown` is never a pricing override key."
         )
-    lines.append(PRICING_SYNC_DEFERRED_REASON)
+    lines.append(PRICING_ASSUMPTIONS_NOTE)
+    return lines
+
+
+def sync_public_pricing_if_needed(
+    prompter: Prompter,
+    config: FoundryWorkflowConfig,
+    *,
+    services: WorkflowServices | None = None,
+) -> list[str]:
+    """Refresh the cached official pricing snapshot when it is absent or stale.
+
+    Analysis itself never touches a network. Only this guided step may, it is
+    bounded, and any failure is reported and stepped over: the assessment
+    continues on the previous snapshot, the packaged catalog, and any customer
+    rates, rather than aborting or inventing a rate.
+
+    ``TOKENLENS_NO_PRICING_SYNC=1`` disables the attempt entirely, for
+    air-gapped environments, CI, and the test suite.
+    """
+    from ..pricing_sources.fetch import FetchBudget
+    from ..pricing_sources.sync import public_sync_needed, sync_public_pricing
+
+    if os.getenv("TOKENLENS_NO_PRICING_SYNC", "").strip() not in {"", "0", "false", "no"}:
+        return ["Public pricing synchronization is disabled (TOKENLENS_NO_PRICING_SYNC)."]
+    if not config.pricing.public_cache:
+        return ["Public pricing synchronization is disabled in .tokenlens.yml (pricing.public_cache)."]
+    deployments = config.foundry.all_deployments
+    modes = sorted(
+        {
+            item.deployment_mode
+            for item in deployments
+            if item.deployment_mode in {"global", "data_zone", "regional"}
+        }
+    ) or None
+    claude_deployments = [
+        item for item in deployments if (item.publisher or "").casefold() == "anthropic"
+    ]
+    claude_models = sorted({item.model for item in claude_deployments if item.model})
+    # Claude modes come from Claude deployments only. A data-zone GPT deployment
+    # elsewhere in the portfolio must never add a data-zone premium to Claude.
+    claude_modes = sorted(
+        {
+            item.deployment_mode
+            for item in claude_deployments
+            if item.deployment_mode in {"global", "data_zone", "regional"}
+        }
+    ) or None
+    wants_claude = bool(claude_models)
+    # Freshness is judged against the sources this selection actually needs, so
+    # a portfolio without Claude is never told a synchronization is overdue.
+    if not public_sync_needed(include_claude=wants_claude):
+        return ["Cached official pricing snapshot is current; no network request was made."]
+    region = next((item.region for item in config.foundry.targets if item.region), None)
+    try:
+        report = sync_public_pricing(
+            region=region,
+            account_region=region,
+            deployments=modes,
+            claude_models=claude_models or None,
+            claude_deployment_modes=claude_modes,
+            include_claude=wants_claude,
+            # The guided path must never stall: one short attempt per source.
+            budget=FetchBudget(timeout_seconds=10.0, retries=0),
+        )
+    except Exception as exc:  # noqa: BLE001 - a sync failure must never stop the assessment
+        return [
+            f"Official pricing synchronization failed ({type(exc).__name__}). The assessment "
+            "continues with the packaged catalog and any customer rates."
+        ]
+    lines: list[str] = []
+    for item in report.outcomes:
+        if item.skipped:
+            lines.append(f"{item.source}: skipped — {item.reason}")
+        elif item.ok:
+            lines.append(
+                f"{item.source}: synchronized {item.entries} entry(ies)"
+                + (f", quarantined {item.quarantined}" if item.quarantined else "")
+            )
+        elif not item.feed_complete:
+            lines.append(
+                f"{item.source}: the published feed was truncated by a bounded-read ceiling, so "
+                "nothing was cached and the previous snapshot stays in effect."
+            )
+        else:
+            lines.append(
+                f"{item.source}: not synchronized ({item.error}); "
+                + (
+                    "the previous cached snapshot is still used."
+                    if item.used_cache
+                    else "the packaged catalog and customer rates still apply."
+                )
+            )
     return lines
 
 
@@ -592,7 +687,12 @@ def _report_pricing(
     answer, so the workflow states the reason, continues the full assessment
     with cost withheld, and prints the single remediation command.
     """
+    sync_lines = sync_public_pricing_if_needed(prompter, config)
     readiness = pricing_readiness(config.foundry.all_deployments, customer_catalog=customer_catalog)
+    prompter.panel(
+        "Pricing assumptions",
+        [ASSUMPTIONS_BANNER, ASSUMPTIONS_WARNING, *sync_lines],
+    )
     prompter.table(
         "Pricing readiness",
         ["Deployment", "Model", "State"],

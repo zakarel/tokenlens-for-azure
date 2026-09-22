@@ -32,6 +32,8 @@ from test_foundry_workflow import (  # noqa: F401 - shared synthetic doubles
 
 runner = CliRunner()
 
+FIXTURES = Path(__file__).parent / "fixtures" / "pricing"
+
 
 @pytest.fixture()
 def cli(tmp_path, monkeypatch):
@@ -387,21 +389,190 @@ def test_workloads_configure_is_explicit_about_being_interactive(cli):
 # --- Pricing catalogs -------------------------------------------------------
 
 
-def test_pricing_status_is_offline_and_reports_the_deferred_sync(cli):
+def test_pricing_status_is_offline_and_reports_the_sync_state(cli):
     result = runner.invoke(app, ["pricing", "status"])
     assert result.exit_code == 0, result.output
     assert "packaged-catalog=" in result.output
     assert "customer-catalog=not configured" in result.output
-    assert "public-sync=deferred" in result.output
+    # The default assumptions are stated wherever pricing is described.
+    assert "pricing-assumptions=Pricing assumptions: Retail · Global · Standard · Short context · Normal inference" in result.output
+    assert "public-sync=not synchronized" in result.output
+    assert "resolution-order=observed > customer > public sync > packaged > unresolved" in result.output
 
 
-def test_pricing_sync_is_deferred_and_never_fabricates_a_rate(cli):
+def test_pricing_sync_states_the_assumptions_and_caches_official_sources(cli, monkeypatch):
+    """The command is exercised against injected fixtures; no socket is opened."""
+    from tokenlens.pricing_sources import azure_retail, claude_docs
+    from tokenlens.pricing_sources.fetch import FetchedPage
+
+    retail_page1 = (FIXTURES / "azure_retail_page1.json").read_bytes()
+    retail_page2 = (FIXTURES / "azure_retail_page2.json").read_bytes()
+    claude_body = (FIXTURES / "claude_pricing.html").read_bytes()
+
+    def transport(url: str, timeout: float, max_bytes: int) -> FetchedPage:
+        if url.startswith(azure_retail.RETAIL_PRICES_URL) or "prices.azure.com" in url:
+            body = retail_page2 if "skip" in url else retail_page1
+            return FetchedPage(url=url, status=200, body=body)
+        assert url == claude_docs.CLAUDE_PRICING_URL
+        return FetchedPage(url=url, status=200, body=claude_body)
+
+    real_sync = foundry_cli.sync_public_pricing
+    monkeypatch.setattr(
+        foundry_cli,
+        "sync_public_pricing",
+        lambda **kwargs: real_sync(**{**kwargs, "transport": transport}),
+    )
     result = runner.invoke(app, ["pricing", "sync"])
-    assert result.exit_code == foundry_cli.EXIT_DEFERRED
-    assert "pricing-sync=deferred" in result.output
-    assert "network=no request was made" in result.output
-    assert "deterministic parser" in result.output
-    assert "pricing set-rate" in result.output
+    assert result.exit_code == 0, result.output
+    assert "assumptions=Pricing assumptions: Retail · Global · Standard · Short context · Normal inference" in result.output
+    assert "source=azure_retail_prices status=ok" in result.output
+    assert "source=claude_pricing_docs status=ok" in result.output
+    assert "content-hash=sha256:" in result.output
+    assert "mode=0600" in result.output
+    assert "analysis=offline" in result.output
+    # A synchronized snapshot is now readable offline.
+    status = runner.invoke(app, ["pricing", "status"])
+    assert "public-sync=cached" in status.output
+
+
+def test_pricing_sync_excludes_claude_from_a_non_usd_run_with_a_reason(cli, monkeypatch):
+    from tokenlens.pricing_sources import azure_retail
+    from tokenlens.pricing_sources.fetch import FetchedPage
+
+    page1 = (FIXTURES / "azure_retail_page1.json").read_bytes()
+    page2 = (FIXTURES / "azure_retail_page2.json").read_bytes()
+
+    def transport(url: str, timeout: float, max_bytes: int) -> FetchedPage:
+        assert "prices.azure.com" in url, "Claude must not be contacted for a non-USD run"
+        return FetchedPage(url=url, status=200, body=page2 if "skip" in url else page1)
+
+    real_sync = foundry_cli.sync_public_pricing
+    monkeypatch.setattr(
+        foundry_cli,
+        "sync_public_pricing",
+        lambda **kwargs: real_sync(**{**kwargs, "transport": transport}),
+    )
+    result = runner.invoke(app, ["pricing", "sync", "--currency", "EUR"])
+    assert result.exit_code == 0, result.output
+    assert "source=claude_pricing_docs status=skipped" in result.output
+    assert "USD only" in result.output
+    assert "never converts currencies" in result.output
+
+
+def test_pricing_sync_regional_only_completes_with_zero_claude_entries(cli, monkeypatch):
+    """A mode Claude is not offered in is reported, not treated as a failure."""
+    from tokenlens.pricing_sources import azure_retail, claude_docs
+    from tokenlens.pricing_sources.fetch import FetchedPage
+
+    page1 = (FIXTURES / "azure_retail_page1.json").read_bytes()
+    page2 = (FIXTURES / "azure_retail_page2.json").read_bytes()
+    claude_body = (FIXTURES / "claude_pricing.html").read_bytes()
+
+    def transport(url: str, timeout: float, max_bytes: int) -> FetchedPage:
+        if "prices.azure.com" in url:
+            return FetchedPage(url=url, status=200, body=page2 if "skip" in url else page1)
+        assert url == claude_docs.CLAUDE_PRICING_URL
+        return FetchedPage(url=url, status=200, body=claude_body)
+
+    real_sync = foundry_cli.sync_public_pricing
+    monkeypatch.setattr(
+        foundry_cli,
+        "sync_public_pricing",
+        lambda **kwargs: real_sync(**{**kwargs, "transport": transport}),
+    )
+    result = runner.invoke(app, ["pricing", "sync", "--deployment-mode", "regional"])
+    assert result.exit_code == 0, result.output
+    assert "source=claude_pricing_docs status=ok entries=0" in result.output
+    assert "published=none" in result.output
+    assert "not offered for Claude" in result.output
+    assert azure_retail.RETAIL_PRICES_URL  # the retail source was still attempted
+
+
+def test_pricing_sync_mixed_modes_keep_the_supported_claude_rates(cli, monkeypatch):
+    from tokenlens.pricing_sources import claude_docs
+    from tokenlens.pricing_sources.fetch import FetchedPage
+
+    page1 = (FIXTURES / "azure_retail_page1.json").read_bytes()
+    page2 = (FIXTURES / "azure_retail_page2.json").read_bytes()
+    claude_body = (FIXTURES / "claude_pricing.html").read_bytes()
+
+    def transport(url: str, timeout: float, max_bytes: int) -> FetchedPage:
+        if "prices.azure.com" in url:
+            return FetchedPage(url=url, status=200, body=page2 if "skip" in url else page1)
+        return FetchedPage(url=url, status=200, body=claude_body)
+
+    real_sync = foundry_cli.sync_public_pricing
+    monkeypatch.setattr(
+        foundry_cli,
+        "sync_public_pricing",
+        lambda **kwargs: real_sync(**{**kwargs, "transport": transport}),
+    )
+    result = runner.invoke(
+        app,
+        ["pricing", "sync", "--deployment-mode", "global", "--deployment-mode", "regional"],
+    )
+    assert result.exit_code == 0, result.output
+    # Global rates survive; only the unsupported mode is quarantined.
+    claude_line = next(
+        line for line in result.output.splitlines() if line.startswith("source=claude_pricing_docs")
+    )
+    assert "status=ok" in claude_line
+    assert "entries=0" not in claude_line
+    assert "quarantined=" in claude_line
+    from tokenlens.pricing_sources.cache import CLAUDE_SNAPSHOT, load_snapshot
+
+    snapshot = load_snapshot(CLAUDE_SNAPSHOT)
+    assert {entry.region for entry in snapshot.catalog.prices} == {"global"}
+
+
+def test_pricing_sync_reports_a_truncated_feed_without_caching_it(cli, monkeypatch):
+    import json as _json
+
+    from tokenlens.pricing_sources.fetch import FetchBudget, FetchedPage
+
+    counter = {"n": 0}
+
+    def endless(url: str, timeout: float, max_bytes: int) -> FetchedPage:
+        counter["n"] += 1
+        payload = _json.loads((FIXTURES / "azure_retail_page1.json").read_text(encoding="utf-8"))
+        payload["NextPageLink"] = f"https://prices.azure.com/api/retail/prices?page={counter['n']}"
+        return FetchedPage(url=url, status=200, body=_json.dumps(payload).encode())
+
+    real_sync = foundry_cli.sync_public_pricing
+    monkeypatch.setattr(
+        foundry_cli,
+        "sync_public_pricing",
+        lambda **kwargs: real_sync(
+            **{**kwargs, "transport": endless, "budget": FetchBudget(max_pages=2, retries=0)}
+        ),
+    )
+    result = runner.invoke(app, ["pricing", "sync", "--no-claude"])
+    assert result.exit_code == foundry_cli.EXIT_PARTIAL
+    assert "source=azure_retail_prices status=failed" in result.output
+    assert "feed=truncated" in result.output
+    assert "no meter is reported as missing" in result.output
+    status = runner.invoke(app, ["pricing", "status"])
+    assert "public-sync=not synchronized" in status.output
+
+
+def test_pricing_sync_reports_a_failed_source_without_fabricating_a_rate(cli, monkeypatch):
+    from tokenlens.pricing_sources.fetch import FetchError
+
+    real_sync = foundry_cli.sync_public_pricing
+
+    def transport(url: str, timeout: float, max_bytes: int):
+        raise FetchError("synthetic outage")
+
+    monkeypatch.setattr(
+        foundry_cli,
+        "sync_public_pricing",
+        lambda **kwargs: real_sync(**{**kwargs, "transport": transport}),
+    )
+    result = runner.invoke(app, ["pricing", "sync"])
+    assert result.exit_code == foundry_cli.EXIT_PARTIAL
+    assert "status=failed" in result.output
+    assert "pricing-sync=partial" in result.output
+    assert "packaged catalog and customer rates still apply" in result.output
 
 
 def test_pricing_verify_validates_local_catalogs_offline(cli):

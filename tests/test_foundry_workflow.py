@@ -474,9 +474,10 @@ def test_an_unpriced_deployment_is_explained_rather_than_asked_about(workspace):
     assert "cost is withheld for those deployments only" in transcript
     assert transcript.count("tokenlens-azure pricing set-rate --model") == 1
     assert f"--model {UNPRICED_MODEL}" in transcript
-    # A rate is never guessed, and public synchronization stays deferred.
+    # A rate is never guessed, and the pricing defaults are stated explicitly.
     assert "never guessed from a related model or family" in transcript
-    assert "Public pricing synchronization is deferred" in transcript
+    assert "Pricing assumptions: Retail · Global · Standard · Short context · Normal inference" in transcript
+    assert "Exact observed or configured dimensions" in transcript
 
 
 def test_all_subscriptions_collect_every_account_in_one_run(workspace):

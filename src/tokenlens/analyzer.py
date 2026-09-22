@@ -21,7 +21,12 @@ from .models import (
 )
 from .pricing import PricingCatalog, PricingResolution, canonical_model_name, resolve_trace_cost
 from .ptu import analyze_ptu
-from .reference import load_bundled_reference_catalog
+from .pricing_sources.assumptions import (
+    ASSUMPTIONS_BANNER,
+    ASSUMPTIONS_WARNING,
+    DEFAULT_PRICING_ASSUMPTIONS,
+)
+from .reference import load_effective_reference_catalog
 from .tasks import reconstruct_tasks
 from .rules import RULES, evaluate_rules
 from .workloads import (
@@ -62,6 +67,7 @@ def _cost_summary(
     customer_catalog: PricingCatalog | None,
     reference_catalog: PricingCatalog | None,
     required_currency: str,
+    applied_assumptions: set[str] | None = None,
 ) -> dict[str, object]:
     resolutions = [
         resolve_trace_cost(
@@ -75,6 +81,13 @@ def _cost_summary(
     ]
     resolved = [item for item in resolutions if item.resolved and item.cost_usd is not None]
     unresolved = [item for item in resolutions if not (item.resolved and item.cost_usd is not None)]
+    if applied_assumptions is not None:
+        # Only a rate that actually priced an analyzed record can contribute an
+        # assumption. An observed cost, or a customer rate with no defaults,
+        # contributes none — which is exactly what the report must show.
+        applied_assumptions.update(
+            dimension for item in resolved for dimension in item.assumed_dimensions
+        )
     resolved_tokens = sum(
         record.usage.input_tokens + record.usage.output_tokens
         for record, resolution in zip(records, resolutions)
@@ -202,6 +215,7 @@ def _summary(
     reference_catalog: PricingCatalog | None,
     pricing_currency: str,
     evaluations: list[RuleEvaluation] | None = None,
+    applied_assumptions: set[str] | None = None,
 ) -> AnalysisSummary | DeploymentSummary:
     aggregate_source = bool(records) and all(telemetry_kind(record) == "aggregate" for record in records)
     aggregate: AggregateAnalysisSummary | None = aggregate_summary(records) if aggregate_source else None
@@ -285,6 +299,7 @@ def _summary(
         customer_catalog=customer_catalog,
         reference_catalog=reference_catalog,
         required_currency=pricing_currency,
+        applied_assumptions=applied_assumptions,
     )
     common.update(
         {
@@ -430,7 +445,9 @@ def analyze(
     generated = generated_at or datetime.now(UTC).isoformat()
     pricing_when = _parse_when(generated)
     if reference_catalog is None and use_bundled_reference:
-        reference_catalog = load_bundled_reference_catalog()
+        # The cached official snapshot is preferred over the packaged
+        # catalog; both are read from disk, never from a network.
+        reference_catalog = load_effective_reference_catalog()
     pricing_currency = (
         "USD"
         if any(record.observed_cost_usd is not None for record in records)
@@ -440,6 +457,8 @@ def analyze(
         if reference_catalog is not None
         else "USD"
     )
+    # Only the defaults that priced an analyzed record are reported as applied.
+    applied_assumptions: set[str] = set()
     summary = _summary(
         records,
         overall_findings,
@@ -448,6 +467,7 @@ def analyze(
         reference_catalog=reference_catalog,
         pricing_currency=pricing_currency,
         evaluations=rule_run.evaluations,
+        applied_assumptions=applied_assumptions,
     )
     total_requests = summary.requests_observed or 0
     total_tokens = summary.total_tokens
@@ -526,6 +546,7 @@ def analyze(
                 summary,
                 customer_catalog=customer_catalog,
                 reference_catalog=reference_catalog,
+                applied_assumptions=applied_assumptions,
             ),
         },
     )
@@ -575,6 +596,7 @@ def _pricing_metadata(
     *,
     customer_catalog: PricingCatalog | None,
     reference_catalog: PricingCatalog | None,
+    applied_assumptions: set[str] | None = None,
 ) -> dict[str, object]:
     """Separate catalogs *consulted* from the catalog entry actually selected."""
     consulted = [
@@ -592,6 +614,24 @@ def _pricing_metadata(
         None,
     )
     matched = summary.estimated_cost_usd is not None
+    # What the catalogs *could* have assumed, versus what actually priced a
+    # record. Only the second is a claim about this report.
+    catalog_available = sorted(
+        {
+            item
+            for catalog in (customer_catalog, reference_catalog)
+            if catalog is not None
+            for item in catalog.assumed_dimensions()
+        }
+    )
+    applied = sorted(applied_assumptions or set())
+    provenance: list[dict[str, object]] = []
+    try:
+        from .pricing_sources.sync import public_pricing_provenance
+
+        provenance = public_pricing_provenance(currency=summary.pricing_currency)
+    except Exception:  # noqa: BLE001 - provenance is additive, never load-bearing
+        provenance = []
     return {
         "currency": summary.pricing_currency,
         "catalogs_consulted": consulted,
@@ -612,6 +652,14 @@ def _pricing_metadata(
         "estimate_only": True,
         "pricing_basis": selected_catalog.pricing_basis if selected_catalog else None,
         "currency_policy": "single_currency_no_conversion",
+        # The defaults are always stated, whether or not any of them was needed,
+        # so a reader never has to infer which dimensions were assumed.
+        "assumptions": DEFAULT_PRICING_ASSUMPTIONS.to_metadata(),
+        "assumptions_banner": ASSUMPTIONS_BANNER,
+        "assumptions_warning": ASSUMPTIONS_WARNING,
+        "assumed_dimensions_applied": applied,
+        "catalog_assumed_dimensions_available": catalog_available,
+        "public_sources": provenance,
     }
 
 

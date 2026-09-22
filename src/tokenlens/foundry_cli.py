@@ -36,7 +36,8 @@ from .foundry_workflow.orchestration import (
     missing_collector_packages,
 )
 from .foundry_workflow.pricing import (
-    PRICING_SYNC_DEFERRED_REASON,
+    ASSUMPTIONS_BANNER,
+    ASSUMPTIONS_WARNING,
     CustomerRate,
     catalog_status,
     load_customer_catalog,
@@ -46,6 +47,12 @@ from .foundry_workflow.pricing import (
 )
 from .foundry_workflow.prompts import TyperPrompter, symbol
 from .foundry_workflow.status import status_lines, status_payload, workloads_lines, workloads_payload
+from .pricing_sources.assumptions import (
+    PricingDimensionError,
+    canonical_context,
+    canonical_deployment,
+)
+from .pricing_sources.sync import sync_public_pricing
 from .foundry_workflow.wizard import (
     collect_and_report,
     configure as run_configure,
@@ -419,7 +426,7 @@ def foundry_pricing(
         "remediation=tokenlens-azure pricing set-rate --model MODEL --input-per-million X "
         "--output-per-million Y --effective-from YYYY-MM-DD"
     )
-    typer.echo("public-sync=deferred; see tokenlens-azure pricing sync")
+    typer.echo("public-sync=tokenlens-azure pricing sync (official sources, bounded and cached)")
     for item in unresolved:
         if item.state == "identity_unresolved":
             typer.echo(
@@ -571,19 +578,78 @@ def pricing_verify() -> None:
 
 
 @pricing_app.command("sync")
-def pricing_sync() -> None:
-    """Synchronize verified public pricing. **Deferred** — see docs/pricing.md.
+def pricing_sync(
+    currency: str = typer.Option("USD", "--currency", help="Billing currency to request. Never converted."),
+    region: str | None = typer.Option(
+        None, "--region", help="Restrict the Azure Retail Prices query to one ARM region."
+    ),
+    deployment_mode: list[str] = typer.Option(
+        [], "--deployment-mode", help="global, data_zone, or regional. Defaults to the assumed global mode."
+    ),
+    context: list[str] = typer.Option(
+        [], "--context", help="Context window to price: short or long. Defaults to the assumed short."
+    ),
+    include_claude: bool = typer.Option(
+        True, "--claude/--no-claude", help="Also parse Anthropic's official published Claude pricing."
+    ),
+) -> None:
+    """Synchronize verified public pricing from official sources, then cache it.
 
-    TokenLens will publish a synchronized rate only when it can attribute it to a
-    documented, machine-readable source with a deterministic parser, fixtures, an
-    effective date, a retrieval timestamp, and a content hash.
+    Only two hosts are ever contacted, both allow-listed by exact host and path
+    on the first request, on every redirect hop, and on every pagination
+    continuation. Requests are bounded in time, pages, items, size, and
+    retries; a feed that hits a ceiling is reported as truncated and is never
+    cached over a complete snapshot. The result is stored user-locally with
+    ``0600`` permissions and every later analysis reads it offline.
     """
-    typer.echo("pricing-sync=deferred")
-    typer.echo(f"reason={PRICING_SYNC_DEFERRED_REASON}")
-    typer.echo("remediation=tokenlens-azure pricing set-rate --model MODEL --input-per-million X "
-               "--output-per-million Y --effective-from YYYY-MM-DD")
-    typer.echo("network=no request was made")
-    raise typer.Exit(code=EXIT_DEFERRED)
+    try:
+        modes = [canonical_deployment(item) for item in deployment_mode]
+        contexts = [canonical_context(item) for item in context]
+    except PricingDimensionError as exc:
+        typer.echo(f"error={exc}", err=True)
+        raise typer.Exit(code=EXIT_FAILED) from exc
+    typer.echo(f"assumptions={ASSUMPTIONS_BANNER}")
+    typer.echo(f"assumption-warning={ASSUMPTIONS_WARNING}")
+    report = sync_public_pricing(
+        currency=currency.upper(),
+        region=region,
+        account_region=region,
+        deployments=modes or None,
+        contexts=contexts or None,
+        include_claude=include_claude,
+        claude_deployment_modes=modes or None,
+    )
+    for outcome in report.outcomes:
+        typer.echo(
+            f"source={outcome.source} status={outcome.status} "
+            f"entries={outcome.entries} quarantined={outcome.quarantined}"
+        )
+        if outcome.content_hash:
+            typer.echo(f"  content-hash={outcome.content_hash}")
+        if outcome.retrieved_at:
+            typer.echo(f"  retrieved-at={outcome.retrieved_at.isoformat()}")
+        if outcome.path is not None:
+            typer.echo(f"  snapshot={safe_display_path(outcome.path)} mode=0600")
+        if not outcome.feed_complete:
+            typer.echo("  feed=truncated; nothing was cached and no meter is reported as missing")
+        if outcome.ok and not outcome.skipped and outcome.entries == 0:
+            typer.echo("  published=none; the read completed and nothing matched the request")
+        if outcome.reason:
+            typer.echo(f"  reason={outcome.reason}")
+        if outcome.error:
+            typer.echo(f"  error={outcome.error}", err=True)
+            typer.echo(
+                "  fallback="
+                + (
+                    "previous cached snapshot retained"
+                    if outcome.used_cache
+                    else "no cached snapshot; packaged catalog and customer rates still apply"
+                )
+            )
+    typer.echo(f"pricing-sync={'ok' if report.ok else 'partial'}")
+    typer.echo("analysis=offline; the cached snapshot is read without any network request")
+    if not report.ok:
+        raise typer.Exit(code=EXIT_PARTIAL)
 
 
 @pricing_app.command("set-rate")

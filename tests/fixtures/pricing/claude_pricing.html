@@ -1,0 +1,76 @@
+<!doctype html>
+<!--
+  Synthetic fixture modelled on https://platform.claude.com/docs/en/about-claude/pricing
+  Committed so the deterministic parser has a stable contract to test against.
+  No content is copied from the published page; only the column layout the
+  parser depends on is reproduced.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Pricing - Claude Docs</title>
+  </head>
+  <body>
+    <main>
+      <h1>Pricing</h1>
+      <p>
+        Token prices are listed per million tokens (MTok). Prompt caching is
+        billed separately for writes and for reads.
+      </p>
+
+      <h2>Navigation</h2>
+      <table>
+        <thead>
+          <tr><th>Section</th><th>Link</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Model pricing</td><td>#model-pricing</td></tr>
+          <tr><td>Batch processing</td><td>#batch</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="model-pricing">Model pricing</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th>Base Input Tokens</th>
+            <th>5m Cache Writes</th>
+            <th>1h Cache Writes</th>
+            <th>Cache Hits &amp; Refreshes</th>
+            <th>Output Tokens</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Claude Opus 5</td>
+            <td>$5 / MTok</td>
+            <td>$6.25 / MTok</td>
+            <td>$10 / MTok</td>
+            <td>$0.50 / MTok</td>
+            <td>$25 / MTok</td>
+          </tr>
+          <tr>
+            <td>Claude Sonnet 5</td>
+            <td>$3 / MTok</td>
+            <td>$3.75 / MTok</td>
+            <td>$6 / MTok</td>
+            <td>$0.30 / MTok</td>
+            <td>$15 / MTok</td>
+          </tr>
+          <tr>
+            <td>Claude Haiku 4.5</td>
+            <td>$1 / MTok</td>
+            <td>$1.25 / MTok</td>
+            <td>$2 / MTok</td>
+            <td>$0.10 / MTok</td>
+            <td>$5 / MTok</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="batch">Batch processing</h2>
+      <p>Batch processing is billed at a discount and is out of scope here.</p>
+    </main>
+  </body>
+</html>
