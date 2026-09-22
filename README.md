@@ -139,6 +139,18 @@ non-interactive terminals receive a plain-text equivalent.
   <img src="docs/assets/tokenlens-report-workloads-20260917-v8.png" alt="Synthetic TokenLens Workloads report">
 </a>
 
+### Usage & diagnostics
+
+<a href="docs/assets/tokenlens-report-usage-20260917-v8.png">
+  <img src="docs/assets/tokenlens-report-usage-20260917-v8.png" alt="Synthetic TokenLens Usage and diagnostics report">
+</a>
+
+### PTU advisor
+
+<a href="docs/assets/tokenlens-report-ptu-advisor-20260917-v8.png">
+  <img src="docs/assets/tokenlens-report-ptu-advisor-20260917-v8.png" alt="Synthetic TokenLens PTU advisor report">
+</a>
+
 <p align="center"><em>All screenshots use deterministic synthetic data.</em></p>
 
 ## Workload cost
