@@ -2055,6 +2055,11 @@ def report_html(report: AnalysisReport) -> str:
         if multi_model
         else _composition_card(report)
     )
+    embedded_payload = json.dumps(
+        _without_internal(report.model_dump(mode="json")),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).replace("<", "\\u003c")
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TokenLens for Azure — Report</title>
@@ -2101,6 +2106,7 @@ def report_html(report: AnalysisReport) -> str:
 <section class="tab-panel workloads" id="workloads-panel" role="tabpanel" aria-labelledby="workloads-tab">{workloads_panel}</section>
 <section class="tab-panel ptu" id="ptu-panel" role="tabpanel" aria-labelledby="ptu-tab">{ptu_panel}</section>
 </div></main>
+<script type="application/json" id="tokenlens-report-payload">{embedded_payload}</script>
 <script>
 document.documentElement.classList.add("js");
 /* One router owns location.hash for the whole report: #tab=<name> plus an

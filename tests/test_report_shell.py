@@ -52,6 +52,8 @@ def test_one_router_owns_the_url_fragment(rendered: str):
     assert '"#ptu=" + slug' not in rendered
     assert "window.tokenlensRouter.setDeployment(slug)" in rendered
     assert "#tab=" in rendered
+    assert 'id="tokenlens-report-payload"' in rendered
+    assert '"report_metadata"' in rendered
 
 
 def test_unknown_fragments_fall_back_to_overview(rendered: str):
