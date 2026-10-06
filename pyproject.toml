@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokenlens-azure"
-version = "0.1.0a1"
+version = "0.2.0a1"
 description = "Offline LLM token-efficiency diagnostics with Azure-first recommendations"
 readme = "README.md"
 requires-python = ">=3.11"
