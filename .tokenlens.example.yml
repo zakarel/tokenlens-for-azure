@@ -1,0 +1,24 @@
+# TokenLens portable policy example. No credentials or customer identifiers.
+schema_version: 3
+collection:
+  lookback_days: 14
+  granularity_minutes: 5
+  output_dir: local-traces/foundry-metrics
+  isolate_runs: true
+  assessment_mode: full
+pricing:
+  public_cache: true
+  use_reference_catalog: true
+report:
+  format: html
+  output_dir: reports
+  open: false
+telemetry:
+  output_dir: tokenlens-traces
+  sample_rate: 1.0
+  content_capture: false
+  fingerprints:
+    enabled: false
+workloads:
+  defaults:
+    create_for_each_deployment: true
