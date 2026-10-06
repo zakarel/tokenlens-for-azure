@@ -46,6 +46,7 @@ SNAPSHOT_SCHEMA_VERSION = 2
 SOURCE_NAMES: dict[str, str] = {
     "azure_retail_prices": AZURE_RETAIL_SNAPSHOT,
     "claude_pricing_docs": CLAUDE_SNAPSHOT,
+    "official_foundry_pages": "official-foundry-pages.json",
 }
 
 #: Re-exported so callers hash bytes the same way the fetcher does.
@@ -72,7 +73,7 @@ class PricingSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: int = SNAPSHOT_SCHEMA_VERSION
-    source: Literal["azure_retail_prices", "claude_pricing_docs"]
+    source: Literal["azure_retail_prices", "claude_pricing_docs", "official_foundry_pages"]
     source_url: str
     api_version: str | None = None
     retrieved_at: datetime
