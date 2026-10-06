@@ -1,10 +1,12 @@
 import pytest
 
 from tokenlens.pricing_sources.official_pages import (
+    fetch_official_page,
     official_page_url,
     page_catalog,
     parse_official_page,
 )
+from tokenlens.pricing_sources.fetch import FetchedPage
 
 
 HTML = """
@@ -46,3 +48,12 @@ def test_page_catalog_excludes_native_unit_rows_without_inventing_token_rates():
     assert len(catalog.prices) == 1
     assert catalog.prices[0].model == "Mistral Medium 3.5 Global"
     assert catalog.prices[0].source_url.endswith("/mistral-ai/")
+
+
+def test_official_page_fetch_uses_allow_list_and_bounded_transport():
+    def transport(url, timeout, max_bytes):
+        assert url.endswith("/mistral-ai/")
+        return FetchedPage(url=url, status=200, body=HTML.encode())
+
+    rates = fetch_official_page("mistral", transport=transport)
+    assert len(rates) == 2

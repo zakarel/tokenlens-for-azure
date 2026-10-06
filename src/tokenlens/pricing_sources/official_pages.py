@@ -8,7 +8,7 @@ from html.parser import HTMLParser
 from typing import Iterable
 from urllib.parse import urljoin
 
-from .fetch import UrlAllowList, content_sha256
+from .fetch import FetchBudget, Transport, UrlAllowList, content_sha256, fetch_text
 from ..pricing import PriceEntry, PricingCatalog
 from datetime import UTC, datetime
 
@@ -182,12 +182,29 @@ def page_catalog(rates: Iterable[OfficialPageRate], *, retrieved_at: datetime | 
     )
 
 
+def fetch_official_page(
+    provider_route: str,
+    *,
+    budget: FetchBudget | None = None,
+    transport: Transport | None = None,
+) -> list[OfficialPageRate]:
+    """Fetch and parse one provider page under the bounded official allow-list."""
+    url = official_page_url(provider_route)
+    page = fetch_text(url, allow_list=OFFICIAL_ALLOW_LIST, budget=budget, transport=transport)
+    return parse_official_page(
+        page.text(),
+        provider_route=provider_route,
+        source_url=page.resolved_url,
+    )
+
+
 __all__ = [
     "OFFICIAL_ALLOW_LIST",
     "OFFICIAL_PRICING_ROOT",
     "OFFICIAL_ROUTES",
     "OfficialPageRate",
     "official_page_url",
+    "fetch_official_page",
     "page_catalog",
     "parse_official_page",
 ]
