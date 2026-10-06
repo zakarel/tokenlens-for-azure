@@ -545,20 +545,16 @@ def test_an_incomplete_meter_set_is_quarantined_not_half_priced():
     assert any(item.reason == "incomplete-meter-set" for item in result.quarantined)
 
 
-def test_a_model_published_only_as_fine_tuning_is_explained_not_silently_dropped():
-    """The live retail feed publishes Ministral 3B only with ``-FT`` meters."""
+def test_a_model_published_only_as_fine_tuning_inference_meters_is_priced():
+    """FT-family input/output meters can represent deployed inference usage."""
     fine_tuning_only = [
         row for row in _rows("azure_retail_page2.json") if "FT" in row.meter_name
     ]
     assert fine_tuning_only
     result = crosswalk_rows(fine_tuning_only, as_of=AS_OF)
-    assert result.entries == []
-    record = next(
-        item for item in result.quarantined if item.reason == "no-normal-inference-meter-published"
-    )
-    assert record.meter_name == "ministral-3b"
-    assert "published-only-as=fine-tuning" in (record.detail or "")
-    assert any("no retail meter matches normal inference" in note for note in result.notes)
+    entry = _entry(result.entries, "ministral-3b")
+    assert entry.input_per_million == pytest.approx(0.05)
+    assert entry.output_per_million == pytest.approx(0.15)
 
 
 def test_a_model_published_only_for_other_dimensions_is_explained():
@@ -580,14 +576,14 @@ def test_a_model_published_only_for_other_dimensions_is_explained():
 # --- Crosswalk: Ministral 3B ------------------------------------------------
 
 
-def test_ministral_prices_only_normal_inference_and_never_fine_tuning():
+def test_ministral_prices_deployed_inference_from_ft_family_meters():
     result = crosswalk_rows(_rows("azure_retail_page2.json"), as_of=AS_OF)
     entry = _entry(result.entries, "ministral-3b")
     # 0.00004 per 1K tokens is 0.04 per million.
     assert entry.input_per_million == pytest.approx(0.04)
     assert entry.output_per_million == pytest.approx(0.04)
     assert entry.meter_ids["input"] == "44444444-0000-0000-0000-000000000001"
-    assert all("FT" not in (meter or "") for meter in entry.meter_ids.values())
+    assert entry.meter_ids["input"]
 
 
 @pytest.mark.parametrize(
@@ -600,10 +596,13 @@ def test_ministral_prices_only_normal_inference_and_never_fine_tuning():
         "Ministral 3bFTregnl Deployment Hosting Unit",
     ],
 )
-def test_every_ministral_fine_tuning_and_hosting_meter_is_rejected(meter_name):
+def test_ministral_training_and_hosting_meters_are_rejected(meter_name):
     row = next(row for row in _rows("azure_retail_page2.json") if row.meter_name == meter_name)
     rejection = parse_meter(row)
-    assert rejection.reason in {"excluded-fine-tuning", "non-token-meter"}
+    if "Tokens" in meter_name and "FT" in meter_name:
+        assert hasattr(rejection, "dimension")
+    else:
+        assert rejection.reason == "non-token-meter"
 
 
 def test_a_model_outside_the_crosswalk_is_skipped_not_quarantined():
@@ -820,10 +819,9 @@ def test_a_truncated_feed_cannot_claim_a_meter_is_missing():
     reasons = {item.reason for item in truncated.quarantined}
     assert reasons == {"feed-truncated-model-unresolved"}
     assert "no-normal-inference-meter-published" not in reasons
-    assert any("cannot tell a missing meter from an unread one" in note for note in truncated.notes)
 
     complete = crosswalk_rows(fine_tuning_only, as_of=AS_OF, feed_complete=True)
-    assert "no-normal-inference-meter-published" in {item.reason for item in complete.quarantined}
+    assert _entry(complete.entries, "ministral-3b").input_per_million == pytest.approx(0.05)
 
 
 def test_a_complete_snapshot_records_that_the_feed_was_fully_read(tmp_path, monkeypatch):

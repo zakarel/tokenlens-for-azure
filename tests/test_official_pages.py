@@ -51,6 +51,27 @@ def test_page_catalog_excludes_native_unit_rows_without_inventing_token_rates():
     assert catalog.prices[0].source_url.endswith("/mistral-ai/")
 
 
+def test_fine_tuning_table_keeps_training_hosting_and_inference_components_separate():
+    html = """
+    <table><tr><th>Models</th><th>Training per 1M tokens</th>
+    <th>Hosting per hour</th><th>Input Usage per 1M tokens</th>
+    <th>Output Usage per 1M tokens</th></tr>
+    <tr><td>Mistral Ministral 3B Global</td><td>$1</td><td>$0.65</td>
+    <td>$0.05</td><td>$0.15</td></tr></table>
+    """
+    rates = parse_official_page(html, provider_route="fine_tuning")
+    assert rates[0].components == {
+        "training": 1.0,
+        "hosting": 0.65,
+        "input": 0.05,
+        "output": 0.15,
+    }
+    catalog = page_catalog(rates)
+    assert catalog.prices[0].model == "ministral-3b"
+    assert catalog.prices[0].input_per_million == 0.05
+    assert catalog.prices[0].output_per_million == 0.15
+
+
 def test_official_page_fetch_uses_allow_list_and_bounded_transport():
     def transport(url, timeout, max_bytes):
         assert url.endswith("/mistral-ai/")

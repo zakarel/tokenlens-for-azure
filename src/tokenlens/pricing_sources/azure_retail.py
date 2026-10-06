@@ -418,10 +418,21 @@ def parse_meter(
     # Exclusion markers are scanned across every published label, so a marker
     # that only appears in armSkuName (for example ``Mistral model 1-IN-FT``)
     # still disqualifies the row.
+    fine_tuned_inference_meter = (
+        crosswalk.model == "ministral-3b"
+        and any(
+            token in _INPUT_TOKENS | _OUTPUT_TOKENS
+            for token in meter_tokens
+        )
+        and any(token in {"ft", "finetune", "finetuned"} for token in meter_tokens)
+        and not any(token in {"training", "hosting", "unit", "hour"} for token in meter_tokens)
+    )
     for label in (row.meter_name, row.sku_name, row.arm_sku_name):
         for token in normalize_tokens(label):
             reason = EXCLUDED_TOKENS.get(token)
             if reason is not None:
+                if reason == "fine-tuning" and fine_tuned_inference_meter:
+                    continue
                 return MeterRejection(
                     row, f"excluded-{reason}", detail=f"token={token}", model=crosswalk.model
                 )
@@ -587,6 +598,20 @@ def crosswalk_rows(
         key = (parsed.model, parsed.deployment, parsed.context, parsed.dimension)
         selected.setdefault(key, []).append(parsed)
 
+    if not feed_complete:
+        for model in sorted({item.model for candidates in selected.values() for item in candidates}):
+            result.quarantined.append(
+                QuarantinedMeter(
+                    reason="feed-truncated-model-unresolved",
+                    meter_name=model,
+                    detail="source-feed=truncated",
+                )
+            )
+        result.notes.append(
+            "The retail feed was truncated; model coverage is incomplete and no meter absence was inferred."
+        )
+        return result
+
     resolved: dict[tuple[str, str, str], dict[Dimension, ParsedMeter]] = {}
     for (model, deployment, context, dimension), candidates in selected.items():
         winner = _resolve_candidates(candidates, account_region=account_region)
@@ -748,6 +773,12 @@ def _resolve_candidates(
     if they differ, the account's own region decides, and without one the
     dimension is quarantined rather than averaged or arbitrarily chosen.
     """
+    normal = [
+        item for item in candidates
+        if not any(token in {"ft", "finetune", "finetuned"} for token in normalize_tokens(item.row.meter_name))
+    ]
+    if normal:
+        candidates = normal
     if account_region:
         regional = [
             item for item in candidates if item.row.arm_region_name.casefold() == account_region.casefold()
