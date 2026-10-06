@@ -190,6 +190,7 @@ class CollectionSettings(BaseModel):
     #: in or deleted.
     isolate_runs: bool = True
     analysis_goal: AnalysisGoal = "full_assessment"
+    assessment_mode: Literal["operational", "optimization", "full"] = "full"
 
     @field_validator("analysis_goal", mode="before")
     @classmethod

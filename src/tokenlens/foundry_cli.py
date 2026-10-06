@@ -242,6 +242,7 @@ def foundry_configure(
         None, "--workloads/--no-workloads", help="Configure business workload identity now."
     ),
     noninteractive: bool = typer.Option(False, "--noninteractive", help="Never prompt; fail on ambiguity."),
+    assessment_mode: str = typer.Option("full", "--assessment-mode", help="operational, optimization, or full."),
     config: str | None = typer.Option(None, "--config", help="Path to .tokenlens.yml."),
 ) -> None:
     """Discover Azure resources and save a credential-free configuration.
@@ -263,6 +264,7 @@ def foundry_configure(
             days=days,
             all_subscriptions=all_subscriptions or None,
             configure_business_workloads=workloads,
+            assessment_mode=assessment_mode,
         )
     except (WorkflowError, NoninteractiveError, WorkloadMappingError) as exc:
         _fail(exc)

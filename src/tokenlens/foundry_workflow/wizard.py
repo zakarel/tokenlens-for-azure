@@ -728,6 +728,7 @@ def configure(
     days: int | None = None,
     all_subscriptions: bool | None = None,
     configure_business_workloads: bool | None = None,
+    assessment_mode: str = "full",
 ) -> tuple[FoundryWorkflowConfig, list[PricingReadiness]]:
     """Discover, select, and save a credential-free configuration.
 
@@ -744,7 +745,18 @@ def configure(
             + ", ".join(missing)
             + f"). Install them with: {install_command()}"
         )
+    if assessment_mode not in {"operational", "optimization", "full"}:
+        raise WorkflowError("assessment mode must be operational, optimization, or full")
+    config.collection.assessment_mode = assessment_mode  # type: ignore[assignment]
     config.collection.analysis_goal = "full_assessment"
+    prompter.panel(
+        "Assessment mode",
+        [
+            "Operational: Azure Monitor, inventory, pricing, reliability, aggregate insights, PTU readiness.",
+            "Optimization: SDK/OTel/App Insights/import request telemetry for TL001-TL008.",
+            "Full: runs both tracks; aggregate telemetry alone does not evaluate request-level rules.",
+        ],
+    )
 
     prompter.step(1, TOTAL_STEPS, "Azure subscription scope")
     scope, subscriptions = _select_scope(

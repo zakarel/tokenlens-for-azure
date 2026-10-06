@@ -24,6 +24,7 @@ from tokenlens.foundry_workflow.configuration import (
     safe_display_path,
 )
 from tokenlens.foundry_workflow.models import (
+    CollectionSettings,
     NoninteractiveError,
     SubscriptionOption,
     WorkflowError,
@@ -38,6 +39,11 @@ from tokenlens.foundry_workflow.orchestration import (
 from tokenlens.foundry_workflow.prompts import ScriptedPrompter
 from tokenlens.foundry_workflow.wizard import collect_and_report, configure
 from tokenlens.telemetry.schema import BucketMetrics, MetricBucketRecord
+
+
+def test_assessment_mode_is_a_typed_persisted_setting():
+    assert CollectionSettings(assessment_mode="operational").assessment_mode == "operational"
+    assert CollectionSettings(assessment_mode="optimization").assessment_mode == "optimization"
 
 WINDOW_START = datetime(2026, 9, 1, tzinfo=UTC)
 SUBSCRIPTION = "11111111-2222-3333-4444-555555555555"
