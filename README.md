@@ -36,6 +36,26 @@ pricing or PTU capacity.
 
 ## Quick start
 
+## Changelog
+
+### 0.3.0a1
+
+- Added zero-touch Foundry collection with chunked long-window merging.
+- Added deterministic aggregate insights for coverage, failures, latency
+  availability, token footprint, pricing readiness, and cache evidence.
+- Added exact public pricing from Azure Retail Prices API and official Foundry
+  provider pages, including Ministral-3B fine-tuned inference meters.
+- Added separate actual-cost, contract, Marketplace, and override pricing
+  tracks.
+- Added typed report payloads, materiality/help links, bounded analytics, and
+  improved responsive insight layout.
+- Corrected GPT-5.6 cache semantics: sub-1,024-token aggregate input proves
+  cached tokens are zero; otherwise cached usage remains unavailable unless
+  request-level usage is collected.
+- Removed the empty Not evaluated and Azure actions report panels.
+
+This remains an **alpha prerelease**, not GA.
+
 ### 1. Install
 
 ```bash

@@ -204,6 +204,7 @@ class AnalysisSummary(BaseModel):
         "catalog_missing",
         "identity_unresolved",
         "currency_mismatch",
+        "usage_incomplete",
     ] = "priced"
     pricing_complete: bool = False
     pricing_currency: str = "USD"

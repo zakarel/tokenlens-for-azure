@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0a1
+## 0.3.0a1
 
 This prerelease establishes the GA-track foundation:
 

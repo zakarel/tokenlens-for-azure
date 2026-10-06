@@ -54,5 +54,5 @@ def test_missing_latency_is_a_direct_data_quality_action():
         total_tokens_state="measured",
     )
     insight = next(item for item in build_aggregate_insights(summary) if item.insight_id == "DQ-LATENCY-GAP")
-    assert "Time to Response" in insight.recommendation
+    assert "No user action is required" in insight.recommendation
     assert insight.help_links

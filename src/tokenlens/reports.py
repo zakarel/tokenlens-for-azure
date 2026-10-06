@@ -254,6 +254,7 @@ _PRICING_STATUS_COPY = {
     "catalog_missing": ("Model identified, exact rate missing", "Run pricing-audit or add an exact override"),
     "identity_unresolved": ("Pricing not attempted", "Model identity unresolved during collection"),
     "currency_mismatch": ("Currency conversion required", "Configure a reporting currency; no conversion is performed"),
+    "usage_incomplete": ("Exact rate found; usage incomplete", "Cached-token usage is unavailable for this aggregate run"),
 }
 
 
@@ -807,6 +808,13 @@ def _model_pricing_state(item) -> AvailabilityState:
             label="Partly priced",
             reason=f"{item.unresolved_tokens:,} tokens excluded",
             action_id="pricing",
+        )
+    if item.pricing_status == "usage_incomplete":
+        return AvailabilityState(
+            status="partial",
+            label="Exact rate found; usage incomplete",
+            reason="Cached-token usage is unavailable for this aggregate run",
+            action_id="usage",
         )
     if item.pricing_status == "currency_mismatch":
         return AvailabilityState(
@@ -2038,7 +2046,6 @@ def _ptu_legacy_summary(analysis: PtuPortfolioAssessment) -> str:
 def report_html(report: AnalysisReport) -> str:
     summary = report.summary
     overview = overview_findings(report)
-    actions = top_recommendations(overview)
     models = model_rollups(report)
     # A donut needs at least two slices to communicate anything.
     multi_model = len(models) > 1
@@ -2098,7 +2105,7 @@ def report_html(report: AnalysisReport) -> str:
 <div class="card"><div class="label">Estimated cost</div><div class="value accent">{_money(summary.estimated_cost_usd, currency=summary.pricing_currency)}</div><div class="sub">{_escape(cost_sub_overview)}</div></div>
 <div class="card"><div class="label">Pricing coverage</div><div class="value">{summary.pricing_coverage_tokens_percent:.1f}% priced</div><div class="sub">{_escape(pricing_headline)} · {_escape(pricing_reason)}</div></div></section>
 <section class="overview-grid"><section class="panel"><div class="panel-head"><div><h2>Portfolio usage</h2><small>Token share by deployment</small></div><a href="#usage" data-tab-link="usage">View analytics →</a></div><div class="portfolio">{_deployment_rows(report)}</div></section>
-<aside class="panel"><div class="panel-head"><div><h2>Azure actions</h2><small>Prioritized for a first decision</small></div></div><div class="actions"><ol>{_overview_actions(actions, report)}</ol></div></aside></section>
+</section>
 {_aggregate_insights_panel(report)}{_material_findings_panel(report, overview, summary, config, hidden_count)}
 <footer>tokenlens-for-azure · created by Tzahi Ariel</footer></section>
 <section class="tab-panel usage" id="usage-panel" role="tabpanel" aria-labelledby="usage-tab">
@@ -2324,7 +2331,7 @@ def task_economics_html(
 <div class="kpi"><span>Optimisation scenarios</span><b>{len(overview_report.report_metadata.get("scenarios", [])):,}</b><p>Independent ranges · not additive</p></div>
 <div class="kpi"><span>Findings</span><b>{len(overview_report.findings):,}</b><p>Usage diagnostics</p></div></section>
 <section class="grid"><article class="panel overview-list"><h2>Portfolio usage</h2><p>Token share by deployment</p>{_deployment_rows(overview_report)}</article>
-<article class="panel overview-list"><h2>Azure actions</h2><p>Prioritized for a first decision</p><ol>{_overview_actions(top_recommendations(overview_findings(overview_report)), overview_report)}</ol></article></section>
+</section>
 <section class="panel overview-list"><h2>Material findings</h2><p>Independent scenarios are retained; no aggregate range is summed.</p>{_finding_cards(overview_findings(overview_report), compact=True)}</section>"""
     else:
         overview_content = '<div class="panel fallback"><h2>Consumption Overview</h2><p>Legacy request/deployment overview remains available when request telemetry is supplied.</p></div>'

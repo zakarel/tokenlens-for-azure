@@ -165,11 +165,11 @@ def test_missing_request_metric_is_unavailable_not_zero():
     assert "Unavailable" in report_html(report)
 
 
-def test_cached_tokens_stay_unavailable_when_the_metric_is_missing(audited_report):
-    assert audited_report.summary.cached_tokens_available is False
-    assert audited_report.summary.aggregate.cached_tokens is None
+def test_sub_threshold_input_proves_cached_tokens_zero_when_metric_is_missing(audited_report):
+    assert audited_report.summary.cached_tokens_available is True
+    assert audited_report.summary.aggregate.cached_tokens == 0
     rendered = report_html(audited_report)
-    assert "cached metric unavailable" in rendered
+    assert "cached metric unavailable" not in rendered
 
 
 def test_complete_status_coverage_reports_a_genuine_zero_rate_limit(audited_report):
@@ -331,13 +331,21 @@ def test_overview_widgets_reconcile_with_the_aggregate_summary(audited_report):
     assert "2 active of 4,032 elapsed" in overview
     assert "1 deployment" in overview
     assert "Single selected route" in overview
-    assert "Request-level optimisation not evaluated" in overview
+    assert "Azure actions" not in overview
 
 
 def test_aggregate_summary_accepts_one_shot_iterators():
     records = iter([bucket(index=0, input_tokens=3, output_tokens=2, status_codes={"200": 1})])
     summary = aggregate_summary(records)
     assert summary.total_tokens == 5
+
+
+def test_sub_1024_input_tokens_prove_prompt_cache_zero():
+    summary = aggregate_summary([
+        bucket(index=0, input_tokens=30, output_tokens=15, status_codes={"200": 1}),
+    ])
+    assert summary.cached_tokens == 0
+    assert summary.cached_tokens_state == "measured"
 
 
 def test_iter_records_many_is_bounded_and_duplicate_free(tmp_path):

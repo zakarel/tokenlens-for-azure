@@ -191,6 +191,13 @@ def aggregate_summary(records: Iterable[TraceRecord]) -> AggregateAnalysisSummar
     output_tokens = _sum_optional(outputs)
     input_state = _measurement_state(inputs)
     cached_state = _measurement_state(cached)
+    # Microsoft prompt caching requires at least 1,024 prompt tokens in a
+    # request. If the complete measured input subtotal is below that threshold,
+    # every request is necessarily cache-ineligible and cached usage is measured
+    # zero even when Azure Monitor omits the cache metric.
+    if cached_state == "unavailable" and input_tokens is not None and input_tokens < 1024:
+        cached_tokens = 0
+        cached_state = "measured"
     output_state = _measurement_state(outputs)
     token_state: Literal["measured", "partial", "unavailable", "not_applicable"]
     if input_state == output_state == "unavailable":

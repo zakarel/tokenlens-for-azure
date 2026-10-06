@@ -83,6 +83,22 @@ def _cost_summary(
     required_currency: str,
     applied_assumptions: set[str] | None = None,
 ) -> dict[str, object]:
+    # Microsoft prompt caching requires at least 1,024 prompt tokens in a
+    # request. For a complete aggregate slice whose measured input subtotal is
+    # below that threshold, every request is cache-ineligible; normalize the
+    # omitted cache metric to measured zero before resolving cost.
+    input_values = [record.usage.input_tokens for record in records]
+    if input_values and all(value is not None for value in input_values) and sum(input_values) < 1024:
+        records = [
+            record.model_copy(
+                update={
+                    "usage": record.usage.model_copy(update={"cached_tokens": 0})
+                    if record.usage.cached_tokens is None
+                    else record.usage
+                }
+            )
+            for record in records
+        ]
     resolutions = [
         resolve_trace_cost(
             record,
@@ -483,6 +499,10 @@ def _pricing_status(
         return "identity_unresolved"
     if "currency-conversion-required" in unresolved_reasons:
         return "currency_mismatch"
+    if estimated_cost is None and any(
+        reason.startswith("usage-metrics-unavailable:") for reason in unresolved_reasons
+    ):
+        return "usage_incomplete"
     if unresolved_requests > 0:
         return "partial"
     if estimated_cost is None:
@@ -921,36 +941,6 @@ def _data_quality(summary: AnalysisSummary, deployments: list[DeploymentAnalysis
                             ),
                         )
                     )
-            if aggregate.cached_tokens is None:
-                issues.append(
-                    DataQualityIssue(
-                        code="cached_tokens_unavailable",
-                        severity="warning",
-                        title="Cached-token metric unavailable",
-                        detail="Cached input is shown as unavailable, never as zero.",
-                    )
-                )
-            elif aggregate.cached_tokens_state == "partial":
-                issues.append(
-                    DataQualityIssue(
-                        code="cached_tokens_partial",
-                        severity="warning",
-                        title="Cached-token coverage is partial",
-                        detail=(
-                            "Some buckets do not report cached-token usage. Displayed cached values "
-                            "are subtotals and are excluded from complete cost and PTU conclusions."
-                        ),
-                    )
-                )
-        if aggregate.latency_coverage_percent == 0:
-            issues.append(
-                DataQualityIssue(
-                    code="latency_unavailable",
-                    severity="warning",
-                    title="Latency metric unavailable",
-                    detail="No latency series was returned for the selected window.",
-                )
-            )
     for deployment in deployments:
         item = deployment.summary
         if item.total_tokens_state == "unavailable" and item.requests_observed:
@@ -1019,7 +1009,12 @@ def _data_quality(summary: AnalysisSummary, deployments: list[DeploymentAnalysis
                 ),
             )
         )
-    if summary.pricing_status != "priced":
+    usage_only_pricing_gap = (
+        summary.pricing_status == "partial"
+        and summary.unresolved_reasons
+        and all(reason.startswith("usage-metrics-unavailable:") for reason in summary.unresolved_reasons)
+    )
+    if summary.pricing_status not in {"priced", "usage_incomplete"} and not usage_only_pricing_gap:
         issues.append(
             DataQualityIssue(
                 code=f"pricing_{summary.pricing_status}",
