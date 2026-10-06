@@ -20,6 +20,7 @@ from .economics import TaskEconomicsReport
 from .ingest import InputError, load_records_many, load_task_events_many
 from .output import choose_output, economics_text, pricing_audit_text
 from .pricing import PricingCatalog
+from .pricing_sources.imports import ImportedPriceRow, summarize_actual_cost
 from .reference import load_effective_reference_catalog
 from .presentation import impact_category, is_material, materiality_config
 from .reports import report_html, report_json, report_sarif, task_economics_sarif, write_output
@@ -47,6 +48,28 @@ app = typer.Typer(
     ),
     invoke_without_command=True,
 )
+
+
+def _attach_actual_cost_metadata(report, records) -> None:
+    config_root = Path(os.environ.get("TOKENLENS_CONFIG_DIR", str(Path.home() / ".config" / "tokenlens")))
+    source = config_root / "pricing-imports" / "actual-cost.json"
+    if not source.is_file():
+        return
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        rows = payload.get("rows", []) if isinstance(payload, dict) else []
+        imported = [ImportedPriceRow.model_validate(row) for row in rows]
+        models = {record.model_name.casefold() for record in records}
+        report.report_metadata["actual_cost"] = summarize_actual_cost(imported, known_models=models).model_dump(mode="json")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        report.report_metadata["actual_cost"] = {
+            "source": "actual-cost",
+            "rows": 0,
+            "matched_rows": 0,
+            "unattributed_rows": 0,
+            "total_actual_cost": None,
+            "note": "Actual-cost import could not be parsed; no estimate was substituted.",
+        }
 
 from .foundry_cli import register as _register_workflow  # noqa: E402 - app must exist first
 
@@ -377,6 +400,7 @@ def analyze_command(
                 data_classification="local_real",
                 source_files=file_count,
             )
+            _attach_actual_cost_metadata(report, records)
         _write_report(
             _render(report, output_format),
             output,

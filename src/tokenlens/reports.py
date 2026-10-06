@@ -1088,6 +1088,16 @@ def _pricing_provenance(report: AnalysisReport, models) -> str:
     customer_catalog = pricing.get("customer_catalog_name")
     if customer_catalog:
         details.append(f"<li>Customer override catalog: {_escape(customer_catalog)}</li>")
+    actual = report.report_metadata.get("actual_cost")
+    if isinstance(actual, dict):
+        actual_total = actual.get("total_actual_cost")
+        actual_label = _money(actual_total, currency=str(actual.get("currency") or summary.pricing_currency)) if actual_total is not None else "Unavailable"
+        details.append(
+            f"<li>Actual billed cost: {_escape(actual_label)} · "
+            f"{_escape(str(actual.get('matched_rows', 0)))} matched row(s), "
+            f"{_escape(str(actual.get('unattributed_rows', 0)))} unattributed · "
+            "kept separate from forward estimates</li>"
+        )
     claude_models = [item for item in models if (item.pricing_publisher or "").casefold() == "anthropic"]
     if claude_models:
         claude_cost = sum(item.estimated_cost_usd or 0.0 for item in claude_models)

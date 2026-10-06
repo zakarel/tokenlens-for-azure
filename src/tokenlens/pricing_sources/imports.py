@@ -24,6 +24,7 @@ class ImportedPriceRow(BaseModel):
     unit: str
     unit_multiplier: float = Field(default=1, gt=0)
     unit_price: float = Field(ge=0)
+    quantity: float | None = Field(default=None, ge=0)
     currency: str = "USD"
     source_record_id: str
     meter_id: str | None = None
@@ -32,6 +33,35 @@ class ImportedPriceRow(BaseModel):
     effective_to: date | None = None
     source_scope: str
     raw_record_hash: str | None = None
+
+
+class ActualCostSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = "actual-cost"
+    currency: str = "USD"
+    rows: int = 0
+    matched_rows: int = 0
+    unattributed_rows: int = 0
+    total_actual_cost: float | None = None
+    join_basis: str = "exact model + component"
+    note: str = ""
+
+
+def summarize_actual_cost(rows: Iterable[ImportedPriceRow], *, known_models: set[str] | None = None) -> ActualCostSummary:
+    items = list(rows)
+    matched = [row for row in items if known_models is None or row.model.casefold() in known_models]
+    total = sum(
+        row.unit_price * float(row.quantity or 0) / row.unit_multiplier
+        for row in matched
+    )
+    return ActualCostSummary(
+        rows=len(items),
+        matched_rows=len(matched),
+        unattributed_rows=len(items) - len(matched),
+        total_actual_cost=total if matched else None,
+        note="Actual billed cost is shown separately from forward estimates; unjoinable rows remain unattributed.",
+    )
 
 
 class ImportedPricingProvider:
@@ -122,6 +152,8 @@ def override_price_provider(rows: Iterable[ImportedPriceRow]) -> ImportedPricing
 __all__ = [
     "ImportedPriceRow",
     "ImportedPricingProvider",
+    "ActualCostSummary",
+    "summarize_actual_cost",
     "actual_cost_provider",
     "contract_price_provider",
     "marketplace_price_provider",

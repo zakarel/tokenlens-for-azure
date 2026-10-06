@@ -4,6 +4,7 @@ from tokenlens.pricing_sources.imports import (
     ImportedPriceRow,
     actual_cost_provider,
     contract_price_provider,
+    summarize_actual_cost,
 )
 from tokenlens.pricing_sources.providers import BillingComponent, DeploymentIdentity
 
@@ -55,3 +56,14 @@ def test_imported_rate_applies_explicit_unit_multiplier():
         WHEN,
     )
     assert result.amount == 6
+
+
+def test_actual_cost_summary_keeps_unattributed_rows_visible():
+    unmatched = row("other", price=3.0).model_copy(update={"model": "other-model", "quantity": 4})
+    summary = summarize_actual_cost(
+        [row("matched", price=2.0).model_copy(update={"quantity": 3}), unmatched],
+        known_models={"gpt-4o"},
+    )
+    assert summary.matched_rows == 1
+    assert summary.unattributed_rows == 1
+    assert summary.total_actual_cost == 6
