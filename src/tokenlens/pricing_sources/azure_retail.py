@@ -790,12 +790,12 @@ def build_initial_url(
 ) -> str:
     """The one URL the sync starts from. Continuations come from the API.
 
-    The query is bounded server-side by the product families the crosswalk can
-    price, and optionally by one ARM region, so an ordinary synchronization
-    finishes well inside the page and item budget instead of walking the entire
-    Foundry Models price list.
+    With no explicit product filter, the sync requests the complete Foundry
+    Models service scope. The crosswalk remains a pricing resolver and
+    quarantine boundary, not a feed-scope boundary; this prevents a narrow
+    mapping from hiding newly published model families.
     """
-    names = tuple(product_names) if product_names is not None else crosswalk_product_names()
+    names = tuple(product_names) if product_names is not None else ()
     filter_expression = f"serviceName eq '{RETAIL_SERVICE_NAME}'"
     if region:
         filter_expression += f" and armRegionName eq '{region}'"

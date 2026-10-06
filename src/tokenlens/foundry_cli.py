@@ -8,6 +8,7 @@ terminal and without Azure.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -41,6 +42,7 @@ from .foundry_workflow.pricing import (
     CustomerRate,
     catalog_status,
     load_customer_catalog,
+    public_snapshot_paths,
     pricing_readiness,
     verify_catalogs,
     write_customer_rate,
@@ -53,6 +55,7 @@ from .pricing_sources.assumptions import (
     canonical_deployment,
 )
 from .pricing_sources.sync import sync_public_pricing
+from .pricing_sources.imports import ImportedPriceRow
 from .foundry_workflow.wizard import (
     collect_and_report,
     configure as run_configure,
@@ -575,6 +578,57 @@ def pricing_verify() -> None:
     typer.echo(f"catalogs={'valid' if not problems else 'invalid'}")
     if problems:
         raise typer.Exit(code=EXIT_FAILED)
+
+
+def _import_pricing_rows(path: str, source: str) -> None:
+    source_path = Path(path)
+    if not source_path.is_file():
+        typer.echo(f"error=pricing import file not found: {safe_display_path(source_path)}", err=True)
+        raise typer.Exit(code=EXIT_FAILED)
+    try:
+        payload = json.loads(source_path.read_text(encoding="utf-8"))
+        rows = payload.get("rows") if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            raise ValueError("expected a JSON array or an object with a rows array")
+        validated = [ImportedPriceRow.model_validate(row).model_dump(mode="json") for row in rows]
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        typer.echo(f"error=invalid {source} pricing import: {exc}", err=True)
+        raise typer.Exit(code=EXIT_FAILED) from exc
+    config_root = Path(os.environ.get("TOKENLENS_CONFIG_DIR", str(Path.home() / ".config" / "tokenlens")))
+    destination = config_root / "pricing-imports" / f"{source}.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps({"source": source, "rows": validated}, indent=2) + "\n", encoding="utf-8")
+    try:
+        destination.chmod(0o600)
+    except OSError:
+        pass
+    typer.echo(f"pricing-import={safe_display_path(destination)}")
+    typer.echo(f"source={source} rows={len(validated)}")
+    typer.echo("analysis=offline; imported rows remain separate from public retail pricing")
+
+
+@pricing_app.command("import-pricesheet")
+def pricing_import_pricesheet(path: str = typer.Argument(..., metavar="FILE")) -> None:
+    """Import a normalized contract/price-sheet JSON file offline."""
+    _import_pricing_rows(path, "contract")
+
+
+@pricing_app.command("import-cost-details")
+def pricing_import_cost_details(path: str = typer.Argument(..., metavar="FILE")) -> None:
+    """Import normalized Cost Details/actual-cost rows offline."""
+    _import_pricing_rows(path, "actual-cost")
+
+
+@pricing_app.command("provenance")
+def pricing_provenance() -> None:
+    """Show local pricing snapshot and imported-source provenance."""
+    for key, path in public_snapshot_paths().items():
+        typer.echo(f"{key}={safe_display_path(path)} exists={path.is_file()}")
+    config_root = Path(os.environ.get("TOKENLENS_CONFIG_DIR", str(Path.home() / ".config" / "tokenlens")))
+    imports = sorted((config_root / "pricing-imports").glob("*.json"))
+    typer.echo(f"imported-sources={len(imports)}")
+    for path in imports:
+        typer.echo(f"import={safe_display_path(path)}")
 
 
 @pricing_app.command("sync")

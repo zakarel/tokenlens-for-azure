@@ -738,12 +738,11 @@ def test_os_environment_isolation_keeps_the_real_profile_untouched(tmp_path, mon
 # --- Bounded queries and truncation -----------------------------------------
 
 
-def test_the_query_is_bounded_to_the_product_families_the_crosswalk_knows():
+def test_default_query_covers_the_complete_foundry_service_scope():
     url = build_initial_url(region="eastus2")
     assert crosswalk_product_names() == ("Azure Mistral Models", "Azure OpenAI GPT5")
-    for name in crosswalk_product_names():
-        assert quote(f"productName eq '{name}'", safe="") in url
-    assert quote(" or ", safe="") in url
+    assert "productName" not in unquote(url)
+    assert "serviceName eq 'Foundry Models'" in unquote(url)
     # A caller can still widen or narrow the bound explicitly.
     assert "productName" not in unquote(build_initial_url(product_names=[]))
 
