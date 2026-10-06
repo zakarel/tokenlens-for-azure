@@ -10,6 +10,7 @@ from urllib.parse import urljoin
 
 from .fetch import FetchBudget, Transport, UrlAllowList, content_sha256, fetch_text
 from ..pricing import PriceEntry, PricingCatalog
+from .cache import PricingSnapshot, write_snapshot
 from datetime import UTC, datetime
 
 OFFICIAL_PRICING_ROOT = "https://azure.microsoft.com/en-us/pricing/details/ai-foundry-models/"
@@ -198,6 +199,37 @@ def fetch_official_page(
     )
 
 
+def sync_official_pages(
+    provider_routes: Iterable[str],
+    *,
+    budget: FetchBudget | None = None,
+    transport: Transport | None = None,
+    now: datetime | None = None,
+) -> tuple[PricingSnapshot, list[OfficialPageRate]]:
+    """Fetch selected provider pages and atomically cache one complete snapshot."""
+    retrieved_at = now or datetime.now(UTC)
+    routes = list(provider_routes)
+    if not routes:
+        raise ValueError("at least one official provider route is required")
+    rates: list[OfficialPageRate] = []
+    for route in routes:
+        rates.extend(fetch_official_page(route, budget=budget, transport=transport))
+    catalog = page_catalog(rates, retrieved_at=retrieved_at)
+    digest = content_sha256("\n".join(sorted(rate.content_hash for rate in rates)))
+    snapshot = PricingSnapshot(
+        source="official_foundry_pages",
+        source_url=OFFICIAL_PRICING_ROOT,
+        retrieved_at=retrieved_at,
+        content_hash=digest,
+        pages_read=len(routes),
+        rows_read=len(rates),
+        catalog=catalog,
+        notes=[f"provider-routes={','.join(routes)}"],
+    )
+    write_snapshot(snapshot, name="official-foundry-pages.json")
+    return snapshot, rates
+
+
 __all__ = [
     "OFFICIAL_ALLOW_LIST",
     "OFFICIAL_PRICING_ROOT",
@@ -207,4 +239,5 @@ __all__ = [
     "fetch_official_page",
     "page_catalog",
     "parse_official_page",
+    "sync_official_pages",
 ]

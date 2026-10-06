@@ -5,6 +5,7 @@ from tokenlens.pricing_sources.official_pages import (
     official_page_url,
     page_catalog,
     parse_official_page,
+    sync_official_pages,
 )
 from tokenlens.pricing_sources.fetch import FetchedPage
 
@@ -57,3 +58,16 @@ def test_official_page_fetch_uses_allow_list_and_bounded_transport():
 
     rates = fetch_official_page("mistral", transport=transport)
     assert len(rates) == 2
+
+
+def test_official_page_sync_writes_complete_private_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOKENLENS_CONFIG_DIR", str(tmp_path))
+
+    def transport(url, timeout, max_bytes):
+        return FetchedPage(url=url, status=200, body=HTML.encode())
+
+    snapshot, rates = sync_official_pages(["mistral"], transport=transport)
+    assert snapshot.source == "official_foundry_pages"
+    assert snapshot.feed_complete is True
+    assert snapshot.rows_read == len(rates)
+    assert (tmp_path / "pricing" / "official-foundry-pages.json").is_file()
