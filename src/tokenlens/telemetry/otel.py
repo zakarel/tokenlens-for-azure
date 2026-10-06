@@ -140,11 +140,13 @@ def _attributes(raw: Any) -> dict[str, Any]:
     return {}
 
 
-def _int(value: Any) -> int:
+def _int(value: Any) -> int | None:
+    if value is None:
+        return None
     try:
         return max(0, int(value))
     except (TypeError, ValueError):
-        return 0
+        return None
 
 
 def _timestamp(span: dict[str, Any]) -> datetime:

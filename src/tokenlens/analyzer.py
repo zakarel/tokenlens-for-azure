@@ -29,6 +29,7 @@ from .pricing_sources.assumptions import (
 from .reference import load_effective_reference_catalog
 from .tasks import reconstruct_tasks
 from .rules import RULES, evaluate_rules
+from .tokens import tokenizer_provenance
 from .workloads import (
     WorkloadIdentity,
     WorkloadMapping,
@@ -60,6 +61,18 @@ def _common_value(resolutions: list[PricingResolution], field: str):
     return values.pop() if len(values) == 1 else None
 
 
+def _sum_usage_metric(records: list[TraceRecord], metric: str) -> tuple[int | None, str]:
+    values = [getattr(record.usage, metric) for record in records]
+    observed = [value for value in values if value is not None]
+    if not observed:
+        return None, "unavailable"
+    return sum(observed), "partial" if len(observed) != len(values) else "measured"
+
+
+def _known_tokens(record: TraceRecord) -> int:
+    return (record.usage.input_tokens or 0) + (record.usage.output_tokens or 0)
+
+
 def _cost_summary(
     records: list[TraceRecord],
     *,
@@ -89,16 +102,16 @@ def _cost_summary(
             dimension for item in resolved for dimension in item.assumed_dimensions
         )
     resolved_tokens = sum(
-        record.usage.input_tokens + record.usage.output_tokens
+        _known_tokens(record)
         for record, resolution in zip(records, resolutions)
         if resolution.resolved
     )
     unresolved_tokens = sum(
-        record.usage.input_tokens + record.usage.output_tokens
+        _known_tokens(record)
         for record, resolution in zip(records, resolutions)
         if not resolution.resolved
     )
-    total_tokens = sum(record.usage.input_tokens + record.usage.output_tokens for record in records)
+    total_tokens = sum(_known_tokens(record) for record in records)
     all_components = bool(resolved) and all(
         item.fresh_input_cost_usd is not None
         and item.cached_input_cost_usd is not None
@@ -220,11 +233,71 @@ def _summary(
     aggregate_source = bool(records) and all(telemetry_kind(record) == "aggregate" for record in records)
     aggregate: AggregateAnalysisSummary | None = aggregate_summary(records) if aggregate_source else None
     coverage = field_coverage(aggregate) if aggregate else {}
-    input_tokens = sum(record.usage.input_tokens for record in records)
-    output_tokens = sum(record.usage.output_tokens for record in records)
-    cached_tokens = sum(record.usage.cached_tokens for record in records)
-    minimum, maximum = _impact(findings, input_tokens, len(records))
-    denominator = max(1, input_tokens)
+    missing_metrics = set(aggregate.missing_metrics if aggregate else ())
+    for record in records:
+        metadata = record.metadata or {}
+        missing_metrics.update(str(item) for item in metadata.get("missing_metrics", ()) or ())
+        for name in ("input_tokens", "cached_tokens", "output_tokens"):
+            if getattr(record.usage, name) is None:
+                missing_metrics.add(name)
+    availability_migration_warning = any(
+        bool((record.metadata or {}).get("availability_migration_warning"))
+        for record in records
+    )
+    capability_values = {
+        (
+            record.modality,
+            record.usage_bases,
+            record.commerce_type,
+            record.ptu_eligible,
+            record.capability_catalog_version,
+            record.capability_status,
+        )
+        for record in records
+    }
+    if len(capability_values) == 1:
+        modality, usage_bases, commerce_type, ptu_eligible, capability_version, capability_status = (
+            next(iter(capability_values))
+        )
+    elif capability_values:
+        modality = "mixed"
+        usage_bases = tuple(sorted({basis for item in capability_values for basis in item[1]}))
+        commerce_type = "unknown"
+        ptu_eligible = None
+        capability_version = None
+        capability_status = "mixed"
+    else:
+        modality = "unknown"
+        usage_bases = ()
+        commerce_type = "unknown"
+        ptu_eligible = None
+        capability_version = None
+        capability_status = "unknown"
+    if aggregate is not None:
+        input_tokens = aggregate.input_tokens
+        cached_tokens = aggregate.cached_tokens
+        output_tokens = aggregate.output_tokens
+        input_state = aggregate.input_tokens_state
+        cached_state = aggregate.cached_tokens_state
+        output_state = aggregate.output_tokens_state
+    else:
+        input_tokens, input_state = _sum_usage_metric(records, "input_tokens")
+        cached_tokens, cached_state = _sum_usage_metric(records, "cached_tokens")
+        output_tokens, output_state = _sum_usage_metric(records, "output_tokens")
+    total_tokens = (
+        None
+        if input_tokens is None and output_tokens is None
+        else (input_tokens or 0) + (output_tokens or 0)
+    )
+    total_state = (
+        "unavailable"
+        if input_state == output_state == "unavailable"
+        else "measured"
+        if input_state == output_state == "measured"
+        else "partial"
+    )
+    minimum, maximum = _impact(findings, input_tokens or 0, len(records))
+    denominator = max(1, input_tokens or 0)
     high = sum(finding.severity == "high" for finding in findings)
     medium = sum(finding.severity == "medium" for finding in findings)
     low = sum(finding.severity == "low" for finding in findings)
@@ -239,13 +312,12 @@ def _summary(
         # not a request, so it is never used as a denominator.
         requests_analyzed = requests_observed or 0
         retries_available = coverage.get("retries", False)
-        cached_available = coverage.get("cached_tokens", False)
-        input_available = coverage.get("input_tokens", False)
-        output_available = coverage.get("output_tokens", False)
-        cached_tokens = aggregate.cached_tokens or 0
+        cached_available = cached_state != "unavailable"
+        input_available = input_state != "unavailable"
+        output_available = output_state != "unavailable"
         average_tokens = (
-            round((input_tokens + output_tokens) / requests_observed, 2)
-            if requests_observed
+            round(((input_tokens or 0) + (output_tokens or 0)) / requests_observed, 2)
+            if requests_observed and input_state == output_state == "measured"
             else None
         )
     else:
@@ -254,13 +326,23 @@ def _summary(
         analysis_unit = "requests"
         requests_analyzed = len(records)
         retries_available = True
-        cached_available = True
-        input_available = True
-        output_available = True
-        average_tokens = round((input_tokens + output_tokens) / max(1, len(records)), 1) if records else 0.0
+        cached_available = cached_state != "unavailable"
+        input_available = input_state != "unavailable"
+        output_available = output_state != "unavailable"
+        average_tokens = (
+            round(((input_tokens or 0) + (output_tokens or 0)) / len(records), 1)
+            if records and input_state == output_state == "measured"
+            else None
+        )
 
     common = {
         "analysis_unit": analysis_unit,
+        "modality": modality,
+        "usage_bases": usage_bases,
+        "commerce_type": commerce_type,
+        "ptu_eligible": ptu_eligible,
+        "capability_catalog_version": capability_version,
+        "capability_status": capability_status,
         "requests_analyzed": requests_analyzed,
         "requests_observed": requests_observed,
         "requests_available": requests_available,
@@ -271,7 +353,13 @@ def _summary(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cached_tokens": cached_tokens,
-        "total_tokens": input_tokens + output_tokens,
+        "total_tokens": total_tokens,
+        "input_tokens_state": input_state,
+        "cached_tokens_state": cached_state,
+        "output_tokens_state": output_state,
+        "total_tokens_state": total_state,
+        "missing_metrics": sorted(missing_metrics),
+        "availability_migration_warning": availability_migration_warning,
         "retries": sum(bool(record.retry_of) for record in records) if retries_available else 0,
         "findings": len(findings),
         "high_findings": high,
@@ -331,6 +419,7 @@ def _summary(
         estimated_cost=pricing["estimated_cost_usd"],
         unresolved_reasons=list(pricing["unresolved_reasons"]),
         coverage_tokens_percent=float(pricing["pricing_coverage_tokens_percent"]),
+        unresolved_requests=int(pricing["unresolved_requests"]),
     )
     service_tiers = {record.service_tier for record in records}
     common["service_tier"] = service_tiers.pop() if len(service_tiers) == 1 else "mixed"
@@ -357,7 +446,11 @@ def _summary(
         resource_name=resource_name,
         project_name=project_name,
         request_share_percent=round((requests_observed or 0) / max(1, request_total) * 100, 1),
-        token_share_percent=round((input_tokens + output_tokens) / max(1, token_total) * 100, 1),
+        token_share_percent=(
+            round(total_tokens / max(1, token_total) * 100, 1)
+            if total_tokens is not None
+            else None
+        ),
         pricing_effective_from=pricing["pricing_effective_from"],
         input_price_per_million=pricing["input_price_per_million"],
         cached_input_price_per_million=pricing["cached_input_price_per_million"],
@@ -377,6 +470,7 @@ def _pricing_status(
     estimated_cost: float | None,
     unresolved_reasons: list[str],
     coverage_tokens_percent: float,
+    unresolved_requests: int,
 ) -> str:
     """Separate identity failure from catalog coverage.
 
@@ -388,6 +482,8 @@ def _pricing_status(
         return "identity_unresolved"
     if "currency-conversion-required" in unresolved_reasons:
         return "currency_mismatch"
+    if unresolved_requests > 0:
+        return "partial"
     if estimated_cost is None:
         return "catalog_missing"
     if coverage_tokens_percent < 100:
@@ -437,7 +533,7 @@ def analyze(
         )
     rule_run = evaluate_rules(records)
     overall_findings = _with_impact(
-        rule_run.findings, sum(r.usage.input_tokens for r in records), len(records)
+        rule_run.findings, sum(r.usage.input_tokens or 0 for r in records), len(records)
     )
     applied_report_config = DEFAULT_REPORT_CONFIG | {
         key: value for key, value in (report_config or {}).items() if key in DEFAULT_REPORT_CONFIG
@@ -486,14 +582,14 @@ def analyze(
     deployments: list[DeploymentAnalysis] = []
     for (_resource, _project, name, model_name, _mode), deployment_records in sorted(
         grouped.items(),
-        key=lambda item: sum(r.usage.input_tokens + r.usage.output_tokens for r in item[1]),
+        key=lambda item: sum(_known_tokens(record) for record in item[1]),
         reverse=True,
     ):
         first = deployment_records[0]
         deployment_run = evaluate_rules(deployment_records)
         findings = _with_impact(
             deployment_run.findings,
-            sum(r.usage.input_tokens for r in deployment_records),
+            sum(r.usage.input_tokens or 0 for r in deployment_records),
             len(deployment_records),
         )
         deployments.append(
@@ -542,6 +638,30 @@ def analyze(
             "scenarios": [scenario.model_dump(mode="json") for scenario in build_savings_scenarios(findings=overall_findings)],
             "telemetry_source": rule_run.source,
             "source_files": source_files,
+            "collection": (
+                {
+                    "requested_start": summary.aggregate.window_start.isoformat()
+                    if summary.aggregate.window_start
+                    else None,
+                    "requested_end": summary.aggregate.window_end.isoformat()
+                    if summary.aggregate.window_end
+                    else None,
+                    "requested_days": summary.aggregate.requested_days,
+                    "returned_start": summary.aggregate.returned_start.isoformat()
+                    if summary.aggregate.returned_start
+                    else None,
+                    "returned_end": summary.aggregate.returned_end.isoformat()
+                    if summary.aggregate.returned_end
+                    else None,
+                    "observed_days": summary.aggregate.observed_days,
+                    "observed_buckets": summary.aggregate.observed_buckets,
+                    "active_buckets": summary.aggregate.active_buckets,
+                    "expected_buckets": summary.aggregate.elapsed_buckets,
+                    "completeness_percent": summary.aggregate.collection_completeness_percent,
+                }
+                if summary.aggregate
+                else None
+            ),
             "pricing": _pricing_metadata(
                 summary,
                 customer_catalog=customer_catalog,
@@ -550,6 +670,32 @@ def analyze(
             ),
         },
     )
+    request_models = sorted(
+        {
+            record.model_name
+            for record in records
+            if telemetry_kind(record) == "request" and record.model_name
+        }
+    )
+    tokenizer_details = [tokenizer_provenance(model) for model in request_models]
+    report.report_metadata["tokenizer"] = tokenizer_details
+    approximate_models = [
+        item["model"] for item in tokenizer_details if item["method"] != "tiktoken_bpe"
+    ]
+    if approximate_models:
+        report.data_quality.append(
+            DataQualityIssue(
+                code="tokenizer_approximate",
+                severity="warning",
+                title="Request-content token estimates are conservative",
+                detail=(
+                    "Exact tokenizer data was not available locally for "
+                    f"{len(approximate_models)} model(s); request-content diagnostics use a "
+                    "UTF-8 byte-based token-count heuristic, including heuristic chat framing. "
+                    "Provide the matching tokenizer data locally to enable exact token counts."
+                ),
+            )
+        )
     # The PTU dashboard's daily cost must agree with Cost analysis exactly, so
     # it reuses the same resolver rather than recomputing any rate.
     def _ptu_cost_resolver(record: TraceRecord) -> PricingResolution:
@@ -705,6 +851,30 @@ def _data_quality(summary: AnalysisSummary, deployments: list[DeploymentAnalysis
         )
     aggregate = summary.aggregate
     if aggregate is not None:
+        if aggregate.collection_completeness_percent < 100:
+            returned = (
+                f"{aggregate.observed_days:g} day(s) with returned data"
+                if aggregate.observed_days
+                else "no returned time span"
+            )
+            requested = (
+                f"{aggregate.requested_days:g}-day requested window"
+                if aggregate.requested_days
+                else "the requested window"
+            )
+            issues.append(
+                DataQualityIssue(
+                    code="collection_incomplete",
+                    severity="warning",
+                    title="Collection coverage is partial",
+                    detail=(
+                        f"{requested}; {returned}; {aggregate.observed_buckets:,} of "
+                        f"{aggregate.elapsed_buckets:,} expected buckets returned "
+                        f"({aggregate.collection_completeness_percent:.1f}% coverage). "
+                        "Requested duration is not evidence that the full period was observed."
+                    ),
+                )
+            )
         if aggregate.outcome_coverage != "complete":
             issues.append(
                 DataQualityIssue(
@@ -718,28 +888,54 @@ def _data_quality(summary: AnalysisSummary, deployments: list[DeploymentAnalysis
                     ),
                 )
             )
-        for field_name, label in (("input_tokens", "Input-token"), ("output_tokens", "Output-token")):
-            if getattr(aggregate, field_name) is None:
+        token_modalities = {"text", "embedding", "audio", "multimodal", "mixed", "unknown"}
+        if summary.modality in token_modalities:
+            for field_name, label in (("input_tokens", "Input-token"), ("output_tokens", "Output-token")):
+                if getattr(aggregate, field_name) is None:
+                    issues.append(
+                        DataQualityIssue(
+                            code=f"{field_name}_unavailable",
+                            severity="blocker",
+                            title=f"{label} metric unavailable",
+                            detail=(
+                                f"The source reported no {label.lower()} series, so token totals, averages, and cost "
+                                "for this field are unavailable rather than zero."
+                            ),
+                        )
+                    )
+                elif getattr(aggregate, f"{field_name}_state") == "partial":
+                    issues.append(
+                        DataQualityIssue(
+                            code=f"{field_name}_partial",
+                            severity="warning",
+                            title=f"{label} coverage is partial",
+                            detail=(
+                                f"Some buckets do not report {label.lower()} usage. Displayed token values "
+                                "are subtotals and are excluded from complete cost and PTU conclusions."
+                            ),
+                        )
+                    )
+            if aggregate.cached_tokens is None:
                 issues.append(
                     DataQualityIssue(
-                        code=f"{field_name}_unavailable",
-                        severity="blocker",
-                        title=f"{label} metric unavailable",
+                        code="cached_tokens_unavailable",
+                        severity="warning",
+                        title="Cached-token metric unavailable",
+                        detail="Cached input is shown as unavailable, never as zero.",
+                    )
+                )
+            elif aggregate.cached_tokens_state == "partial":
+                issues.append(
+                    DataQualityIssue(
+                        code="cached_tokens_partial",
+                        severity="warning",
+                        title="Cached-token coverage is partial",
                         detail=(
-                            f"The source reported no {label.lower()} series, so token totals, averages, and cost "
-                            "for this field are unavailable rather than zero."
+                            "Some buckets do not report cached-token usage. Displayed cached values "
+                            "are subtotals and are excluded from complete cost and PTU conclusions."
                         ),
                     )
                 )
-        if aggregate.cached_tokens is None:
-            issues.append(
-                DataQualityIssue(
-                    code="cached_tokens_unavailable",
-                    severity="warning",
-                    title="Cached-token metric unavailable",
-                    detail="Cached input is shown as unavailable, never as zero.",
-                )
-            )
         if aggregate.latency_coverage_percent == 0:
             issues.append(
                 DataQualityIssue(
@@ -749,6 +945,74 @@ def _data_quality(summary: AnalysisSummary, deployments: list[DeploymentAnalysis
                     detail="No latency series was returned for the selected window.",
                 )
             )
+    for deployment in deployments:
+        item = deployment.summary
+        if item.total_tokens_state == "unavailable" and item.requests_observed:
+            if item.modality in {"text_to_speech", "speech_to_text", "audio", "image", "video"}:
+                issues.append(
+                    DataQualityIssue(
+                        code="native_usage_unavailable",
+                        severity="warning",
+                        title="Native usage metric unavailable",
+                        detail=(
+                            f"{item.deployment_name} has {item.requests_observed:,} request(s), but "
+                            f"no {item.modality.replace('_', ' ')} billing-unit usage was reported."
+                        ),
+                    )
+                )
+            else:
+                issues.append(
+                    DataQualityIssue(
+                        code="token_usage_unavailable",
+                        severity="warning",
+                        title="Token usage unavailable",
+                        detail=(
+                            f"{item.deployment_name} has request activity but no measured input or output "
+                            "token usage."
+                        ),
+                    )
+                )
+        elif item.total_tokens_state == "partial":
+            issues.append(
+                DataQualityIssue(
+                    code="token_usage_partial",
+                    severity="warning",
+                    title="Token usage is partial",
+                    detail=(
+                        f"{item.deployment_name} has incomplete input or output token metrics; totals are "
+                        "subtotals and cost or PTU conclusions are withheld."
+                    ),
+                )
+            )
+        if (
+            aggregate is None
+            and item.cached_tokens_state == "unavailable"
+            and item.input_tokens_state != "unavailable"
+        ):
+            issues.append(
+                DataQualityIssue(
+                    code="cached_tokens_unavailable",
+                    severity="warning",
+                    title="Cached-token metric unavailable",
+                    detail=(
+                        f"{item.deployment_name} has no cached-token measurement; cached usage is "
+                        "unavailable rather than zero."
+                    ),
+                )
+            )
+    if summary.availability_migration_warning:
+        issues.append(
+            DataQualityIssue(
+                code="legacy_usage_availability_ambiguous",
+                severity="warning",
+                title="Legacy zero-valued usage is ambiguous",
+                detail=(
+                    "Older request telemetry did not distinguish a reported zero from a missing usage metric. "
+                    "Those values were withheld as unavailable rather than treated as measured zero; recollect "
+                    "or re-import from a source that preserves metric presence."
+                ),
+            )
+        )
     if summary.pricing_status != "priced":
         issues.append(
             DataQualityIssue(

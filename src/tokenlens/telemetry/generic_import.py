@@ -243,11 +243,13 @@ def _coerce_timestamp(value: Any, fmt: str):
     return None
 
 
-def _coerce_int(value: Any) -> int:
+def _coerce_int(value: Any) -> int | None:
+    if value is None:
+        return None
     try:
         return max(0, int(float(value)))
     except (TypeError, ValueError):
-        return 0
+        return None
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -275,9 +277,9 @@ def map_row(row: dict[str, Any], mapping: MappingSpec) -> ModelRequestRecord | N
         if values.get(name) in (None, ""):
             return None
 
-    def _usage_value(name: str) -> int:
+    def _usage_value(name: str) -> int | None:
         path = mapping.usage.get(name)
-        return _coerce_int(_resolve_path(row, path)) if path else 0
+        return _coerce_int(_resolve_path(row, path)) if path else None
 
     usage = TelemetryUsage(
         input_tokens=_usage_value("input_tokens"),

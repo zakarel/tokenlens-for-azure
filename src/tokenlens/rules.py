@@ -235,7 +235,9 @@ def _history(records: list[TraceRecord]) -> Finding | None:
         if len(record.messages) >= 5 and tokens > 0:
             candidates.append((record, tokens))
             total_history += tokens
-            total_input += record.usage.input_tokens or tokens
+            total_input += (
+                record.usage.input_tokens if record.usage.input_tokens is not None else tokens
+            )
     if len(candidates) < 2:
         return None
     average = round(total_history / len(candidates))
@@ -357,7 +359,12 @@ def _retry(records: list[TraceRecord]) -> Finding | None:
         ]
     if not retry_indexes:
         return None
-    repeated = sum(records[index].usage.input_tokens or count_messages(records[index].messages, records[index].model) for index in retry_indexes)
+    repeated = sum(
+        records[index].usage.input_tokens
+        if records[index].usage.input_tokens is not None
+        else count_messages(records[index].messages, records[index].model)
+        for index in retry_indexes
+    )
     return _finding(
         "TL005",
         "high",
@@ -380,7 +387,11 @@ def _p99(values: list[int]) -> int:
 
 
 def _output_budget(records: list[TraceRecord]) -> Finding | None:
-    pairs = [(record.max_output_tokens, record.usage.output_tokens) for record in records if record.max_output_tokens]
+    pairs = [
+        (record.max_output_tokens, record.usage.output_tokens)
+        for record in records
+        if record.max_output_tokens is not None and record.usage.output_tokens is not None
+    ]
     if len(pairs) < 2:
         return None
     limit = _p99([int(pair[0]) for pair in pairs])
@@ -459,7 +470,11 @@ def _model_size(records: list[TraceRecord]) -> Finding | None:
             term in user_text or term in task_shape
             for term in ("classify", "extract", "format as json", "yes or no", "categorize")
         )
-        if looks_bounded or (len(user_text) < 120 and record.usage.output_tokens < 160):
+        if looks_bounded or (
+            len(user_text) < 120
+            and record.usage.output_tokens is not None
+            and record.usage.output_tokens < 160
+        ):
             bounded += 1
         if "mini" not in record.model.lower() and "nano" not in record.model.lower():
             eligible += 1
@@ -505,7 +520,7 @@ def _available_fields(records: list[TraceRecord]) -> set[str]:
             available.add("retrieved_chunks")
         if record.max_output_tokens:
             available.add("max_output_tokens")
-        if record.usage.output_tokens:
+        if record.usage.output_tokens is not None:
             available.add("output_tokens")
         if record.retry_of:
             available.add("retry_of")

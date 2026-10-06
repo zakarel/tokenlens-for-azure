@@ -10,7 +10,12 @@ from pydantic import ValidationError
 
 from .events import TaskEvent, parse_event, validate_event_stream
 from .models import TraceRecord, Usage
-from .telemetry.schema import MetricBucketRecord, ModelRequestRecord
+from .telemetry.schema import (
+    SUPPORTED_SCHEMA_VERSIONS,
+    MetricBucketRecord,
+    ModelRequestRecord,
+    parse_record,
+)
 
 
 class InputError(ValueError):
@@ -95,9 +100,11 @@ def _usage(raw: dict[str, Any]) -> Usage:
     usage = raw.get("usage") or {}
     details = usage.get("prompt_tokens_details") or usage.get("input_token_details") or {}
     return Usage(
-        input_tokens=usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0,
-        output_tokens=usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0,
-        cached_tokens=usage.get("cached_tokens", details.get("cached_tokens", 0)) or 0,
+        input_tokens=_first_value(usage.get("input_tokens"), usage.get("prompt_tokens")),
+        output_tokens=_first_value(usage.get("output_tokens"), usage.get("completion_tokens")),
+        cached_tokens=_first_value(
+            usage.get("cached_tokens"), details.get("cached_tokens")
+        ),
     )
 
 
@@ -109,7 +116,7 @@ def _first_value(*values: Any) -> Any:
 
 
 def _canonical_request(record: ModelRequestRecord) -> TraceRecord:
-    """Map a schema-v3 request record onto the shared analysis event."""
+    """Map a canonical request record onto the shared analysis event."""
     features = record.content_features
     return TraceRecord(
         timestamp=record.timestamp.isoformat().replace("+00:00", "Z"),
@@ -117,6 +124,12 @@ def _canonical_request(record: ModelRequestRecord) -> TraceRecord:
         model=record.model_name if record.model_name != "unknown" else record.deployment_name,
         deployment_name=record.deployment_name,
         model_name=record.model_name,
+        modality=record.modality,
+        usage_bases=record.usage_bases,
+        commerce_type=record.commerce_type,
+        ptu_eligible=record.ptu_eligible,
+        capability_catalog_version=record.capability_catalog_version,
+        capability_status=record.capability_status,
         provider=record.provider,
         service_tier=record.service_tier,
         deployment_mode=record.deployment_mode,
@@ -129,6 +142,8 @@ def _canonical_request(record: ModelRequestRecord) -> TraceRecord:
             input_tokens=record.usage.input_tokens,
             output_tokens=record.usage.output_tokens,
             cached_tokens=record.usage.cached_tokens,
+            reasoning_tokens=record.usage.reasoning_tokens,
+            cache_write_tokens=record.usage.cache_write_tokens,
         ),
         latency_ms=record.latency_ms,
         status_code=record.status_code,
@@ -142,6 +157,8 @@ def _canonical_request(record: ModelRequestRecord) -> TraceRecord:
             "sample_rate": record.sample_rate,
             "error_category": record.error_category,
             "retry_count": record.retry_count,
+            "missing_metrics": list(record.missing_metrics),
+            "availability_migration_warning": record.availability_migration_warning,
             "content_features": features.model_dump(exclude_none=True),
             "fingerprints": record.fingerprints.model_dump(exclude_none=True),
         },
@@ -149,7 +166,7 @@ def _canonical_request(record: ModelRequestRecord) -> TraceRecord:
 
 
 def _canonical_bucket(record: MetricBucketRecord) -> TraceRecord:
-    """Map a schema-v3 aggregate bucket onto the shared analysis event.
+    """Map a canonical aggregate bucket onto the shared analysis event.
 
     One bucket becomes one analysis event carrying the bucket's aggregate token
     counts. Request outcomes, latency percentiles, per-field provenance, the
@@ -163,15 +180,21 @@ def _canonical_bucket(record: MetricBucketRecord) -> TraceRecord:
         model=record.model_name if record.model_name != "unknown" else record.deployment_name,
         deployment_name=record.deployment_name,
         model_name=record.model_name,
+        modality=record.modality,
+        usage_bases=record.usage_bases,
+        commerce_type=record.commerce_type,
+        ptu_eligible=record.ptu_eligible,
+        capability_catalog_version=record.capability_catalog_version,
+        capability_status=record.capability_status,
         provider=record.provider,
         service_tier=record.service_tier,
         deployment_mode=record.deployment_mode,
         resource_name=record.scope.resource_name,
         project_name=record.scope.project_name,
         usage=Usage(
-            input_tokens=metrics.input_tokens or 0,
-            output_tokens=metrics.output_tokens or 0,
-            cached_tokens=metrics.cached_tokens or 0,
+            input_tokens=metrics.input_tokens,
+            output_tokens=metrics.output_tokens,
+            cached_tokens=metrics.cached_tokens,
         ),
         latency_ms=metrics.p50_latency_ms or metrics.average_latency_ms,
         status_code=None,
@@ -197,13 +220,14 @@ def _canonical_bucket(record: MetricBucketRecord) -> TraceRecord:
 
 
 def normalize_canonical(raw: dict[str, Any], line_number: int = 0) -> TraceRecord:
-    """Validate and normalize a canonical schema-v3 telemetry record."""
+    """Validate, migrate, and normalize a canonical telemetry record."""
     try:
-        if raw.get("record_type") == "foundry_metric_bucket":
-            return _canonical_bucket(MetricBucketRecord.model_validate(raw))
-        return _canonical_request(ModelRequestRecord.model_validate(raw))
-    except ValidationError as exc:
-        error_count = len(exc.errors())
+        record = parse_record(raw)
+        if isinstance(record, MetricBucketRecord):
+            return _canonical_bucket(record)
+        return _canonical_request(record)
+    except (ValidationError, ValueError) as exc:
+        error_count = len(getattr(exc, "errors", lambda: [])())
         raise InputError(
             f"Invalid canonical telemetry record on line {line_number} ({error_count} validation error)"
         ) from exc
@@ -211,7 +235,10 @@ def normalize_canonical(raw: dict[str, Any], line_number: int = 0) -> TraceRecor
 
 def normalize_record(raw: dict[str, Any], line_number: int = 0) -> TraceRecord:
     """Normalize the project schema and common OpenAI/Azure envelopes."""
-    if raw.get("schema_version") == 3 and raw.get("record_type") in {"model_request", "foundry_metric_bucket"}:
+    if raw.get("schema_version") in SUPPORTED_SCHEMA_VERSIONS and raw.get("record_type") in {
+        "model_request",
+        "foundry_metric_bucket",
+    }:
         return normalize_canonical(raw, line_number)
     request = raw.get("request") if isinstance(raw.get("request"), dict) else raw
     response = raw.get("response") if isinstance(raw.get("response"), dict) else raw
@@ -219,9 +246,9 @@ def normalize_record(raw: dict[str, Any], line_number: int = 0) -> TraceRecord:
     if not request_messages and isinstance(request.get("input"), list):
         request_messages = request["input"]
     usage = _usage(response)
-    if not usage.input_tokens and not usage.output_tokens:
+    if usage.input_tokens is None and usage.output_tokens is None:
         usage = _usage(raw)
-    if not usage.input_tokens and not usage.output_tokens:
+    if usage.input_tokens is None and usage.output_tokens is None:
         usage = _usage(request)
 
     messages = [
@@ -266,6 +293,16 @@ def normalize_record(raw: dict[str, Any], line_number: int = 0) -> TraceRecord:
         "model": model,
         "deployment_name": str(deployment),
         "model_name": str(model_name),
+        "modality": str(_first_value(raw.get("modality"), metadata.get("modality")) or "unknown"),
+        "usage_bases": tuple(_first_value(raw.get("usage_bases"), metadata.get("usage_bases")) or ()),
+        "commerce_type": str(_first_value(raw.get("commerce_type"), metadata.get("commerce_type")) or "unknown"),
+        "ptu_eligible": _first_value(raw.get("ptu_eligible"), metadata.get("ptu_eligible")),
+        "capability_catalog_version": _first_value(
+            raw.get("capability_catalog_version"), metadata.get("capability_catalog_version")
+        ),
+        "capability_status": str(
+            _first_value(raw.get("capability_status"), metadata.get("capability_status")) or "unknown"
+        ),
         "provider": str(provider or "unknown"),
         "service_tier": str(_first_value(raw.get("service_tier"), request.get("service_tier"), metadata.get("service_tier")) or "standard"),
         "deployment_mode": str(_first_value(raw.get("deployment_mode"), request.get("deployment_mode"), metadata.get("deployment_mode")) or "unknown"),

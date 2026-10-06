@@ -52,7 +52,7 @@ def record(index: int, *, deployment: str, model: str, workload: str | None = No
         "model_name": model,
         "deployment_mode": "global",
         "messages": [{"role": "user", "content": "synthetic"}],
-        "usage": {"input_tokens": 1000, "output_tokens": 500},
+        "usage": {"input_tokens": 1000, "cached_tokens": 0, "output_tokens": 500},
         "status_code": 200,
     }
     if workload:

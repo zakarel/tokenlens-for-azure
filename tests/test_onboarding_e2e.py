@@ -11,6 +11,7 @@ and every value is synthetic.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -136,6 +137,17 @@ def test_first_run_walkthrough_is_executable_in_order(tmp_path, onboarding):
     assert "excluded_metrics={'SuccessfulCalls'" in collect.output
     assert "records-written=1" in collect.output
     assert "next: tokenlens-azure analyze metrics --format html --open" in collect.output
+    manifests = list((tmp_path / "metrics").rglob("collection-manifest-*.json"))
+    assert len(manifests) == 1
+    manifest_text = manifests[0].read_text(encoding="utf-8")
+    manifest = json.loads(manifest_text)
+    assert manifest["expected_buckets_per_deployment"] == 4032
+    assert manifest["deployments"][0]["model_name"] == "gpt-4.1"
+    # The synthetic record is outside the command's requested window and must
+    # not be counted as returned metric evidence.
+    assert "input_tokens" not in manifest["deployments"][0]["metric_coverage"]
+    assert "example-foundry-account" not in manifest_text
+    assert "chat-route" not in manifest_text
 
     # 4. The printed next command runs offline and produces a report.
     analyze = runner.invoke(app, ["analyze", "metrics", "--format", "html", "--output", "report.html"])

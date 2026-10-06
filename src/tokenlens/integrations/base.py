@@ -128,11 +128,13 @@ def _value(source: Any, *names: str) -> Any:
     return None
 
 
-def _int(value: Any) -> int:
+def _int(value: Any) -> int | None:
+    if value is None:
+        return None
     try:
         number = int(value)
     except (TypeError, ValueError):
-        return 0
+        return None
     return max(0, number)
 
 

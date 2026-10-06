@@ -57,6 +57,7 @@ def request_record(
     model: str = PRICED_MODEL,
     workload: str | None = None,
     input_tokens: int = 1000,
+    cached_tokens: int = 0,
     output_tokens: int = 500,
     day: int = 1,
 ):
@@ -66,7 +67,11 @@ def request_record(
         "model_name": model,
         "deployment_mode": "global",
         "messages": [{"role": "user", "content": "synthetic"}],
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        "usage": {
+            "input_tokens": input_tokens,
+            "cached_tokens": cached_tokens,
+            "output_tokens": output_tokens,
+        },
         "status_code": 200,
     }
     if workload:
@@ -307,14 +312,15 @@ def test_daily_statistics_use_observed_dates_and_disclose_partial_days():
     assert rollup.p50_daily_cost is not None and rollup.p90_daily_cost is not None
 
 
-def test_a_configured_deployment_with_no_traffic_still_appears():
+def test_a_configured_deployment_without_returned_metrics_is_unmeasured():
     records = [request_record(i, deployment="reasoning-prod") for i in range(2)]
     identities = merge_identities(["reasoning-prod", "idle-prod"])
     portfolio = analyzed(records, workload_identities=identities).workloads
     names = [item.workload_name for item in portfolio.workloads]
     assert "idle-prod" in names
     idle = next(item for item in portfolio.workloads if item.workload_name == "idle-prod")
-    assert idle.total_tokens == 0
+    assert idle.total_tokens is None
+    assert idle.total_tokens_state == "unavailable"
     assert idle.estimated_cost is None
 
 

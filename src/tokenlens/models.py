@@ -5,13 +5,22 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .capabilities import (
+    CAPABILITY_CATALOG_VERSION,
+    CommerceType,
+    Modality,
+    UsageBasis,
+    resolve_model_capability,
+)
 
 class Usage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    input_tokens: int = Field(default=0, ge=0)
-    output_tokens: int = Field(default=0, ge=0)
-    cached_tokens: int = Field(default=0, ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    cached_tokens: int | None = Field(default=None, ge=0)
+    reasoning_tokens: int | None = Field(default=None, ge=0)
+    cache_write_tokens: int | None = Field(default=None, ge=0)
 
 
 class TraceRecord(BaseModel):
@@ -22,6 +31,12 @@ class TraceRecord(BaseModel):
     model: str = "unknown"
     deployment_name: str = "unknown"
     model_name: str = "unknown"
+    modality: Modality = "unknown"
+    usage_bases: tuple[UsageBasis, ...] = ()
+    commerce_type: CommerceType = "unknown"
+    ptu_eligible: bool | None = None
+    capability_catalog_version: str | None = None
+    capability_status: Literal["verified", "unknown"] = "unknown"
     provider: str = "unknown"
     service_tier: str = "standard"
     deployment_mode: str = "unknown"
@@ -38,6 +53,19 @@ class TraceRecord(BaseModel):
     retrieved_chunks: list[Any] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     response: dict[str, Any] | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.capability_status == "verified" or self.modality != "unknown":
+            return
+        capability = resolve_model_capability(self.model_name)
+        if capability is None:
+            return
+        self.modality = capability.modality
+        self.usage_bases = capability.usage_bases
+        self.commerce_type = capability.commerce_type
+        self.ptu_eligible = capability.ptu_eligible
+        self.capability_catalog_version = CAPABILITY_CATALOG_VERSION
+        self.capability_status = "verified"
 
 
 class Estimate(BaseModel):
@@ -93,8 +121,15 @@ class AggregateAnalysisSummary(BaseModel):
     bucket_minutes: int = Field(default=5, gt=0)
     window_start: datetime | None = None
     window_end: datetime | None = None
+    requested_days: float = Field(default=0, ge=0)
+    returned_start: datetime | None = None
+    returned_end: datetime | None = None
     observed_days: float = Field(default=0, ge=0)
     active_days: int = Field(default=0, ge=0)
+    input_tokens_state: Literal["measured", "partial", "unavailable", "not_applicable"] = "unavailable"
+    cached_tokens_state: Literal["measured", "partial", "unavailable", "not_applicable"] = "unavailable"
+    output_tokens_state: Literal["measured", "partial", "unavailable", "not_applicable"] = "unavailable"
+    total_tokens_state: Literal["measured", "partial", "unavailable", "not_applicable"] = "unavailable"
     missing_metrics: list[str] = Field(default_factory=list)
 
     @property
@@ -105,7 +140,9 @@ class AggregateAnalysisSummary(BaseModel):
         return round(min(100.0, self.observed_buckets / self.elapsed_buckets * 100), 1)
 
     @property
-    def total_tokens(self) -> int:
+    def total_tokens(self) -> int | None:
+        if self.input_tokens is None and self.output_tokens is None:
+            return None
         return (self.input_tokens or 0) + (self.output_tokens or 0)
 
 
@@ -113,6 +150,12 @@ class AnalysisSummary(BaseModel):
     #: ``requests`` for request telemetry, ``metric_buckets`` for aggregate
     #: telemetry. Every rendered label is chosen from this, never guessed.
     analysis_unit: Literal["requests", "metric_buckets"] = "requests"
+    modality: Modality = "unknown"
+    usage_bases: tuple[UsageBasis, ...] = ()
+    commerce_type: CommerceType = "unknown"
+    ptu_eligible: bool | None = None
+    capability_catalog_version: str | None = None
+    capability_status: Literal["verified", "unknown", "mixed"] = "unknown"
     requests_analyzed: int
     #: Actual requests. ``None`` when the source reports no request metric — it
     #: is never replaced with a bucket count.
@@ -122,10 +165,16 @@ class AnalysisSummary(BaseModel):
     cached_tokens_available: bool = True
     input_tokens_available: bool = True
     output_tokens_available: bool = True
-    input_tokens: int
-    output_tokens: int
-    cached_tokens: int
-    total_tokens: int = 0
+    input_tokens: int | None
+    output_tokens: int | None
+    cached_tokens: int | None
+    total_tokens: int | None = None
+    input_tokens_state: Literal["measured", "partial", "unavailable", "not_applicable"] = "unavailable"
+    cached_tokens_state: Literal["measured", "partial", "unavailable", "not_applicable"] = "unavailable"
+    output_tokens_state: Literal["measured", "partial", "unavailable", "not_applicable"] = "unavailable"
+    total_tokens_state: Literal["measured", "partial", "unavailable", "not_applicable"] = "unavailable"
+    missing_metrics: list[str] = Field(default_factory=list)
+    availability_migration_warning: bool = False
     retries: int
     findings: int
     high_findings: int
@@ -182,7 +231,7 @@ class DeploymentSummary(AnalysisSummary):
     resource_name: str | None = None
     project_name: str | None = None
     request_share_percent: float = 0
-    token_share_percent: float = 0
+    token_share_percent: float | None = None
     pricing_catalog_name: str | None = None
     pricing_effective_from: str | None = None
     input_price_per_million: float | None = Field(default=None, ge=0)

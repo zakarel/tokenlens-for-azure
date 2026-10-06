@@ -12,6 +12,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ..capabilities import CAPABILITY_CATALOG_VERSION, CommerceType, Modality, UsageBasis
+from ..telemetry.manifest import CollectionManifest
 from ..workloads import WorkloadIdentity, WorkloadMapping
 
 #: Version 3 stores every selected Foundry account in ``foundry.accounts`` so a
@@ -136,6 +138,12 @@ class DeploymentRecord(BaseModel):
     provider_family: ProviderFamily = "unknown"
     inference_api: InferenceApi = "unknown"
     publisher: str | None = None
+    modality: Modality = "unknown"
+    supported_usage_bases: tuple[UsageBasis, ...] = ()
+    commerce_type: CommerceType = "unknown"
+    ptu_eligible: bool | None = None
+    capability_catalog_version: str | None = None
+    capability_status: Literal["verified", "unknown"] = "unknown"
 
     @property
     def mode_label(self) -> str:
@@ -366,6 +374,8 @@ class CollectionSummary(BaseModel):
     duplicates_skipped: int = 0
     identity_conflicts: list[str] = Field(default_factory=list)
     unresolved_pricing: list[str] = Field(default_factory=list)
+    manifest: CollectionManifest | None = None
+    manifest_file: str | None = None
 
     @property
     def succeeded(self) -> list[DeploymentOutcome]:

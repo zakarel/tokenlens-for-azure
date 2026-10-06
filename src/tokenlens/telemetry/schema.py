@@ -1,4 +1,4 @@
-"""Canonical, privacy-first telemetry records (schema version 3).
+"""Canonical, privacy-first telemetry records (schema version 4).
 
 Every collection adapter (SDK wrapper, OpenTelemetry importer, Azure Monitor
 collector, generic import) emits one of these two records so provider-specific
@@ -14,10 +14,18 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-SCHEMA_VERSION = 3
-SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3)
+from ..capabilities import (
+    CAPABILITY_CATALOG_VERSION,
+    CommerceType,
+    Modality,
+    UsageBasis,
+    resolve_model_capability,
+)
+
+SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, 4)
 
 TelemetrySource = Literal["sdk_wrapper", "otel", "azure_monitor", "import"]
 RecordType = Literal["model_request", "foundry_metric_bucket"]
@@ -66,13 +74,13 @@ class _Canonical(BaseModel):
 
 
 class TelemetryUsage(_Canonical):
-    """Aggregate token usage. Counters are nonnegative and never estimated."""
+    """Aggregate token usage; absent source metrics remain unavailable."""
 
-    input_tokens: int = Field(default=0, ge=0)
-    cached_tokens: int = Field(default=0, ge=0)
-    output_tokens: int = Field(default=0, ge=0)
-    reasoning_tokens: int = Field(default=0, ge=0)
-    cache_write_tokens: int = Field(default=0, ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    cached_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    reasoning_tokens: int | None = Field(default=None, ge=0)
+    cache_write_tokens: int | None = Field(default=None, ge=0)
 
 
 class ContentFeatures(_Canonical):
@@ -115,7 +123,7 @@ class ResourceScope(_Canonical):
 class ModelRequestRecord(_Canonical):
     """One canonical request-level telemetry record."""
 
-    schema_version: Literal[3] = SCHEMA_VERSION
+    schema_version: Literal[4] = SCHEMA_VERSION
     record_type: Literal["model_request"] = "model_request"
     source: TelemetrySource
     event_id: str
@@ -123,6 +131,12 @@ class ModelRequestRecord(_Canonical):
     provider: str
     deployment_name: str
     model_name: str
+    modality: Modality = "unknown"
+    usage_bases: tuple[UsageBasis, ...] = ()
+    commerce_type: CommerceType = "unknown"
+    ptu_eligible: bool | None = None
+    capability_catalog_version: str | None = None
+    capability_status: Literal["verified", "unknown"] = "unknown"
     service_tier: str = "standard"
     deployment_mode: str = "unknown"
     api: str | None = None
@@ -137,6 +151,8 @@ class ModelRequestRecord(_Canonical):
     streamed: bool = False
     sampled: bool = True
     sample_rate: float = Field(default=1.0, gt=0, le=1)
+    missing_metrics: list[str] = Field(default_factory=list)
+    availability_migration_warning: bool = False
     content_features: ContentFeatures = Field(default_factory=ContentFeatures)
     fingerprints: Fingerprints = Field(default_factory=Fingerprints)
 
@@ -151,6 +167,36 @@ class ModelRequestRecord(_Canonical):
         # An unknown deployment mode must stay unknown: PTU sizing and pricing
         # differ between Global and Regional, so guessing is never acceptable.
         return value or "unknown"
+
+    @model_validator(mode="after")
+    def _resolve_exact_capability(self) -> ModelRequestRecord:
+        missing = set(self.missing_metrics)
+        for metric in (
+            "input_tokens",
+            "cached_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cache_write_tokens",
+        ):
+            if getattr(self.usage, metric) is None:
+                missing.add(metric)
+            elif metric in missing:
+                raise ValueError(
+                    f"measured {metric} cannot also be listed as unavailable"
+                )
+        self.missing_metrics = sorted(missing)
+        if self.capability_status == "verified" or self.modality != "unknown":
+            return self
+        capability = resolve_model_capability(self.model_name)
+        if capability is None:
+            return self
+        self.modality = capability.modality
+        self.usage_bases = capability.usage_bases
+        self.commerce_type = capability.commerce_type
+        self.ptu_eligible = capability.ptu_eligible
+        self.capability_catalog_version = CAPABILITY_CATALOG_VERSION
+        self.capability_status = "verified"
+        return self
 
 
 class BucketMetrics(_Canonical):
@@ -176,7 +222,7 @@ class BucketMetrics(_Canonical):
 class MetricBucketRecord(_Canonical):
     """One canonical aggregate telemetry bucket."""
 
-    schema_version: Literal[3] = SCHEMA_VERSION
+    schema_version: Literal[4] = SCHEMA_VERSION
     record_type: Literal["foundry_metric_bucket"] = "foundry_metric_bucket"
     source: TelemetrySource = "azure_monitor"
     event_id: str
@@ -185,6 +231,12 @@ class MetricBucketRecord(_Canonical):
     provider: str = "azure_foundry"
     deployment_name: str
     model_name: str
+    modality: Modality = "unknown"
+    usage_bases: tuple[UsageBasis, ...] = ()
+    commerce_type: CommerceType = "unknown"
+    ptu_eligible: bool | None = None
+    capability_catalog_version: str | None = None
+    capability_status: Literal["verified", "unknown"] = "unknown"
     #: Model version reported as a separate dimension. It is kept separate
     #: rather than concatenated so the exact model identity is preserved
     #: without inventing a combined model ID that no catalog contains.
@@ -223,6 +275,21 @@ class MetricBucketRecord(_Canonical):
     def _utc(cls, value: datetime | None) -> datetime | None:
         return _as_utc(value) if value is not None else None
 
+    @model_validator(mode="after")
+    def _resolve_exact_capability(self) -> MetricBucketRecord:
+        if self.capability_status == "verified" or self.modality != "unknown":
+            return self
+        capability = resolve_model_capability(self.model_name)
+        if capability is None:
+            return self
+        self.modality = capability.modality
+        self.usage_bases = capability.usage_bases
+        self.commerce_type = capability.commerce_type
+        self.ptu_eligible = capability.ptu_eligible
+        self.capability_catalog_version = CAPABILITY_CATALOG_VERSION
+        self.capability_status = "verified"
+        return self
+
 
 CanonicalRecord = ModelRequestRecord | MetricBucketRecord
 
@@ -234,7 +301,35 @@ def record_json(record: CanonicalRecord) -> dict[str, Any]:
 
 
 def parse_record(raw: dict[str, Any]) -> CanonicalRecord:
-    """Parse a canonical record, rejecting unknown or content-bearing fields."""
+    """Parse the current record schema and migrate earlier canonical records."""
+    version = raw.get("schema_version")
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise ValueError("unsupported canonical telemetry schema version")
+    if isinstance(version, int) and version < SCHEMA_VERSION:
+        raw = {
+            **raw,
+            "schema_version": SCHEMA_VERSION,
+            "modality": raw.get("modality", "unknown"),
+            "usage_bases": raw.get("usage_bases", ()),
+        }
+        if raw.get("record_type") == "model_request":
+            usage = dict(raw.get("usage") or {})
+            missing = set(raw.get("missing_metrics") or ())
+            ambiguous_zero = False
+            for metric in (
+                "input_tokens",
+                "cached_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "cache_write_tokens",
+            ):
+                if usage.get(metric) == 0:
+                    usage[metric] = None
+                    missing.add(metric)
+                    ambiguous_zero = True
+            raw["usage"] = usage
+            raw["missing_metrics"] = sorted(missing)
+            raw["availability_migration_warning"] = ambiguous_zero
     record_type = raw.get("record_type")
     if record_type == "foundry_metric_bucket":
         return MetricBucketRecord.model_validate(raw)

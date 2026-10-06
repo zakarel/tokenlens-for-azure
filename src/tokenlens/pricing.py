@@ -341,6 +341,25 @@ def resolve_trace_cost(
             publisher=infer_publisher(record.model_name),
         )
 
+    missing_usage = [
+        name
+        for name, value in (
+            ("input_tokens", record.usage.input_tokens),
+            ("cached_tokens", record.usage.cached_tokens),
+            ("output_tokens", record.usage.output_tokens),
+        )
+        if value is None
+    ]
+    if missing_usage:
+        return PricingResolution(
+            resolved=False,
+            source="unresolved",
+            currency=required_currency or "USD",
+            publisher=infer_publisher(record.model_name),
+            unresolved_reason="usage-metrics-unavailable:" + ",".join(missing_usage),
+            suggested_override_key=canonical_model_name(record.model_name),
+        )
+
     # An aggregate bucket's ``input_tokens`` is an interval total, not one
     # prompt, so it is never used as a context length. Without a per-request
     # measure the documented default context applies, and says so.

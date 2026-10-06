@@ -3,16 +3,19 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
 import webbrowser
+from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
 import typer
 
 from .analyzer import analyze, analyze_task_events
+from .capabilities import CAPABILITY_CATALOG_VERSION, resolve_model_capability
 from .economics import TaskEconomicsReport
 from .ingest import InputError, load_records_many, load_task_events_many
 from .output import choose_output, economics_text, pricing_audit_text
@@ -21,6 +24,15 @@ from .reference import load_effective_reference_catalog
 from .presentation import impact_category, is_material, materiality_config
 from .reports import report_html, report_json, report_sarif, write_output
 from .telemetry import TelemetryConfig, TelemetryWriter
+from .telemetry.manifest import CollectionManifest, build_deployment_manifest
+from .foundry_workflow.configuration import atomic_write
+
+
+def format_measurement(value: int | float | None, unit: str) -> str:
+    if value is None:
+        return f"Unavailable {unit}"
+    return f"{value:,} {unit}"
+
 
 app = typer.Typer(
     help=(
@@ -103,7 +115,8 @@ def _render(report, output_format: str) -> str:
     lines = [
         "TokenLens for Azure",
         "─" * 68,
-        f"Analyzed {requests} · {summary.total_tokens:,} total tokens · {len(report.deployments):,} deployments{unit}",
+        f"Analyzed {requests} · {format_measurement(summary.total_tokens, 'tokens')} · "
+        f"{len(report.deployments):,} deployments{unit}",
         "",
     ]
     for issue in report.data_quality:
@@ -119,7 +132,7 @@ def _render(report, output_format: str) -> str:
         )
         lines.append(
             f"Deployment: {item.deployment_name} · model type: {item.model_name} · "
-            f"{deployment_requests} · {item.total_tokens:,} tokens"
+            f"{deployment_requests} · {format_measurement(item.total_tokens, 'tokens')}"
         )
     if report.deployments:
         lines.append("")
@@ -205,6 +218,97 @@ def _safe_source(source: str, *, include_paths: bool) -> tuple[str, int]:
         return "stdin", 1
     unit = "file" if count == 1 else "files"
     return f"{count} local telemetry {unit}", count
+
+
+def _direct_collection_manifest(
+    *,
+    result,
+    inventory,
+    deployment_names: list[str],
+    subscription_id: str,
+    resource_group: str,
+    account: str,
+    window,
+) -> CollectionManifest:
+    run_id = secrets.token_hex(8)
+    inventory_by_name = {
+        str(item.get("name") or "").casefold(): item
+        for item in inventory
+        if isinstance(item, dict) and item.get("name")
+    }
+    names = sorted(
+        set(deployment_names)
+        | {record.deployment_name for record in result.records}
+        | (
+            set(inventory_by_name)
+            if not deployment_names
+            else set()
+        )
+    )
+    entries = []
+    for name in names:
+        entry = inventory_by_name.get(name.casefold(), {})
+        records = [record for record in result.records if record.deployment_name.casefold() == name.casefold()]
+        record = records[0] if records else None
+        model = (
+            record.model_name
+            if record and record.model_name not in {"", "unknown"}
+            else str(entry.get("model") or "")
+        )
+        capability = resolve_model_capability(model)
+        modality = record.modality if record else (
+            capability.modality if capability else "unknown"
+        )
+        usage_bases = record.usage_bases if record else (
+            capability.usage_bases if capability else ()
+        )
+        entries.append(
+            build_deployment_manifest(
+                run_id=run_id,
+                identity_scope=f"{subscription_id}\0{resource_group}\0{account}",
+                deployment_name=name,
+                model_name=model or None,
+                model_version=(
+                    record.model_version
+                    if record and record.model_version
+                    else str(entry["model_version"])
+                    if entry.get("model_version")
+                    else None
+                ),
+                modality=modality,
+                usage_bases=usage_bases,
+                capability_catalog_version=(
+                    record.capability_catalog_version
+                    if record and record.capability_catalog_version
+                    else CAPABILITY_CATALOG_VERSION
+                    if capability
+                    else None
+                ),
+                collection_state="succeeded",
+                requested_start=window.start,
+                requested_end=window.end,
+                bucket_minutes=window.granularity_minutes,
+                records=records,
+                requested_metrics=result.requested_metrics,
+                missing_metrics=result.missing_metrics,
+                unsupported_metrics=result.unsupported_metrics,
+                identity_conflict_count=sum(
+                    name.casefold() in conflict.casefold()
+                    for conflict in result.identity_conflicts
+                ),
+            )
+        )
+    return CollectionManifest(
+        run_id=run_id,
+        generated_at=datetime.now(UTC),
+        requested_start=window.start,
+        requested_end=window.end,
+        bucket_minutes=window.granularity_minutes,
+        expected_buckets_per_deployment=window.expected_buckets,
+        pages_read=result.pages_read,
+        retries=result.retries,
+        deployments=entries,
+    )
 
 
 @app.command("analyze")
@@ -727,12 +831,13 @@ def collect_foundry_metrics(
         metrics_client = _foundry_metrics_client(metrics_endpoint)
         available = list(resources.list_metric_definitions(uri))
         inventory = _deployment_inventory(resources, subscription_id, resource_group, account, quiet=quiet)
+        window = CollectionWindow.for_days(lookback)
         result = collect_metrics(
             metrics_client=metrics_client,
             subscription_id=subscription_id,
             resource_group=resource_group,
             account=account,
-            window=CollectionWindow.for_days(lookback),
+            window=window,
             available_metrics=available,
             deployments=deployments or None,
             deployment_inventory=inventory,
@@ -749,6 +854,26 @@ def collect_foundry_metrics(
         TelemetryConfig.from_env(output_dir=Path(output_dir)),
     )
     written = writer.write_all(result.records)
+    manifest = _direct_collection_manifest(
+        result=result,
+        inventory=inventory,
+        deployment_names=deployments,
+        subscription_id=subscription_id,
+        resource_group=str(resource_group),
+        account=str(account),
+        window=window,
+    )
+    manifest_path = Path(output_dir) / f"collection-manifest-{manifest.run_id}.json"
+    atomic_write(
+        manifest_path,
+        json.dumps(manifest.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
+        mode=0o600,
+    )
+    ignore_path = Path(output_dir) / ".gitignore"
+    if ignore_path.is_symlink():
+        raise typer.BadParameter("The telemetry output directory contains a symlinked .gitignore.")
+    if not ignore_path.exists():
+        atomic_write(ignore_path, "*\n", mode=0o600)
     if quiet:
         return
     for key, value in result.summary().items():
@@ -759,6 +884,7 @@ def collect_foundry_metrics(
         typer.echo(f"identity-conflict={conflict}")
     typer.echo(f"records-written={written}")
     typer.echo(f"records-already-present={writer.skipped_duplicates}")
+    typer.echo(f"collection-manifest={manifest_path.name}")
     typer.echo(f"output-dir={Path(output_dir).resolve()}")
     typer.echo(f"next: tokenlens-azure analyze {output_dir} --format html --open")
 

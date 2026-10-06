@@ -23,11 +23,13 @@ from .base import AttributeProxy, Instrumentation, classify_error, stream_outcom
 __all__ = ["instrument_anthropic_foundry"]
 
 
-def _int(value: Any) -> int:
+def _int(value: Any) -> int | None:
+    if value is None:
+        return None
     try:
         return max(0, int(value))
     except (TypeError, ValueError):
-        return 0
+        return None
 
 
 def _get(source: Any, name: str) -> Any:
@@ -48,6 +50,14 @@ def extract_messages_usage(usage: Any) -> TelemetryUsage:
         cached_tokens=_int(_get(usage, "cache_read_input_tokens")),
         cache_write_tokens=_int(_get(usage, "cache_creation_input_tokens")),
     )
+
+
+def _merge_cumulative_usage(previous: int | None, incoming: int | None) -> int | None:
+    if previous is None:
+        return incoming
+    if incoming is None:
+        return previous
+    return max(previous, incoming)
 
 
 class _MessageStreamProxy:
@@ -120,10 +130,12 @@ class _MessageStreamProxy:
             usage = extract_messages_usage(_get(message, "usage"))
             merged = self._usage.model_copy(
                 update={
-                    "input_tokens": usage.input_tokens or self._usage.input_tokens,
-                    "cached_tokens": usage.cached_tokens or self._usage.cached_tokens,
-                    "cache_write_tokens": usage.cache_write_tokens or self._usage.cache_write_tokens,
-                    "output_tokens": usage.output_tokens or self._usage.output_tokens,
+                    "input_tokens": _merge_cumulative_usage(self._usage.input_tokens, usage.input_tokens),
+                    "cached_tokens": _merge_cumulative_usage(self._usage.cached_tokens, usage.cached_tokens),
+                    "cache_write_tokens": _merge_cumulative_usage(
+                        self._usage.cache_write_tokens, usage.cache_write_tokens
+                    ),
+                    "output_tokens": _merge_cumulative_usage(self._usage.output_tokens, usage.output_tokens),
                 }
             )
             self._usage = merged
@@ -137,10 +149,12 @@ class _MessageStreamProxy:
             usage = extract_messages_usage(delta_usage)
             merged = self._usage.model_copy(
                 update={
-                    "output_tokens": usage.output_tokens or self._usage.output_tokens,
-                    "input_tokens": usage.input_tokens or self._usage.input_tokens,
-                    "cached_tokens": usage.cached_tokens or self._usage.cached_tokens,
-                    "cache_write_tokens": usage.cache_write_tokens or self._usage.cache_write_tokens,
+                    "output_tokens": _merge_cumulative_usage(self._usage.output_tokens, usage.output_tokens),
+                    "input_tokens": _merge_cumulative_usage(self._usage.input_tokens, usage.input_tokens),
+                    "cached_tokens": _merge_cumulative_usage(self._usage.cached_tokens, usage.cached_tokens),
+                    "cache_write_tokens": _merge_cumulative_usage(
+                        self._usage.cache_write_tokens, usage.cache_write_tokens
+                    ),
                 }
             )
             self._usage = merged

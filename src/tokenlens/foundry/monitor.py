@@ -339,8 +339,8 @@ class _BucketState:
         self.status_observed = False
 
 
-def _deployment_inventory(raw: Iterable[Mapping[str, Any]] | None) -> dict[str, dict[str, str]]:
-    inventory: dict[str, dict[str, str]] = {}
+def _deployment_inventory(raw: Iterable[Mapping[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    inventory: dict[str, dict[str, Any]] = {}
     for item in raw or []:
         name = str(item.get("name") or "").strip()
         if not name:
@@ -349,6 +349,12 @@ def _deployment_inventory(raw: Iterable[Mapping[str, Any]] | None) -> dict[str, 
             "model": str(item.get("model") or "").strip(),
             "model_version": str(item.get("model_version") or "").strip(),
             "sku": str(item.get("sku") or "").strip(),
+            "modality": item.get("modality", "unknown"),
+            "usage_bases": tuple(item.get("usage_bases") or ()),
+            "commerce_type": item.get("commerce_type", "unknown"),
+            "ptu_eligible": item.get("ptu_eligible"),
+            "capability_catalog_version": item.get("capability_catalog_version"),
+            "capability_status": item.get("capability_status", "unknown"),
         }
     return inventory
 
@@ -598,6 +604,11 @@ def collect_metrics(
                 result.identity_conflicts.append(conflict)
         model_name = state.model_name or inventory_model or "unknown"
         model_version = state.model_version or inventory_version or None
+        capability = (
+            {}
+            if state.model_name and inventory_model and state.model_name != inventory_model
+            else entry_identity
+        )
 
         metrics = BucketMetrics(
             input_tokens=_as_int(values.get("input_tokens")),
@@ -635,6 +646,12 @@ def collect_metrics(
                 bucket_minutes=window.granularity_minutes,
                 deployment_name=deployment,
                 model_name=model_name,
+                modality=capability.get("modality", "unknown"),
+                usage_bases=tuple(capability.get("usage_bases") or ()),
+                commerce_type=capability.get("commerce_type", "unknown"),
+                ptu_eligible=capability.get("ptu_eligible"),
+                capability_catalog_version=capability.get("capability_catalog_version"),
+                capability_status=capability.get("capability_status", "unknown"),
                 model_version=model_version or None,
                 deployment_mode=(deployment_modes or {}).get(deployment, default_deployment_mode),
                 scope=scope or ResourceScope(),

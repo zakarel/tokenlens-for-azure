@@ -17,6 +17,7 @@ import shutil
 import subprocess
 from typing import Any, Callable, Iterable, Sequence
 
+from ..capabilities import CAPABILITY_CATALOG_VERSION, resolve_model_capability
 from ..pricing import canonical_model_name, infer_publisher
 from .models import (
     AccountOption,
@@ -271,6 +272,7 @@ def enrich_deployment(raw: dict[str, Any]) -> DeploymentRecord:
     model = str(raw.get("model") or "")
     publisher = infer_publisher(model) if model else None
     family = provider_family_for_model(model, publisher)
+    capability = resolve_model_capability(model)
     capacity = raw.get("capacity")
     return DeploymentRecord(
         name=str(raw.get("name") or ""),
@@ -282,6 +284,12 @@ def enrich_deployment(raw: dict[str, Any]) -> DeploymentRecord:
         provider_family=family,
         inference_api=inference_api_for_family(family),
         publisher=publisher,
+        modality=capability.modality if capability else "unknown",
+        supported_usage_bases=capability.usage_bases if capability else (),
+        commerce_type=capability.commerce_type if capability else "unknown",
+        ptu_eligible=capability.ptu_eligible if capability else None,
+        capability_catalog_version=CAPABILITY_CATALOG_VERSION if capability else None,
+        capability_status="verified" if capability else "unknown",
     )
 
 

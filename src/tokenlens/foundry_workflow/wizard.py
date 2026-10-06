@@ -15,6 +15,7 @@ about, and neither blocks usage collection.
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from typing import Sequence
 
 from ..pricing import PricingCatalog
@@ -588,6 +589,7 @@ def sync_public_pricing_if_needed(
     config: FoundryWorkflowConfig,
     *,
     services: WorkflowServices | None = None,
+    now: datetime | None = None,
 ) -> list[str]:
     """Refresh the cached official pricing snapshot when it is absent or stale.
 
@@ -602,6 +604,7 @@ def sync_public_pricing_if_needed(
     from ..pricing_sources.fetch import FetchBudget
     from ..pricing_sources.sync import public_sync_needed, sync_public_pricing
 
+    moment = now or datetime.now(UTC)
     if os.getenv("TOKENLENS_NO_PRICING_SYNC", "").strip() not in {"", "0", "false", "no"}:
         return ["Public pricing synchronization is disabled (TOKENLENS_NO_PRICING_SYNC)."]
     if not config.pricing.public_cache:
@@ -630,7 +633,7 @@ def sync_public_pricing_if_needed(
     wants_claude = bool(claude_models)
     # Freshness is judged against the sources this selection actually needs, so
     # a portfolio without Claude is never told a synchronization is overdue.
-    if not public_sync_needed(include_claude=wants_claude):
+    if not public_sync_needed(include_claude=wants_claude, now=moment):
         return ["Cached official pricing snapshot is current; no network request was made."]
     region = next((item.region for item in config.foundry.targets if item.region), None)
     try:
@@ -643,6 +646,7 @@ def sync_public_pricing_if_needed(
             include_claude=wants_claude,
             # The guided path must never stall: one short attempt per source.
             budget=FetchBudget(timeout_seconds=10.0, retries=0),
+            now=moment,
         )
     except Exception as exc:  # noqa: BLE001 - a sync failure must never stop the assessment
         return [

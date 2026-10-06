@@ -108,6 +108,33 @@ def test_active_observed_and_elapsed_buckets_stay_distinct(audited_report):
     assert aggregate.collection_completeness_percent == pytest.approx(0.97, abs=0.05)
 
 
+def test_observed_days_count_returned_days_not_the_requested_window():
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    end = start + timedelta(days=90)
+    records = [
+        bucket(index=0, input_tokens=1, output_tokens=1, status_codes={"200": 1}),
+        bucket(index=29 * 24 * 12, input_tokens=1, output_tokens=1, status_codes={"200": 1}),
+    ]
+    for record, stamp in zip(records, (start, start + timedelta(days=29))):
+        record.timestamp = stamp.isoformat().replace("+00:00", "Z")
+        record.metadata["window_start"] = start.isoformat().replace("+00:00", "Z")
+        record.metadata["window_end"] = end.isoformat().replace("+00:00", "Z")
+        record.metadata["expected_buckets"] = 90 * 24 * 12
+
+    report = analyze(records, "sparse-90-day-fixture", generated_at="2026-10-01T00:00:00Z")
+    aggregate = report.summary.aggregate
+
+    assert aggregate.requested_days == 90
+    assert aggregate.observed_days == 2
+    assert aggregate.returned_start == start
+    assert aggregate.returned_end == start + timedelta(days=29, minutes=5)
+    assert aggregate.collection_completeness_percent < 1
+    assert any(issue.code == "collection_incomplete" for issue in report.data_quality)
+    collection = report.report_metadata["collection"]
+    assert collection["requested_days"] == 90
+    assert collection["observed_days"] == 2
+
+
 def test_zero_idle_buckets_are_not_active():
     summary = aggregate_summary(
         [bucket(index=index, input_tokens=0, output_tokens=0, status_codes={}) for index in range(50)]

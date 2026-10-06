@@ -141,7 +141,11 @@ def collector(*, failing: set[str] | None = None, buckets: int = 4):
                         model_version=str(entry.get("model_version") or "") or None,
                         deployment_mode=kwargs["default_deployment_mode"],
                         metrics=BucketMetrics(
-                            input_tokens=1000, output_tokens=200, requests=5, successful_requests=5
+                            input_tokens=1000,
+                            cached_tokens=0,
+                            output_tokens=200,
+                            requests=5,
+                            successful_requests=5,
                         ),
                         workload=assignments.get(name),
                         workload_source="deployment_mapping" if assignments.get(name) else None,
@@ -751,6 +755,13 @@ def test_each_run_writes_its_own_isolated_telemetry_directory(workspace):
     assert second.records_written == 12
     assert first.duplicates_skipped == 0 and second.duplicates_skipped == 0
     assert first.run_dir != second.run_dir
+    for run_dir in (first.run_dir, second.run_dir):
+        manifest_path = Path(run_dir) / "collection-manifest.json"
+        assert manifest_path.is_file()
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert len(payload["deployments"]) == len(ALL_DEPLOYMENTS)
+        assert payload["expected_buckets_per_deployment"] == 4032
+        assert "subscription" not in manifest_path.read_text(encoding="utf-8").casefold()
     base = Path("local-traces/foundry-metrics")
     # Nothing is written to the base directory any more, and the previous run
     # is still on disk: history is preserved, never merged or deleted.

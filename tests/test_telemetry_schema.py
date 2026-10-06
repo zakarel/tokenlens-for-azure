@@ -69,9 +69,21 @@ def test_canonical_request_serializes_without_any_content_key():
     serialized = json.dumps(payload)
     assert CANARY_PROMPT not in serialized
     assert assert_contentless(payload) is payload
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["record_type"] == "model_request"
     assert payload["timestamp"].endswith("Z") or "+00:00" in payload["timestamp"]
+
+
+def test_request_usage_keeps_measured_zero_separate_from_missing():
+    record = request_record(
+        usage=TelemetryUsage(input_tokens=0, cached_tokens=None, output_tokens=0)
+    )
+    payload = record_json(record)
+
+    assert payload["usage"]["input_tokens"] == 0
+    assert payload["usage"]["output_tokens"] == 0
+    assert "cached_tokens" not in payload["usage"]
+    assert "cached_tokens" in payload["missing_metrics"]
 
 
 def test_counters_must_be_nonnegative_and_timestamps_are_utc():
@@ -110,6 +122,73 @@ def test_bucket_metrics_distinguish_zero_from_unavailable():
     assert bucket.metrics.cached_tokens is None
     assert "cached_tokens" in bucket.missing_metrics
     assert parse_record(record_json(bucket)).record_type == "foundry_metric_bucket"
+
+
+def test_schema_v3_request_migrates_and_resolves_only_an_exact_capability():
+    payload = record_json(
+        ModelRequestRecord(
+            schema_version=4,
+            source="sdk_wrapper",
+            event_id="synthetic-tts-event",
+            timestamp=datetime(2026, 9, 14, 12, 0, tzinfo=UTC),
+            provider="azure_foundry",
+            deployment_name="synthetic-speech",
+            model_name="tts-1",
+        )
+    )
+    payload["schema_version"] = 3
+    payload.pop("modality")
+    payload.pop("usage_bases")
+    payload.pop("commerce_type")
+    payload.pop("ptu_eligible")
+    payload.pop("capability_catalog_version")
+    payload.pop("capability_status")
+
+    migrated = parse_record(payload)
+
+    assert migrated.schema_version == 4
+    assert migrated.modality == "text_to_speech"
+    assert migrated.ptu_eligible is False
+
+
+def test_schema_v3_ambiguous_zero_usage_migrates_to_unavailable_with_warning():
+    payload = record_json(
+        request_record(usage=TelemetryUsage(input_tokens=0, cached_tokens=0, output_tokens=0))
+    )
+    payload["schema_version"] = 3
+    for field in (
+        "modality",
+        "usage_bases",
+        "commerce_type",
+        "ptu_eligible",
+        "capability_catalog_version",
+        "capability_status",
+        "missing_metrics",
+        "availability_migration_warning",
+    ):
+        payload.pop(field, None)
+
+    migrated = parse_record(payload)
+
+    assert migrated.usage.input_tokens is None
+    assert migrated.usage.cached_tokens is None
+    assert migrated.usage.output_tokens is None
+    assert migrated.availability_migration_warning is True
+    assert {"input_tokens", "cached_tokens", "output_tokens"} <= set(migrated.missing_metrics)
+
+
+def test_unknown_model_stays_unclassified_during_schema_migration():
+    record = ModelRequestRecord(
+        source="otel",
+        event_id="synthetic-unknown-event",
+        timestamp=datetime(2026, 9, 14, tzinfo=UTC),
+        provider="azure_foundry",
+        deployment_name="synthetic-deployment",
+        model_name="tts-1-next",
+    )
+
+    assert record.modality == "unknown"
+    assert record.capability_status == "unknown"
 
 
 def test_fingerprints_require_keyed_hmac():

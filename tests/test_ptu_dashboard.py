@@ -136,6 +136,58 @@ def test_dashboard_payload_is_typed_and_complete(full_report):
     assert data.recommendation_reasons and data.assumptions and data.next_steps
 
 
+def test_tts_deployment_is_not_applicable_to_token_based_ptu():
+    record = request_record(
+        timestamp=datetime(2026, 9, 14, 12, 0, tzinfo=UTC),
+        deployment="synthetic-speech",
+        model="tts-1",
+        input_tokens=0,
+        cached_tokens=0,
+        output_tokens=0,
+    )
+
+    report = analyze([record], "synthetic-speech", generated_at="2026-09-14T13:00:00Z")
+    result = report.ptu_analysis.deployments[0]
+    assert result.dashboard.summary.modality == "text_to_speech"
+    assert result.dashboard.summary.ptu_eligible is False
+    assert result.dashboard.summary.state == "ptu_not_applicable"
+    assert result.dashboard.summary.secondary_blockers == []
+    assert "Token-based PTU sizing" in result.note
+
+
+def test_tts_request_activity_with_missing_tokens_is_not_rendered_as_zero_or_no_traffic():
+    records = [
+        parsed(
+            {
+                "timestamp": (datetime(2026, 9, 14, 12, 0, tzinfo=UTC) + timedelta(seconds=index)).isoformat(),
+                "deployment_name": "synthetic-speech",
+                "model_name": "tts-1",
+                "provider": "azure_foundry",
+                "deployment_mode": "regional",
+                "status_code": 200,
+            }
+        )
+        for index in range(235)
+    ]
+
+    report = analyze(records, "synthetic-speech", generated_at="2026-09-14T13:00:00Z")
+    dashboard_data = dashboard(report)
+    rendered = report_html(report)
+    workload = next(item for item in report.workloads.workloads if item.workload_name == "synthetic-speech")
+
+    assert report.summary.requests_observed == 235
+    assert report.summary.total_tokens is None
+    assert report.summary.total_tokens_state == "unavailable"
+    assert workload.requests == 235
+    assert workload.total_tokens is None
+    assert dashboard_data.summary.state == "ptu_not_applicable"
+    assert dashboard_data.summary.total_tokens is None
+    assert "Native usage metric unavailable" in rendered
+    assert "Token pricing not applicable" in rendered
+    assert "No traffic in this window" not in rendered
+    assert "0 total tokens" not in rendered
+
+
 def test_at_a_glance_totals_match_the_analyzed_deployment_exactly(full_report):
     data = dashboard(full_report)
     deployment = full_report.deployments[0].summary

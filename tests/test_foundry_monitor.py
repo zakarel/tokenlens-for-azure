@@ -157,9 +157,40 @@ def collect(client, **overrides):
 
 def test_capability_matrix_and_metric_map_stay_explicit():
     assert set(CAPABILITY_MATRIX) == {"azure_openai", "claude_foundry", "partner_model", "unknown"}
-    # Every canonical field the matrix expects must have documented candidates.
     for family, expected in CAPABILITY_MATRIX.items():
         assert expected <= set(METRIC_MAP), family
+
+
+def test_deployment_capability_flows_from_inventory_into_aggregate_record():
+    stamp = WINDOW.start
+    speech_metric = series(
+        "ProcessedPromptTokens",
+        [(stamp, 0)],
+        deployment="synthetic-speech",
+        model="tts-1",
+    )
+    result = collect(
+        FakeMetricsClient([{"metrics": [speech_metric]}]),
+        deployments=["synthetic-speech"],
+        deployment_inventory=[
+            {
+                "name": "synthetic-speech",
+                "model": "tts-1",
+                "modality": "text_to_speech",
+                "usage_bases": ("characters", "audio_seconds"),
+                "commerce_type": "azure_direct",
+                "ptu_eligible": False,
+                "capability_catalog_version": "2026-10-06.1",
+                "capability_status": "verified",
+            }
+        ],
+    )
+
+    record = result.records[0]
+    assert record.modality == "text_to_speech"
+    assert record.usage_bases == ("characters", "audio_seconds")
+    assert record.ptu_eligible is False
+    assert record.capability_status == "verified"
 
 
 def test_supported_metrics_never_guesses_an_unavailable_metric():

@@ -205,8 +205,8 @@ def test_chat_completion_emits_one_contentless_record_and_no_extra_call(tmp_path
         "cached_tokens": 1800,
         "output_tokens": 380,
         "reasoning_tokens": 0,
-        "cache_write_tokens": 0,
     }
+    assert "cache_write_tokens" in record["missing_metrics"]
     assert record["status_code"] == 200
     assert record["latency_ms"] >= 0
     assert record["content_features"] == {"message_count": 2, "tool_count": 1, "max_output_tokens": 1000}
@@ -264,7 +264,8 @@ def test_provider_failure_emits_safe_error_telemetry(tmp_path):
     record = written(tmp_path)[0]
     assert record["status_code"] == 429
     assert record["error_category"] == "rate_limited"
-    assert record["usage"]["input_tokens"] == 0
+    assert "input_tokens" not in record["usage"]
+    assert "input_tokens" in record["missing_metrics"]
     serialized = json.dumps(record)
     assert CANARY_PROMPT not in serialized
     assert "example-endpoint.invalid" not in serialized

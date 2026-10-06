@@ -10,6 +10,7 @@ records defined in :mod:`tokenlens.telemetry.schema` through the shared
 from __future__ import annotations
 
 from .config import TelemetryConfig
+from .manifest import CollectionManifest, DeploymentCollectionManifest, GapInterval, MetricCoverage
 from .privacy import ContentLeakError, FingerprintPolicy, assert_contentless
 from .schema import (
     SCHEMA_VERSION,
@@ -32,11 +33,15 @@ __all__ = [
     "SUPPORTED_SCHEMA_VERSIONS",
     "BucketMetrics",
     "ContentFeatures",
+    "CollectionManifest",
     "ContentLeakError",
+    "DeploymentCollectionManifest",
     "Fingerprints",
     "FingerprintPolicy",
     "MetricBucketRecord",
     "ModelRequestRecord",
+    "GapInterval",
+    "MetricCoverage",
     "ResourceScope",
     "TelemetryConfig",
     "TelemetryUsage",

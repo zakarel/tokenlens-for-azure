@@ -15,6 +15,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import json
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -26,9 +27,10 @@ from ..pricing import PricingCatalog
 from ..reference import load_effective_reference_catalog
 from ..reports import report_html, report_json, write_output
 from ..telemetry import TelemetryConfig, TelemetryWriter
+from ..telemetry.manifest import CollectionManifest, CollectionState, build_deployment_manifest
 from ..workloads import WorkloadMapping, canonical_workload_id, merge_identities, safe_account_scope
 from . import discovery
-from .configuration import safe_display_path
+from .configuration import atomic_write, safe_display_path
 from .models import (
     CollectionSummary,
     DeploymentOutcome,
@@ -323,6 +325,14 @@ def collect_deployments(
         run_dir=str(destination),
         run_id=run_id,
         accounts=[target.account for target in targets],
+        manifest=CollectionManifest(
+            run_id=run_id,
+            generated_at=started,
+            requested_start=window.start,
+            requested_end=window.end,
+            bucket_minutes=window.granularity_minutes,
+            expected_buckets_per_deployment=window.expected_buckets,
+        ),
     )
     order = [
         f"{target.account}/{item.name}"
@@ -349,7 +359,58 @@ def collect_deployments(
         for item in summary.outcomes
         if item.status == "succeeded" and item.pricing_status not in {"exact_public_rate", "customer_override"}
     ]
+    if summary.manifest is not None:
+        summary.manifest.deployments.sort(key=lambda item: item.deployment_ref)
+        summary.manifest.pages_read = sum(item.pages_read for item in summary.manifest.deployments)
+        summary.manifest.retries = sum(item.retries for item in summary.manifest.deployments)
+        manifest_path = destination / "collection-manifest.json"
+        atomic_write(
+            manifest_path,
+            json.dumps(summary.manifest.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
+            mode=0o600,
+        )
+        summary.manifest_file = safe_display_path(manifest_path)
     return summary
+
+
+def _append_deployment_manifest(
+    summary: CollectionSummary,
+    target: FoundryAccountTarget,
+    deployment: DeploymentRecord,
+    window: Any,
+    *,
+    state: CollectionState,
+    result: Any | None = None,
+    error_category: str | None = None,
+) -> None:
+    if summary.manifest is None:
+        raise WorkflowError("Collection manifest was not initialized for this run.")
+    summary.manifest.deployments.append(
+        build_deployment_manifest(
+            run_id=summary.run_id,
+            identity_scope=(
+                f"{target.subscription_id}\0{target.resource_group}\0{target.account}"
+            ),
+            deployment_name=deployment.name,
+            model_name=deployment.model or None,
+            model_version=deployment.model_version,
+            modality=deployment.modality,
+            usage_bases=deployment.supported_usage_bases,
+            capability_catalog_version=deployment.capability_catalog_version,
+            collection_state=state,
+            requested_start=window.start,
+            requested_end=window.end,
+            bucket_minutes=window.granularity_minutes,
+            records=result.records if result is not None else (),
+            requested_metrics=result.requested_metrics if result is not None else (),
+            missing_metrics=result.missing_metrics if result is not None else (),
+            unsupported_metrics=result.unsupported_metrics if result is not None else (),
+            pages_read=result.pages_read if result is not None else 0,
+            retries=result.retries if result is not None else 0,
+            identity_conflict_count=len(result.identity_conflicts) if result is not None else 0,
+            error_category=error_category,
+        )
+    )
 
 
 def _collect_account(
@@ -380,6 +441,14 @@ def _collect_account(
         for deployment in selected:
             if progress is not None:
                 progress(deployment.name, "failed")
+            _append_deployment_manifest(
+                summary,
+                target,
+                deployment,
+                window,
+                state="failed",
+                error_category=category,
+            )
             summary.outcomes.append(
                 DeploymentOutcome(
                     deployment=deployment.name,
@@ -394,7 +463,18 @@ def _collect_account(
         return
 
     inventory = [
-        {"name": item.name, "model": item.model, "model_version": item.model_version, "sku": item.sku}
+        {
+            "name": item.name,
+            "model": item.model,
+            "model_version": item.model_version,
+            "sku": item.sku,
+            "modality": item.modality,
+            "usage_bases": item.supported_usage_bases,
+            "commerce_type": item.commerce_type,
+            "ptu_eligible": item.ptu_eligible,
+            "capability_catalog_version": item.capability_catalog_version,
+            "capability_status": item.capability_status,
+        }
         for item in target.deployments
     ]
     # A deployment that disappeared from the account is reported explicitly
@@ -449,6 +529,15 @@ def _collect_account(
             results = list(pool.map(_collect_one, selected))
 
     for name in sorted(stale):
+        stale_deployment = next(item for item in target.deployments if item.name == name)
+        _append_deployment_manifest(
+            summary,
+            target,
+            stale_deployment,
+            window,
+            state="skipped",
+            error_category="deployment_not_found",
+        )
         summary.outcomes.append(
             DeploymentOutcome(
                 deployment=name,
@@ -470,6 +559,14 @@ def _collect_account(
         pricing_status = readiness_state.state if readiness_state else "identity_unresolved"
         if error is not None:
             category, message = _classify(error)
+            _append_deployment_manifest(
+                summary,
+                target,
+                deployment,
+                window,
+                state="failed",
+                error_category=category,
+            )
             summary.outcomes.append(
                 DeploymentOutcome(
                     deployment=deployment.name,
@@ -486,8 +583,19 @@ def _collect_account(
         try:
             before = writer.skipped_duplicates
             written = writer.write_all(result.records)
+            if writer.dropped_events:
+                raise OSError(writer.last_error or "One or more telemetry records could not be written.")
             duplicates = writer.skipped_duplicates - before
         except OSError:
+            _append_deployment_manifest(
+                summary,
+                target,
+                deployment,
+                window,
+                state="failed",
+                result=result,
+                error_category="file_write_failed",
+            )
             summary.outcomes.append(
                 DeploymentOutcome(
                     deployment=deployment.name,
@@ -501,6 +609,14 @@ def _collect_account(
                 )
             )
             continue
+        _append_deployment_manifest(
+            summary,
+            target,
+            deployment,
+            window,
+            state="succeeded",
+            result=result,
+        )
         tokens = sum(
             (record.metrics.input_tokens or 0) + (record.metrics.output_tokens or 0)
             for record in result.records

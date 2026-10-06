@@ -388,6 +388,14 @@ class WorkloadCostRollup(BaseModel):
     cached_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    input_tokens_state: Literal["measured", "partial", "unavailable"] = "unavailable"
+    cached_tokens_state: Literal["measured", "partial", "unavailable"] = "unavailable"
+    output_tokens_state: Literal["measured", "partial", "unavailable"] = "unavailable"
+    total_tokens_state: Literal["measured", "partial", "unavailable"] = "unavailable"
+    usage_records: int = 0
+    complete_usage_records: int = 0
+    modality: str = "unknown"
+    usage_bases: tuple[str, ...] = ()
     estimated_cost: float | None = None
     pricing_currency: str = "USD"
     priced_tokens: int = 0
@@ -510,14 +518,22 @@ class _Bucket:
         self.deployments: OrderedDict[str, None] = OrderedDict()
         self.models: OrderedDict[str, None] = OrderedDict()
         self.input_tokens = 0
+        self.input_seen = False
+        self.input_missing = False
         self.cached_tokens = 0
+        self.cached_seen = False
+        self.cached_missing = False
         self.output_tokens = 0
+        self.output_seen = False
+        self.output_missing = False
         self.priced_tokens = 0
         self.unpriced_tokens = 0
         self.identity_unresolved_tokens = 0
         self.cost = 0.0
         self.priced_records = 0
         self.total_records = 0
+        self.usage_records = 0
+        self.complete_usage_records = 0
         self.requests = 0
         self.requests_available = False
         self.request_metric_missing = False
@@ -525,6 +541,8 @@ class _Bucket:
         self.business_tokens = 0
         self.sources: OrderedDict[str, None] = OrderedDict()
         self.confidences: OrderedDict[str, None] = OrderedDict()
+        self.modalities: OrderedDict[str, None] = OrderedDict()
+        self.usage_bases: OrderedDict[str, None] = OrderedDict()
 
     def add(
         self,
@@ -534,12 +552,33 @@ class _Bucket:
         business_tagged: bool = False,
     ) -> None:
         usage = record.usage
-        tokens = usage.input_tokens + usage.output_tokens
+        input_tokens = usage.input_tokens
+        cached_tokens = usage.cached_tokens
+        output_tokens = usage.output_tokens
+        tokens = (input_tokens or 0) + (output_tokens or 0)
+        self.usage_records += 1
+        if input_tokens is not None and output_tokens is not None:
+            self.complete_usage_records += 1
         self.deployments.setdefault(record.deployment_name or "unknown", None)
         self.models.setdefault(record.model_name or "unknown", None)
-        self.input_tokens += usage.input_tokens
-        self.cached_tokens += usage.cached_tokens
-        self.output_tokens += usage.output_tokens
+        self.modalities.setdefault(record.modality, None)
+        for basis in record.usage_bases:
+            self.usage_bases.setdefault(basis, None)
+        if input_tokens is None:
+            self.input_missing = True
+        else:
+            self.input_seen = True
+            self.input_tokens += input_tokens
+        if cached_tokens is None:
+            self.cached_missing = True
+        else:
+            self.cached_seen = True
+            self.cached_tokens += cached_tokens
+        if output_tokens is None:
+            self.output_missing = True
+        else:
+            self.output_seen = True
+            self.output_tokens += output_tokens
         self.total_records += 1
         if business_tagged:
             self.business_tokens += tokens
@@ -562,8 +601,17 @@ class _Bucket:
             self.unpriced_tokens += tokens
 
     @property
-    def total_tokens(self) -> int:
+    def total_tokens(self) -> int | None:
+        if not self.input_seen and not self.output_seen:
+            return None
         return self.input_tokens + self.output_tokens
+
+    def metric_state(self, metric: str) -> str:
+        seen = getattr(self, f"{metric}_seen")
+        missing = getattr(self, f"{metric}_missing")
+        if not seen:
+            return "unavailable"
+        return "partial" if missing else "measured"
 
 
 def _rollup(
@@ -580,8 +628,24 @@ def _rollup(
     window_days: Sequence[date] = (),
 ) -> WorkloadCostRollup:
     total_tokens = bucket.total_tokens
-    coverage = round(bucket.priced_tokens / total_tokens * 100, 1) if total_tokens else 0.0
-    priced_complete = bucket.unpriced_tokens == 0 and bucket.priced_tokens > 0
+    known_tokens = total_tokens or 0
+    coverage = round(bucket.priced_tokens / known_tokens * 100, 1) if known_tokens else 0.0
+    input_state = bucket.metric_state("input")
+    cached_state = bucket.metric_state("cached")
+    output_state = bucket.metric_state("output")
+    total_state = (
+        "unavailable"
+        if input_state == output_state == "unavailable"
+        else "measured"
+        if input_state == output_state == "measured"
+        else "partial"
+    )
+    priced_complete = (
+        bucket.unpriced_tokens == 0
+        and bucket.priced_tokens > 0
+        and total_state == "measured"
+        and cached_state == "measured"
+    )
     requests = bucket.requests if bucket.requests_available and not bucket.request_metric_missing else None
     estimated_cost = round(bucket.cost, 6) if bucket.priced_records else None
     # A cost per request is only meaningful when both the denominator and the
@@ -605,10 +669,18 @@ def _rollup(
         deployments=list(bucket.deployments),
         models=list(bucket.models),
         requests=requests,
-        input_tokens=bucket.input_tokens,
-        cached_tokens=bucket.cached_tokens,
-        output_tokens=bucket.output_tokens,
+        input_tokens=bucket.input_tokens if bucket.input_seen else None,
+        cached_tokens=bucket.cached_tokens if bucket.cached_seen else None,
+        output_tokens=bucket.output_tokens if bucket.output_seen else None,
         total_tokens=total_tokens,
+        input_tokens_state=input_state,
+        cached_tokens_state=cached_state,
+        output_tokens_state=output_state,
+        total_tokens_state=total_state,
+        usage_records=bucket.usage_records,
+        complete_usage_records=bucket.complete_usage_records,
+        modality=next(iter(bucket.modalities)) if len(bucket.modalities) == 1 else "mixed",
+        usage_bases=tuple(bucket.usage_bases),
         estimated_cost=estimated_cost,
         pricing_currency=currency,
         priced_tokens=bucket.priced_tokens,
@@ -624,7 +696,7 @@ def _rollup(
             round(value, 6) if (value := _percentile(daily_values, 0.9)) is not None else None
         ),
         business_identity_coverage_percent=(
-            round(bucket.business_tokens / total_tokens * 100, 1) if total_tokens else 0.0
+           round(bucket.business_tokens / known_tokens * 100, 1) if known_tokens else 0.0
         ),
         identity_unresolved_tokens=bucket.identity_unresolved_tokens,
         daily_costs=[(day.isoformat(), round(value, 6)) for day, value in sorted(bucket.daily.items())],

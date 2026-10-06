@@ -341,6 +341,7 @@ def catalog_status(
     *,
     customer_catalog: PricingCatalog | None = None,
     include_claude: bool | None = None,
+    now: datetime | None = None,
 ) -> dict[str, object]:
     """Summarize which catalogs are available, without contacting the network.
 
@@ -390,7 +391,9 @@ def catalog_status(
         status["public-sync-excluded"] = (
             ", ".join(excluded) + " — currency differs; TokenLens never converts"
         )
-    status["public-sync-stale"] = "yes" if public_sync_needed(include_claude=include_claude) else "no"
+    status["public-sync-stale"] = (
+        "yes" if public_sync_needed(include_claude=include_claude, now=now) else "no"
+    )
     status["public-sync-sources"] = ", ".join(selected)
     status["resolution-order"] = "observed > customer > public sync > packaged > unresolved"
     return status

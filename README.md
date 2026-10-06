@@ -217,6 +217,11 @@ Collection uses Azure Resource Manager and Azure Monitor. Analysis runs locally.
 By default TokenLens does **not** collect prompts, responses, system messages,
 tool content, retrieved documents, credentials, user identities, or IP addresses.
 
+Request-content diagnostics use exact local tokenizer assets only when they are
+already cached. TokenLens never downloads tokenizer data during analysis. If an
+asset is missing, the report identifies the UTF-8 byte-based token heuristic as
+low-confidence; aggregate Azure Monitor token metrics remain source-reported.
+
 Local configuration, telemetry, reports, pricing overrides, and run state are
 excluded from Git. Reports omit local source paths and Azure subscription or
 tenant identifiers.

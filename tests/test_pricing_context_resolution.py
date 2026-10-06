@@ -62,7 +62,7 @@ def record(*, input_tokens: int, aggregate: bool = False, model: str = "gpt-5.6-
         "model_name": model,
         "deployment_mode": "global",
         "messages": [{"role": "user", "content": "synthetic"}],
-        "usage": {"input_tokens": input_tokens, "output_tokens": 100},
+        "usage": {"input_tokens": input_tokens, "cached_tokens": 0, "output_tokens": 100},
         "status_code": 200,
     }
     if aggregate:

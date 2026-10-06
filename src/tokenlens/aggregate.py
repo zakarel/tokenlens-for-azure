@@ -101,6 +101,14 @@ def _sum_optional(values: list[int | None]) -> int | None:
     return sum(present) if present else None
 
 
+def _measurement_state(values: list[int | None]) -> Literal["measured", "partial", "unavailable"]:
+    if not values or all(value is None for value in values):
+        return "unavailable"
+    if any(value is None for value in values):
+        return "partial"
+    return "measured"
+
+
 def aggregate_summary(records: list[TraceRecord]) -> AggregateAnalysisSummary:
     """Summarize aggregate buckets without ever treating a bucket as a request."""
     buckets = [record for record in records if telemetry_kind(record) == "aggregate"]
@@ -157,15 +165,14 @@ def aggregate_summary(records: list[TraceRecord]) -> AggregateAnalysisSummary:
         span = (max(stamps) - min(stamps)).total_seconds()
         expected = int(span // (bucket_minutes * 60)) + 1
 
-    if window_start and window_end:
-        observed_days = max(0.0, (window_end - window_start).total_seconds() / 86_400)
-    elif stamps:
-        observed_days = max(
-            bucket_minutes / 1440,
-            ((max(stamps) - min(stamps)) + timedelta(minutes=bucket_minutes)).total_seconds() / 86_400,
-        )
-    else:
-        observed_days = 0.0
+    requested_days = (
+        max(0.0, (window_end - window_start).total_seconds() / 86_400)
+        if window_start and window_end
+        else 0.0
+    )
+    returned_start = min(stamps) if stamps else None
+    returned_end = max(stamps) + timedelta(minutes=bucket_minutes) if stamps else None
+    observed_days = float(len({stamp.date() for stamp in stamps}))
 
     outcome_coverage: Literal["complete", "partial", "unavailable"]
     if coverage_states == {"complete"} and buckets:
@@ -178,6 +185,19 @@ def aggregate_summary(records: list[TraceRecord]) -> AggregateAnalysisSummary:
         outcome_coverage = "unavailable"
 
     requests_observed = _sum_optional(requests)
+    input_tokens = _sum_optional(inputs)
+    cached_tokens = _sum_optional(cached)
+    output_tokens = _sum_optional(outputs)
+    input_state = _measurement_state(inputs)
+    cached_state = _measurement_state(cached)
+    output_state = _measurement_state(outputs)
+    token_state: Literal["measured", "partial", "unavailable", "not_applicable"]
+    if input_state == output_state == "unavailable":
+        token_state = "unavailable"
+    elif input_state == output_state == "measured":
+        token_state = "measured"
+    else:
+        token_state = "partial"
     return AggregateAnalysisSummary(
         metric_buckets_read=len(buckets),
         elapsed_buckets=expected,
@@ -190,15 +210,22 @@ def aggregate_summary(records: list[TraceRecord]) -> AggregateAnalysisSummary:
         failed_requests=_sum_optional(failed) if outcome_coverage != "unavailable" else None,
         outcome_coverage=outcome_coverage,
         status_codes=dict(sorted(status_codes.items())),
-        input_tokens=_sum_optional(inputs),
-        cached_tokens=_sum_optional(cached),
-        output_tokens=_sum_optional(outputs),
+        input_tokens=input_tokens,
+        cached_tokens=cached_tokens,
+        output_tokens=output_tokens,
         latency_coverage_percent=round(latency_reported / len(buckets) * 100, 1) if buckets else 0.0,
         bucket_minutes=bucket_minutes,
         window_start=window_start or (min(stamps) if stamps else None),
         window_end=window_end or ((max(stamps) + timedelta(minutes=bucket_minutes)) if stamps else None),
+        requested_days=round(requested_days, 2),
+        returned_start=returned_start,
+        returned_end=returned_end,
         observed_days=round(observed_days, 2),
         active_days=len(active_days),
+        input_tokens_state=input_state,
+        cached_tokens_state=cached_state,
+        output_tokens_state=output_state,
+        total_tokens_state=token_state,
         missing_metrics=sorted(missing),
     )
 

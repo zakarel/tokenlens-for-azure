@@ -145,7 +145,7 @@ def test_the_wizard_syncs_when_the_cache_is_absent(cache, monkeypatch):
         "sync_public_pricing",
         lambda **kwargs: real(**{**kwargs, "transport": _transport}),
     )
-    lines = sync_public_pricing_if_needed(ScriptedPrompter([]), _config())
+    lines = sync_public_pricing_if_needed(ScriptedPrompter([]), _config(), now=NOW)
     assert any("azure_retail_prices: synchronized" in line for line in lines)
     assert any("claude_pricing_docs: synchronized" in line for line in lines)
     for path in public_snapshot_paths().values():
@@ -159,7 +159,7 @@ def test_the_wizard_skips_the_sync_when_the_cache_is_current(synced, monkeypatch
         raise AssertionError("a current cache must not trigger a network request")
 
     monkeypatch.setattr("tokenlens.pricing_sources.sync.sync_public_pricing", forbidden)
-    lines = sync_public_pricing_if_needed(ScriptedPrompter([]), _config())
+    lines = sync_public_pricing_if_needed(ScriptedPrompter([]), _config(), now=NOW)
     assert lines == ["Cached official pricing snapshot is current; no network request was made."]
 
 
@@ -177,7 +177,7 @@ def test_a_sync_failure_never_stops_the_assessment(cache, monkeypatch):
         "sync_public_pricing",
         lambda **kwargs: real(**{**kwargs, "transport": broken}),
     )
-    lines = sync_public_pricing_if_needed(ScriptedPrompter([]), _config())
+    lines = sync_public_pricing_if_needed(ScriptedPrompter([]), _config(), now=NOW)
     assert any("not synchronized" in line for line in lines)
     assert any("packaged catalog and customer rates still apply" in line for line in lines)
     # Readiness still works offline against the packaged catalog.
@@ -192,7 +192,7 @@ def test_an_unexpected_sync_error_is_absorbed(cache, monkeypatch):
         raise RuntimeError("unexpected")
 
     monkeypatch.setattr(sync_module, "sync_public_pricing", explode)
-    lines = sync_public_pricing_if_needed(ScriptedPrompter([]), _config())
+    lines = sync_public_pricing_if_needed(ScriptedPrompter([]), _config(), now=NOW)
     assert lines == [
         "Official pricing synchronization failed (RuntimeError). The assessment continues "
         "with the packaged catalog and any customer rates."
@@ -201,11 +201,13 @@ def test_an_unexpected_sync_error_is_absorbed(cache, monkeypatch):
 
 def test_the_sync_can_be_disabled_by_configuration_and_by_environment(cache, monkeypatch):
     monkeypatch.delenv("TOKENLENS_NO_PRICING_SYNC", raising=False)
-    lines = sync_public_pricing_if_needed(ScriptedPrompter([]), _config(public_cache=False))
+    lines = sync_public_pricing_if_needed(
+        ScriptedPrompter([]), _config(public_cache=False), now=NOW
+    )
     assert lines == ["Public pricing synchronization is disabled in .tokenlens.yml (pricing.public_cache)."]
 
     monkeypatch.setenv("TOKENLENS_NO_PRICING_SYNC", "1")
-    lines = sync_public_pricing_if_needed(ScriptedPrompter([]), _config())
+    lines = sync_public_pricing_if_needed(ScriptedPrompter([]), _config(), now=NOW)
     assert lines == ["Public pricing synchronization is disabled (TOKENLENS_NO_PRICING_SYNC)."]
 
 
@@ -329,12 +331,12 @@ def test_the_requested_source_set_is_persisted_and_reused(cache):
     assert requested_sources() == ["azure_retail_prices"]
     # With nothing explicit, freshness follows what was actually synchronized.
     assert public_sync_needed(now=NOW) is False
-    assert catalog_status()["public-sync-stale"] == "no"
-    assert catalog_status()["claude-pricing-docs-requested"] == "no"
+    assert catalog_status(now=NOW)["public-sync-stale"] == "no"
+    assert catalog_status(now=NOW)["claude-pricing-docs-requested"] == "no"
 
     sync_public_pricing(include_claude=True, transport=_transport, now=NOW)
     assert requested_sources() == ["azure_retail_prices", "claude_pricing_docs"]
-    assert catalog_status()["claude-pricing-docs-requested"] == "yes"
+    assert catalog_status(now=NOW)["claude-pricing-docs-requested"] == "yes"
 
 
 def test_with_no_recorded_selection_both_sources_are_assumed(cache):
@@ -352,7 +354,7 @@ def test_the_wizard_only_requires_claude_when_a_claude_deployment_is_selected(ca
 
     monkeypatch.setattr("tokenlens.pricing_sources.sync.sync_public_pricing", forbidden)
     lines = sync_public_pricing_if_needed(
-        ScriptedPrompter([]), _config(deployments=no_claude)
+        ScriptedPrompter([]), _config(deployments=no_claude), now=NOW
     )
     assert lines == ["Cached official pricing snapshot is current; no network request was made."]
 
@@ -444,7 +446,7 @@ def test_claude_modes_are_derived_only_from_claude_deployments(cache, monkeypatc
         return real(**{**kwargs, "transport": _transport})
 
     monkeypatch.setattr(sync_module, "sync_public_pricing", spy)
-    sync_public_pricing_if_needed(ScriptedPrompter([]), _config(deployments=mixed))
+    sync_public_pricing_if_needed(ScriptedPrompter([]), _config(deployments=mixed), now=NOW)
 
     assert captured["claude_deployment_modes"] == ["global"]
     # The retail side still sees both modes it was asked for.
@@ -474,7 +476,7 @@ def test_a_claude_data_zone_deployment_drives_the_data_zone_rate(cache, monkeypa
         return real(**{**kwargs, "transport": _transport})
 
     monkeypatch.setattr(sync_module, "sync_public_pricing", spy)
-    sync_public_pricing_if_needed(ScriptedPrompter([]), _config(deployments=dz_claude))
+    sync_public_pricing_if_needed(ScriptedPrompter([]), _config(deployments=dz_claude), now=NOW)
     assert captured["claude_deployment_modes"] == ["data_zone"]
     opus = next(
         item
@@ -497,6 +499,6 @@ def test_a_portfolio_with_no_claude_deployment_passes_no_claude_modes(cache, mon
 
     monkeypatch.setattr(sync_module, "sync_public_pricing", spy)
     no_claude = [item for item in DEPLOYMENTS if item.publisher != "anthropic"]
-    sync_public_pricing_if_needed(ScriptedPrompter([]), _config(deployments=no_claude))
+    sync_public_pricing_if_needed(ScriptedPrompter([]), _config(deployments=no_claude), now=NOW)
     assert captured["include_claude"] is False
     assert captured["claude_deployment_modes"] is None

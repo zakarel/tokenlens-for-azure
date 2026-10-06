@@ -27,14 +27,20 @@ class ModelRollup:
     elapsed_buckets: int
     cached_tokens_available: bool
     pricing_status: str
-    input_tokens: int
-    output_tokens: int
-    cached_tokens: int
-    total_tokens: int
+    input_tokens: int | None
+    output_tokens: int | None
+    cached_tokens: int | None
+    total_tokens: int | None
+    input_tokens_state: str
+    output_tokens_state: str
+    cached_tokens_state: str
+    total_tokens_state: str
+    modality: str
+    usage_bases: tuple[str, ...]
     retries: int
     addressable_min_tokens: int
     addressable_max_tokens: int
-    token_share_percent: float
+    token_share_percent: float | None
     deployment_mode: str
     service_tier: str
     estimated_cost_usd: float | None
@@ -74,15 +80,25 @@ class DeploymentRollup:
     pricing_status: str
     window_start: str | None
     window_end: str | None
+    requested_days: float
+    observed_days: float
+    returned_start: str | None
+    returned_end: str | None
     active_days: int
-    input_tokens: int
-    output_tokens: int
-    cached_tokens: int
-    total_tokens: int
+    input_tokens: int | None
+    output_tokens: int | None
+    cached_tokens: int | None
+    total_tokens: int | None
+    input_tokens_state: str
+    output_tokens_state: str
+    cached_tokens_state: str
+    total_tokens_state: str
+    modality: str
+    usage_bases: tuple[str, ...]
     retries: int
     addressable_min_tokens: int
     addressable_max_tokens: int
-    token_share_percent: float
+    token_share_percent: float | None
     average_tokens_per_request: float | None
     deployment_mode: str
     service_tier: str
@@ -210,15 +226,29 @@ def _deployment_rollup(deployment: DeploymentAnalysis, portfolio_total: int) -> 
         pricing_status=summary.pricing_status,
         window_start=aggregate.window_start.isoformat() if aggregate and aggregate.window_start else None,
         window_end=aggregate.window_end.isoformat() if aggregate and aggregate.window_end else None,
+        requested_days=aggregate.requested_days if aggregate else 0.0,
+        observed_days=aggregate.observed_days if aggregate else 0.0,
+        returned_start=aggregate.returned_start.isoformat() if aggregate and aggregate.returned_start else None,
+        returned_end=aggregate.returned_end.isoformat() if aggregate and aggregate.returned_end else None,
         active_days=aggregate.active_days if aggregate else 0,
         input_tokens=summary.input_tokens,
         output_tokens=summary.output_tokens,
         cached_tokens=summary.cached_tokens,
         total_tokens=summary.total_tokens,
+        input_tokens_state=summary.input_tokens_state,
+        output_tokens_state=summary.output_tokens_state,
+        cached_tokens_state=summary.cached_tokens_state,
+        total_tokens_state=summary.total_tokens_state,
+        modality=summary.modality,
+        usage_bases=summary.usage_bases,
         retries=summary.retries,
         addressable_min_tokens=summary.addressable_min_tokens,
         addressable_max_tokens=summary.addressable_max_tokens,
-        token_share_percent=round(summary.total_tokens / max(1, portfolio_total) * 100, 1),
+        token_share_percent=(
+            round(summary.total_tokens / max(1, portfolio_total) * 100, 1)
+            if summary.total_tokens is not None and portfolio_total > 0
+            else None
+        ),
         average_tokens_per_request=summary.average_tokens_per_request,
         deployment_mode=summary.deployment_mode,
         service_tier=summary.service_tier,
@@ -240,15 +270,23 @@ def _deployment_rollup(deployment: DeploymentAnalysis, portfolio_total: int) -> 
 
 
 def deployment_rollups(report: AnalysisReport) -> list[DeploymentRollup]:
-    total = report.summary.total_tokens
+    total = report.summary.total_tokens or 0
     return sorted(
         [_deployment_rollup(item, total) for item in report.deployments],
-        key=lambda item: (-item.total_tokens, item.deployment_name.casefold()),
+        key=lambda item: (-(item.total_tokens or 0), item.deployment_name.casefold()),
     )
 
 
+def _merge_measurement_state(current: str, incoming: str) -> str:
+    if current == incoming:
+        return current
+    if current == "unavailable" and incoming == "unavailable":
+        return "unavailable"
+    return "partial"
+
+
 def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
-    total = report.summary.total_tokens
+    total = report.summary.total_tokens or 0
     grouped: OrderedDict[tuple[str, str, str], dict[str, object]] = OrderedDict()
     for deployment in report.deployments:
         item = _deployment_rollup(deployment, total)
@@ -270,6 +308,16 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
                 "output_tokens": 0,
                 "cached_tokens": 0,
                 "total_tokens": 0,
+                "input_tokens_present": False,
+                "output_tokens_present": False,
+                "cached_tokens_present": False,
+                "total_tokens_present": False,
+                "input_tokens_state": item.input_tokens_state,
+                "output_tokens_state": item.output_tokens_state,
+                "cached_tokens_state": item.cached_tokens_state,
+                "total_tokens_state": item.total_tokens_state,
+                "modality": item.modality,
+                "usage_bases": set(item.usage_bases),
                 "retries": 0,
                 "addressable_min_tokens": 0,
                 "addressable_max_tokens": 0,
@@ -290,10 +338,6 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
             },
         )
         for key in (
-            "input_tokens",
-            "output_tokens",
-            "cached_tokens",
-            "total_tokens",
             "retries",
             "addressable_min_tokens",
             "addressable_max_tokens",
@@ -301,6 +345,18 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
             "unresolved_tokens",
         ):
             current[key] = int(current[key]) + int(getattr(item, key))
+        for key in ("input_tokens", "output_tokens", "cached_tokens", "total_tokens"):
+            value = getattr(item, key)
+            if value is not None:
+                current[key] = int(current[key]) + value
+                current[f"{key}_present"] = True
+            state_key = f"{key}_state"
+            current[state_key] = _merge_measurement_state(
+                str(current[state_key]), getattr(item, state_key)
+            )
+        current["usage_bases"] = set(current["usage_bases"]) | set(item.usage_bases)
+        if str(current["modality"]) != item.modality:
+            current["modality"] = "mixed"
         # An unavailable request metric stays unavailable for the whole model
         # rollup rather than being summed as if it were zero.
         if item.requests is not None:
@@ -336,11 +392,15 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
                 requests=int(values["requests"]) if values["requests_available"] else None,
                 active_buckets=int(values["active_buckets"]),
                 elapsed_buckets=int(values["elapsed_buckets"]),
-                cached_tokens_available=bool(values["cached_tokens_available"]),
+                cached_tokens_available=values["cached_tokens_state"] != "unavailable",
                 pricing_status=str(values["pricing_status"]),
                 deployment_mode=str(values["deployment_mode"]),
                 service_tier=str(values["service_tier"]),
-                token_share_percent=round(int(values["total_tokens"]) / max(1, total) * 100, 1),
+                token_share_percent=(
+                    round(int(values["total_tokens"]) / max(1, total) * 100, 1)
+                    if values["total_tokens_present"] and total > 0
+                    else None
+                ),
                 estimated_cost_usd=(
                     float(values["estimated_cost_usd"]) if int(values["priced_requests"]) else None
                 ),
@@ -363,11 +423,21 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
                 pricing_confidence=values["pricing_confidence"],  # type: ignore[arg-type]
                 unresolved_reasons=sorted(values["unresolved_reasons"]),  # type: ignore[arg-type]
                 suggested_override_keys=sorted(values["suggested_override_keys"]),  # type: ignore[arg-type]
+                **{
+                    name: (
+                        int(values[name])
+                        if values.get(f"{name}_present", False)
+                        else None
+                    )
+                    for name in ("input_tokens", "output_tokens", "cached_tokens", "total_tokens")
+                },
+                input_tokens_state=str(values["input_tokens_state"]),
+                output_tokens_state=str(values["output_tokens_state"]),
+                cached_tokens_state=str(values["cached_tokens_state"]),
+                total_tokens_state=str(values["total_tokens_state"]),
+                modality=str(values["modality"]),
+                usage_bases=tuple(sorted(values["usage_bases"])),
                 **{name: int(values[name]) for name in (
-                    "input_tokens",
-                    "output_tokens",
-                    "cached_tokens",
-                    "total_tokens",
                     "retries",
                     "addressable_min_tokens",
                     "addressable_max_tokens",
@@ -377,7 +447,7 @@ def model_rollups(report: AnalysisReport) -> list[ModelRollup]:
             )
             for key, values in grouped.items()
         ],
-        key=lambda item: (-item.total_tokens, item.model_name.casefold()),
+        key=lambda item: (-(item.total_tokens or 0), item.model_name.casefold()),
     )
 
 

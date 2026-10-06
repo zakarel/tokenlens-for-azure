@@ -31,6 +31,14 @@ from .presentation import (
 )
 
 
+def _format_optional(value: int | float | None, unit: str) -> str:
+    return f"Unavailable {unit}" if value is None else f"{value:,} {unit}"
+
+
+def _format_optional_percent(value: float | None) -> str:
+    return "Unavailable share" if value is None else f"{value:.1f}%"
+
+
 def _without_internal(value: object) -> object:
     if isinstance(value, dict):
         return {key: _without_internal(item) for key, item in value.items() if key != "confidence"}
@@ -160,22 +168,34 @@ def _requests_sub(summary) -> str:
     return f"{summary.retries:,} retries observed" if summary.retries_available else "Retries unavailable"
 
 
+def _token_measurement(value: int | None, state: str) -> str:
+    if value is None or state == "unavailable":
+        return "Unavailable"
+    return f"{value:,} partial" if state == "partial" else f"{value:,}"
+
+
 def _tokens_sub(summary) -> str:
     cached = (
-        f"{summary.cached_tokens:,} cached"
-        if summary.cached_tokens_available
-        else "cached metric unavailable"
+        "cached metric unavailable"
+        if summary.cached_tokens_state == "unavailable"
+        else f"{_token_measurement(summary.cached_tokens, summary.cached_tokens_state)} cached"
     )
-    fresh = f"{summary.input_tokens:,} input" if summary.input_tokens_available else "input metric unavailable"
-    output = f"{summary.output_tokens:,} output" if summary.output_tokens_available else "output metric unavailable"
+    fresh = (
+        "input metric unavailable"
+        if summary.input_tokens_state == "unavailable"
+        else f"{_token_measurement(summary.input_tokens, summary.input_tokens_state)} input"
+    )
+    output = (
+        "output metric unavailable"
+        if summary.output_tokens_state == "unavailable"
+        else f"{_token_measurement(summary.output_tokens, summary.output_tokens_state)} output"
+    )
     return f"{fresh} · {cached} · {output}"
 
 
 def _total_tokens_value(summary) -> str:
-    """A total is only a total when every component was actually reported."""
-    if summary.input_tokens_available and summary.output_tokens_available:
-        return f"{summary.total_tokens:,}"
-    return f"{summary.total_tokens:,} partial"
+    """Render unavailable and incomplete totals without manufacturing a zero."""
+    return _token_measurement(summary.total_tokens, summary.total_tokens_state)
 
 
 _PRICING_STATUS_COPY = {
@@ -292,15 +312,15 @@ def _deployment_rows(report: AnalysisReport) -> str:
         item = rollups[0]
         requests = f"{item.requests:,}" if item.requests is not None else "Unavailable"
         window = _window_text(item)
-        cached = f"{item.cached_tokens:,}" if item.cached_tokens_available else "Metric unavailable"
+        cached = _token_measurement(item.cached_tokens, item.cached_tokens_state)
         return f"""<div class="single-usage">
           <div><strong>{_escape(_display_name(item.deployment_name, unknown="Unknown deployment"))}</strong>
-            <small>{_escape(_model_label(item))} · {_escape(item.deployment_mode.title())}</small></div>
+            <small>{_escape(_model_label(item))} · {_escape(item.modality.replace("_", " "))} · {_escape(item.deployment_mode.title())}</small></div>
           <dl class="single-usage-grid">
-            <div><dt>Total tokens</dt><dd>{item.total_tokens:,}</dd></div>
-            <div><dt>Input</dt><dd>{item.input_tokens:,}</dd></div>
+            <div><dt>Total tokens</dt><dd>{_escape(_token_measurement(item.total_tokens, item.total_tokens_state))}</dd></div>
+            <div><dt>Input</dt><dd>{_escape(_token_measurement(item.input_tokens, item.input_tokens_state))}</dd></div>
             <div><dt>Cached input</dt><dd>{_escape(cached)}</dd></div>
-            <div><dt>Output</dt><dd>{item.output_tokens:,}</dd></div>
+            <div><dt>Output</dt><dd>{_escape(_token_measurement(item.output_tokens, item.output_tokens_state))}</dd></div>
             <div><dt>Requests</dt><dd>{_escape(requests)}</dd></div>
             <div><dt>Observed window</dt><dd>{_escape(window)}</dd></div>
           </dl></div>"""
@@ -309,11 +329,21 @@ def _deployment_rows(report: AnalysisReport) -> str:
         name = _display_name(item.deployment_name, unknown="Unknown deployment")
         model = _display_name(item.model_name, unknown="Unknown model")
         volume = f"{item.requests:,} requests" if item.requests is not None else f"{item.active_buckets:,} active buckets"
+        total_text = _token_measurement(item.total_tokens, item.total_tokens_state)
+        share_text = f"{item.token_share_percent:.1f}%" if item.token_share_percent is not None else "Unavailable share"
+        if item.total_tokens is None:
+            bar = '<div class="portfolio-bar" role="img" aria-label="Token usage unavailable"><span style="width:0%"></span></div>'
+        else:
+            label = chart_label(name, item.total_tokens, item.token_share_percent or 0)
+            bar = (
+                f'<div class="portfolio-bar" role="img" aria-label="{_escape(label)}">'
+                f'<span style="width:{max(1, item.token_share_percent or 0)}%"></span></div>'
+            )
         rows.append(
             f"""<div class="portfolio-row">
-              <div><strong>{_escape(name)}</strong><small>{_escape(model)}</small></div>
-              <div class="portfolio-bar" role="img" aria-label="{_escape(chart_label(name, item.total_tokens, item.token_share_percent))}"><span style="width:{max(1, item.token_share_percent)}%"></span></div>
-              <div class="portfolio-value"><strong>{item.total_tokens:,}</strong><small>{item.token_share_percent:.1f}% · {_escape(volume)}</small></div>
+              <div><strong>{_escape(name)}</strong><small>{_escape(model)} · {_escape(item.modality.replace("_", " "))}</small></div>
+              {bar}
+              <div class="portfolio-value"><strong>{_escape(total_text)}</strong><small>{_escape(share_text)} · {_escape(volume)}</small></div>
             </div>"""
         )
     return "".join(rows)
@@ -329,14 +359,13 @@ def _window_text(item) -> str:
     start, end = getattr(item, "window_start", None), getattr(item, "window_end", None)
     if not start or not end:
         return "Not reported by source"
-    try:
-        first = datetime.fromisoformat(start)
-        last = datetime.fromisoformat(end)
-    except ValueError:
-        return "Not reported by source"
-    days = max(1, round((last - first).total_seconds() / 86_400))
+    requested = getattr(item, "requested_days", 0)
+    observed = getattr(item, "observed_days", 0)
     active = getattr(item, "active_days", 0)
-    return f"{days} day(s) · {active} active day(s)"
+    return (
+        f"{requested:g} day(s) requested · {observed:g} day(s) returned · "
+        f"{active} active day(s)"
+    )
 
 
 def _overview_actions(findings: list[Finding], report: AnalysisReport) -> str:
@@ -378,7 +407,11 @@ def _diagnostic_sections(report: AnalysisReport) -> str:
         if item.rule_id not in material
     ]
 
-    denominator = f"{report.summary.input_tokens:,} input tokens"
+    denominator = (
+        f"{report.summary.input_tokens:,} input tokens"
+        if report.summary.input_tokens is not None
+        else "Unavailable input tokens"
+    )
     finding_cards = _finding_cards(
         [findings_by_rule[item.rule_id] for item in evaluated],
         empty=_no_findings_message(report),
@@ -421,12 +454,25 @@ def _composition_card(report: AnalysisReport) -> str:
     summary = report.summary
     models = model_rollups(report)
     item = models[0] if models else None
-    cached_label = f"{summary.cached_tokens:,}" if summary.cached_tokens_available else "Metric unavailable"
-    parts = [
-        ("Input (uncached)", max(0, summary.input_tokens - (summary.cached_tokens if summary.cached_tokens_available else 0)), "#73c7ff"),
-        ("Cached input", summary.cached_tokens if summary.cached_tokens_available else 0, "#ffc857"),
-        ("Output", summary.output_tokens, "#57d68b"),
-    ]
+    parts: list[tuple[str, int, str]] = []
+    if summary.input_tokens is not None:
+        if summary.cached_tokens is not None:
+            parts.extend(
+                [
+                    (
+                        "Input (uncached)",
+                        max(0, summary.input_tokens - summary.cached_tokens),
+                        "#73c7ff",
+                    ),
+                    ("Cached input", summary.cached_tokens, "#ffc857"),
+                ]
+            )
+        else:
+            parts.append(("Input (cache split unavailable)", summary.input_tokens, "#73c7ff"))
+    elif summary.cached_tokens is not None:
+        parts.append(("Cached input", summary.cached_tokens, "#ffc857"))
+    if summary.output_tokens is not None:
+        parts.append(("Output", summary.output_tokens, "#57d68b"))
     total = max(1, sum(value for _, value, _ in parts))
     bars = "".join(
         f'<div class="bar-row"><span>{_escape(label)}</span>'
@@ -435,28 +481,33 @@ def _composition_card(report: AnalysisReport) -> str:
         for label, value, color in parts
     )
     name = _escape(_model_label(item)) if item else "Unknown model"
+    composition = _tokens_sub(summary)
     return f"""<article class="chart-card"><h2>Token composition</h2>
       <p>One model is in scope, so composition replaces a single-slice share chart.</p>
-      <div class="composition" role="img" aria-label="Token composition for {name}: {summary.input_tokens:,} input, {_escape(cached_label)} cached, {summary.output_tokens:,} output">{bars}</div>
+      <div class="composition" role="img" aria-label="Token composition for {name}: {_escape(composition)}">{bars or '<p class="empty">No compatible token metrics were reported.</p>'}</div>
       <div class="table-scroll"><table class="data-table"><caption>Token composition for {name}</caption>
       <thead><tr><th scope="col">Component</th><th scope="col">Tokens</th></tr></thead>
-      <tbody><tr><th scope="row">Input</th><td>{summary.input_tokens:,}</td></tr>
-      <tr><th scope="row">Cached input</th><td>{_escape(cached_label)}</td></tr>
-      <tr><th scope="row">Output</th><td>{summary.output_tokens:,}</td></tr>
-      <tr><th scope="row">Total</th><td>{summary.total_tokens:,}</td></tr></tbody></table></div></article>"""
+      <tbody><tr><th scope="row">Input</th><td>{_escape(_token_measurement(summary.input_tokens, summary.input_tokens_state))}</td></tr>
+      <tr><th scope="row">Cached input</th><td>{_escape(_token_measurement(summary.cached_tokens, summary.cached_tokens_state))}</td></tr>
+      <tr><th scope="row">Output</th><td>{_escape(_token_measurement(summary.output_tokens, summary.output_tokens_state))}</td></tr>
+      <tr><th scope="row">Total</th><td>{_escape(_token_measurement(summary.total_tokens, summary.total_tokens_state))}</td></tr></tbody></table></div></article>"""
 
 
 def _donut_chart(report: AnalysisReport) -> tuple[str, str]:
     models = model_rollups(report)
-    total = max(1, report.summary.total_tokens)
+    measured_models = [item for item in models if item.total_tokens is not None]
+    total = sum(item.total_tokens or 0 for item in measured_models)
     colors = ["#73c7ff", "#57d68b", "#ffc857", "#ff8fa3", "#b9a7ff", "#5eead4", "#f4a261"]
     radius, circumference = 76, 2 * math.pi * 76
     offset = 0.0
     segments = []
-    for index, item in enumerate(models):
+    for index, item in enumerate(measured_models):
+        if not total or not item.total_tokens:
+            continue
         fraction = item.total_tokens / total
         length = circumference * fraction
-        label = chart_label(item.model_name, item.total_tokens, item.token_share_percent)
+        share = item.token_share_percent or 0
+        label = chart_label(item.model_name, item.total_tokens, share)
         color = colors[index % len(colors)]
         segments.append(
             f'<circle class="donut-segment" cx="100" cy="100" r="{radius}" style="fill:none;stroke:{color};stroke-width:28" '
@@ -464,19 +515,27 @@ def _donut_chart(report: AnalysisReport) -> tuple[str, str]:
             f'stroke-dashoffset="{-offset:.4f}" tabindex="0" aria-label="{_escape(label)}"><title>{_escape(label)}</title></circle>'
         )
         offset += length
+    unavailable_count = len(models) - len(measured_models)
+    token_label = f"{total:,}" if measured_models else "Unavailable"
+    excluded_note = (
+        f" {unavailable_count} model(s) with unavailable token metrics are excluded."
+        if unavailable_count
+        else ""
+    )
     svg = f"""<svg class="donut" viewBox="0 0 200 200" role="img" aria-labelledby="donut-title donut-desc">
       <title id="donut-title">Token share by model</title>
-      <desc id="donut-desc">Each segment represents a model's share of {report.summary.total_tokens:,} portfolio tokens.</desc>
+      <desc id="donut-desc">Each segment represents a model's share of {token_label} measured portfolio tokens.{excluded_note}</desc>
       <circle class="donut-track" cx="100" cy="100" r="{radius}" style="fill:none;stroke:#294365;stroke-width:28"></circle>
       <g transform="rotate(-90 100 100)">{''.join(segments)}</g>
-      <text x="100" y="96" text-anchor="middle" class="donut-total">{report.summary.total_tokens:,}</text>
+      <text x="100" y="96" text-anchor="middle" class="donut-total">{token_label}</text>
       <text x="100" y="113" text-anchor="middle" class="donut-label">total tokens</text>
     </svg>"""
     # The donut's own text alternative stays compact; the full model summary is
     # a separate panel, so the same table is never rendered twice.
     rows = "".join(
-        f'<tr><th scope="row">{_escape(_model_label(item))}</th><td>{item.total_tokens:,}</td>'
-        f"<td>{item.token_share_percent:.1f}%</td></tr>"
+        f'<tr><th scope="row">{_escape(_model_label(item))}</th>'
+        f'<td>{_escape(_token_measurement(item.total_tokens, item.total_tokens_state))}</td>'
+        f'<td>{f"{item.token_share_percent:.1f}%" if item.token_share_percent is not None else "Unavailable"}</td></tr>'
         for item in models
     )
     table = f"""<div class="table-scroll"><table class="data-table"><caption>Token share by model</caption>
@@ -487,7 +546,7 @@ def _donut_chart(report: AnalysisReport) -> tuple[str, str]:
 
 def _column_chart(report: AnalysisReport) -> tuple[str, str]:
     deployments = deployment_rollups(report)
-    max_total = max((item.total_tokens for item in deployments), default=1)
+    max_total = max((item.total_tokens or 0 for item in deployments), default=1) or 1
     width, height, chart_top, chart_bottom = 760, 300, 22, 220
     plot_height = chart_bottom - chart_top
     count = max(1, len(deployments))
@@ -505,12 +564,22 @@ def _column_chart(report: AnalysisReport) -> tuple[str, str]:
         # reconciled with the report's total token count.
         # Cached input is a subset of input. When the metric is unavailable it is
         # omitted entirely rather than drawn as a zero-height segment.
-        cached_value = item.cached_tokens if item.cached_tokens_available else 0
-        parts = [
-            ("input", max(0, item.input_tokens - cached_value)),
-            ("output", item.output_tokens),
-            ("cached", cached_value),
-        ]
+        cached_value = item.cached_tokens if item.cached_tokens is not None else None
+        parts: list[tuple[str, int]] = []
+        if item.input_tokens is not None:
+            if cached_value is None:
+                parts.append(("input", item.input_tokens))
+            else:
+                parts.extend(
+                    [
+                        ("input", max(0, item.input_tokens - cached_value)),
+                        ("cached", cached_value),
+                    ]
+                )
+        elif cached_value is not None:
+            parts.append(("cached", cached_value))
+        if item.output_tokens is not None:
+            parts.append(("output", item.output_tokens))
         for key, value in parts:
             if not value:
                 continue
@@ -523,15 +592,18 @@ def _column_chart(report: AnalysisReport) -> tuple[str, str]:
             )
         label = item.deployment_name
         rows.append(
-            f'<tr><th scope="row">{_escape(label)}</th><td>{_escape(item.model_name)}</td><td>{item.input_tokens:,}</td>'
-            f'<td>{item.output_tokens:,}</td><td>{_escape(f"{item.cached_tokens:,}" if item.cached_tokens_available else "Unavailable")}</td><td>{item.total_tokens:,}</td>'
+            f'<tr><th scope="row">{_escape(label)}</th><td>{_escape(item.model_name)}</td>'
+            f'<td>{_escape(_token_measurement(item.input_tokens, item.input_tokens_state))}</td>'
+            f'<td>{_escape(_token_measurement(item.output_tokens, item.output_tokens_state))}</td>'
+            f'<td>{_escape(_token_measurement(item.cached_tokens, item.cached_tokens_state))}</td>'
+            f'<td>{_escape(_token_measurement(item.total_tokens, item.total_tokens_state))}</td>'
             f'<td>{_escape(_money(item.estimated_cost_usd, currency=item.pricing_currency))}</td></tr>'
         )
         rects.append(
             f'<text x="{x + bar_width / 2:.1f}" y="244" text-anchor="middle" class="axis-label">{_escape(label[:18])}</text>'
         )
         rects.append(
-            f'<text x="{x + bar_width / 2:.1f}" y="260" text-anchor="middle" class="axis-value">{item.total_tokens:,}</text>'
+            f'<text x="{x + bar_width / 2:.1f}" y="260" text-anchor="middle" class="axis-value">{_escape(_token_measurement(item.total_tokens, item.total_tokens_state))}</text>'
         )
     svg = f"""<svg class="columns" viewBox="0 0 {width} {height}" role="img" aria-labelledby="column-title column-desc">
       <title id="column-title">Token usage by deployment</title>
@@ -565,7 +637,7 @@ def _analytics_deployment_sections(report: AnalysisReport) -> str:
         findings = analysis.findings if analysis else []
         aggregate = analysis.summary.aggregate if analysis else None
         requests = f"{deployment.requests:,}" if deployment.requests is not None else "Unavailable"
-        cached = f"{deployment.cached_tokens:,}" if deployment.cached_tokens_available else "Metric unavailable"
+        cached = _token_measurement(deployment.cached_tokens, deployment.cached_tokens_state)
         retries = f"{deployment.retries:,}" if deployment.retries_available else "Unavailable"
         status_codes = (
             " · ".join(f"HTTP {code}: {count:,}" for code, count in aggregate.status_codes.items())
@@ -586,9 +658,9 @@ def _analytics_deployment_sections(report: AnalysisReport) -> str:
         )
         sections.append(
             f"""<details class="deployment-details"><summary><strong>{_escape(_display_name(deployment.deployment_name, unknown="Unknown deployment"))}</strong>
-              <span>{_escape(_model_label(deployment))} · {_escape(requests)} requests · {deployment.total_tokens:,} tokens</span></summary>
-              <div class="detail-body"><div class="mini-stats"><span>Input <strong>{deployment.input_tokens:,}</strong></span>
-              <span>Output <strong>{deployment.output_tokens:,}</strong></span><span>Cached <strong>{_escape(cached)}</strong></span>
+              <span>{_escape(_model_label(deployment))} · {_escape(deployment.modality.replace("_", " "))} · {_escape(requests)} requests · {_escape(_token_measurement(deployment.total_tokens, deployment.total_tokens_state))} tokens</span></summary>
+              <div class="detail-body"><div class="mini-stats"><span>Input <strong>{_escape(_token_measurement(deployment.input_tokens, deployment.input_tokens_state))}</strong></span>
+              <span>Output <strong>{_escape(_token_measurement(deployment.output_tokens, deployment.output_tokens_state))}</strong></span><span>Cached <strong>{_escape(cached)}</strong></span>
               <span>Retries <strong>{_escape(retries)}</strong></span>{bucket_line}{outcome_line}</div>{coverage_line}{_finding_cards(findings)}</div>
             </details>"""
         )
@@ -672,6 +744,28 @@ def _model_pricing_state(item) -> AvailabilityState:
             reason="Recollect or enrich this slice before any rate can apply",
             action_id="identity",
         )
+    if item.modality in {
+        "text_to_speech",
+        "speech_to_text",
+        "image",
+        "video",
+        "managed_compute",
+    } and item.total_tokens_state == "unavailable":
+        return AvailabilityState(
+            status="not_applicable",
+            label="Token pricing not applicable",
+            reason=(
+                f"{item.modality.replace('_', ' ')} needs a compatible native usage metric "
+                "and billing unit."
+            ),
+        )
+    if item.total_tokens_state == "unavailable":
+        return AvailabilityState(
+            status="missing_actionable",
+            label="Token usage unavailable",
+            reason="Requests may be present, but token usage was not reported.",
+            action_id="usage",
+        )
     if item.estimated_cost_usd is not None and not item.unresolved_requests:
         return AvailabilityState(status="available", label="Priced")
     if item.estimated_cost_usd is not None:
@@ -704,9 +798,16 @@ def _cost_state(report: AnalysisReport) -> dict[str, object]:
     needs_price = [
         item
         for item in models
-        if not _identity_missing(item) and (item.estimated_cost_usd is None or item.unresolved_requests)
+        if not _identity_missing(item)
+        and _model_pricing_state(item).action_id == "pricing"
     ]
-    identity_tokens = sum(item.total_tokens for item in identity_missing)
+    needs_usage = [
+        item for item in models if _model_pricing_state(item).action_id == "usage"
+    ]
+    native_unit_required = [
+        item for item in models if _model_pricing_state(item).status == "not_applicable"
+    ]
+    identity_tokens = sum(item.total_tokens or 0 for item in identity_missing)
     coverage = summary.pricing_coverage_tokens_percent
     if summary.estimated_cost_usd is not None and not summary.unresolved_tokens:
         banner = AvailabilityState(status="available", label="Pricing complete")
@@ -729,6 +830,22 @@ def _cost_state(report: AnalysisReport) -> dict[str, object]:
             ),
             action_id="identity",
         )
+    elif needs_usage and not needs_price:
+        banner = AvailabilityState(
+            status="missing_actionable",
+            label="Usage metric unavailable",
+            reason=f"{len(needs_usage)} model(s) have request activity without measured token usage.",
+            action_id="usage",
+        )
+    elif native_unit_required and not needs_price:
+        banner = AvailabilityState(
+            status="not_applicable",
+            label="Token pricing not applicable",
+            reason=(
+                f"{len(native_unit_required)} model(s) require native usage units before cost can be estimated."
+            ),
+            action_id="usage",
+        )
     else:
         banner = AvailabilityState(
             status="missing_actionable",
@@ -744,6 +861,8 @@ def _cost_state(report: AnalysisReport) -> dict[str, object]:
         "models": models,
         "identity_missing": identity_missing,
         "needs_price": needs_price,
+        "needs_usage": needs_usage,
+        "native_unit_required": native_unit_required,
         "identity_tokens": identity_tokens,
     }
 
@@ -765,6 +884,11 @@ _REMEDIATION = {
         "TokenLens never converts currencies; align the catalog and the report.",
         "tokenlens-azure pricing verify",
     ),
+    "usage": (
+        "Collect compatible usage metrics",
+        "Requests are present, but the model's billable usage unit is not. Enable a compatible Azure Monitor metric or import request-level telemetry.",
+        "tokenlens-azure foundry",
+    ),
 }
 
 
@@ -780,7 +904,8 @@ def _remediation_panel(state: AvailabilityState, models) -> str:
     ]
     rows = "".join(
         f"<li><strong>{_escape(_model_label(item))}</strong>"
-        f"<span>{_escape(item.deployment_mode.title())} · {item.total_tokens:,} tokens · "
+        f"<span>{_escape(item.deployment_mode.title())} · "
+        f"{_escape(_token_measurement(item.total_tokens, item.total_tokens_state))} tokens · "
         f"{_escape(_model_pricing_state(item).label)}</span>"
         + (
             f"<span>Suggested override key: <code>{_escape(', '.join(item.suggested_override_keys) or item.canonical_model_key)}</code></span>"
@@ -802,15 +927,26 @@ def _cost_composition(report: AnalysisReport) -> str:
     """Three honest states: nothing priced, partly priced, fully priced."""
     summary = report.summary
     if summary.estimated_cost_usd is None:
+        if summary.total_tokens_state == "unavailable":
+            volume = "Usage metrics are unavailable; cost cannot be calculated from this telemetry."
+        elif summary.total_tokens_state == "partial":
+            volume = f"{_token_measurement(summary.total_tokens, summary.total_tokens_state)} tokens remain incompletely measured."
+        else:
+            volume = f"{summary.unresolved_tokens:,} tokens remain unpriced."
         return (
             '<div class="cost-empty"><strong>No costs to chart until pricing is configured.</strong>'
-            f'<span>{summary.unresolved_tokens:,} tokens remain unpriced.</span>'
+            f'<span>{_escape(volume)}</span>'
             '<a href="#resolve-pricing" data-open-remediation="1">Resolve pricing</a></div>'
         )
     components = [
-        ("Fresh input", summary.fresh_input_cost_usd, "var(--accent)", summary.input_tokens - summary.cached_tokens),
-        ("Cached input", summary.cached_input_cost_usd, "var(--amber)", summary.cached_tokens),
-        ("Output", summary.output_cost_usd, "var(--green)", summary.output_tokens),
+        (
+            "Fresh input",
+            summary.fresh_input_cost_usd,
+            "var(--accent)",
+            max(0, (summary.input_tokens or 0) - (summary.cached_tokens or 0)),
+        ),
+        ("Cached input", summary.cached_input_cost_usd, "var(--amber)", summary.cached_tokens or 0),
+        ("Output", summary.output_cost_usd, "var(--green)", summary.output_tokens or 0),
     ]
     # A component with no tokens is omitted rather than drawn as a zero-width
     # bar that reads as a resolved $0 cost.
@@ -830,7 +966,7 @@ def _cost_composition(report: AnalysisReport) -> str:
             f'<strong>{_escape(_money(summary.estimated_cost_usd, currency=summary.pricing_currency))}</strong></div>'
         ]
     if summary.unresolved_tokens:
-        excluded_share = summary.unresolved_tokens / max(1, summary.total_tokens) * 100
+        excluded_share = summary.unresolved_tokens / max(1, summary.total_tokens or 0) * 100
         rows.append(
             '<div class="cost-bar partial"><span>Unpriced</span>'
             f'<div class="cost-track"><i class="excluded" style="width:{excluded_share:.1f}%"></i></div>'
@@ -961,9 +1097,13 @@ def _cost_view_rows(report: AnalysisReport, view: str) -> str:
         return f'<table class="data-table"><caption>Cost by workload</caption><thead><tr><th scope="col">Workload</th><th scope="col">Coverage</th><th scope="col">Cost</th><th scope="col">Status</th></tr></thead><tbody>{body}</tbody></table>'
     if view == "component":
         components = [
-            ("Fresh input", summary.fresh_input_cost_usd, summary.input_tokens - summary.cached_tokens),
-            ("Cached input", summary.cached_input_cost_usd, summary.cached_tokens),
-            ("Output", summary.output_cost_usd, summary.output_tokens),
+            (
+                "Fresh input",
+                summary.fresh_input_cost_usd,
+                max(0, (summary.input_tokens or 0) - (summary.cached_tokens or 0)),
+            ),
+            ("Cached input", summary.cached_input_cost_usd, summary.cached_tokens or 0),
+            ("Output", summary.output_cost_usd, summary.output_tokens or 0),
         ]
         rows = []
         for label, value, tokens in components:
@@ -998,8 +1138,10 @@ def _cost_view_rows(report: AnalysisReport, view: str) -> str:
         )
         detail = (
             f"<tr class=\"row-detail\"><td colspan=\"4\"><details><summary>Provenance and remediation</summary>"
-            f"<ul class=\"detail-list\"><li>Tokens: {item.total_tokens:,} ({item.input_tokens:,} input / "
-            f"{item.cached_tokens:,} cached / {item.output_tokens:,} output)</li>"
+            f"<ul class=\"detail-list\"><li>Tokens: {_escape(_token_measurement(item.total_tokens, item.total_tokens_state))} ("
+            f"{_escape(_token_measurement(item.input_tokens, item.input_tokens_state))} input / "
+            f"{_escape(_token_measurement(item.cached_tokens, item.cached_tokens_state))} cached / "
+            f"{_escape(_token_measurement(item.output_tokens, item.output_tokens_state))} output)</li>"
             f"<li>Rates I/C/O: {_rate(item.input_price_per_million, currency=item.pricing_currency)} / "
             f"{_rate(item.cached_input_price_per_million, currency=item.pricing_currency)} / "
             f"{_rate(item.output_price_per_million, currency=item.pricing_currency)}</li>"
@@ -1090,6 +1232,8 @@ def _cost_analysis_panel(report: AnalysisReport) -> str:
     models = state["models"]
     identity_missing = state["identity_missing"]
     needs_price = state["needs_price"]
+    needs_usage = state["needs_usage"]
+    native_unit_required = state["native_unit_required"]
     priced_models = [item for item in models if item.estimated_cost_usd is not None]
     top_model = max(priced_models, key=lambda item: item.estimated_cost_usd or 0, default=None)
     pricing = report.report_metadata.get("pricing", {})
@@ -1097,16 +1241,49 @@ def _cost_analysis_panel(report: AnalysisReport) -> str:
     cost_display = (
         _money(summary.estimated_cost_usd, currency=summary.pricing_currency) if matched else "Unavailable"
     )
+    token_coverage = (
+        f"{summary.total_tokens - summary.unresolved_tokens:,} of {summary.total_tokens:,} measured tokens"
+        if summary.total_tokens is not None
+        else "Token usage unavailable"
+    )
+    unpriced_detail = (
+        "Excluded from the total"
+        if summary.unresolved_tokens
+        else "No token usage was measured"
+        if summary.total_tokens_state == "unavailable"
+        else "Every measured token is priced"
+        if summary.pricing_complete
+        else "No measured token volume is priced"
+    )
+    pricing_coverage_display = (
+        f"{summary.pricing_coverage_tokens_percent:.0f}%"
+        if summary.total_tokens is not None
+        else "N/A"
+    )
+    unpriced_display = (
+        f"{summary.unresolved_tokens:,}"
+        if summary.total_tokens is not None
+        else "N/A"
+    )
+    model_readiness = (
+        f"{len(native_unit_required):,} native unit(s) not token-priced"
+        if native_unit_required
+        else f"{len(needs_usage):,} model(s) need usage telemetry"
+        if needs_usage
+        else f"{len(identity_missing):,} separate identity failure(s)"
+        if identity_missing
+        else "No identity failures"
+    )
     cards = [
         f'<div class="card"><div class="label">Estimated cost</div>'
         f'<div class="value{"" if matched else " cost-name"}">{_escape(cost_display)}</div>'
         f'<div class="sub">{_availability_badge(banner if not matched else AvailabilityState(status="available", label=f"{summary.pricing_coverage_tokens_percent:.0f}% priced"))}</div></div>',
-        f'<div class="card"><div class="label">Pricing coverage</div><div class="value">{summary.pricing_coverage_tokens_percent:.0f}%</div>'
-        f'<div class="sub">{summary.total_tokens - summary.unresolved_tokens:,} of {summary.total_tokens:,} tokens</div></div>',
-        f'<div class="card"><div class="label">Unpriced tokens</div><div class="value cost-name">{summary.unresolved_tokens:,}</div>'
-        f'<div class="sub">{_escape("Excluded from the total" if summary.unresolved_tokens else "Every observed token is priced")}</div></div>',
+        f'<div class="card"><div class="label">Pricing coverage</div><div class="value">{_escape(pricing_coverage_display)}</div>'
+        f'<div class="sub">{_escape(token_coverage)}</div></div>',
+        f'<div class="card"><div class="label">Unpriced tokens</div><div class="value cost-name">{_escape(unpriced_display)}</div>'
+        f'<div class="sub">{_escape(unpriced_detail)}</div></div>',
         f'<div class="card"><div class="label">Models requiring pricing</div><div class="value cost-name">{len(needs_price):,}</div>'
-        f'<div class="sub">{_escape(f"{len(identity_missing):,} separate identity failure(s)" if identity_missing else "No identity failures")}</div></div>',
+        f'<div class="sub">{_escape(model_readiness)}</div></div>',
     ]
     # Conditional cards appear only when they carry information.
     if top_model is not None:
@@ -1188,6 +1365,16 @@ def _workload_pricing_state(item) -> AvailabilityState:
             reason="Recollect or enrich this slice before any rate can apply",
             action_id="identity",
         )
+    if item.total_tokens_state == "partial":
+        return AvailabilityState(
+            status="missing_actionable",
+            label="Usage metrics incomplete",
+            reason=(
+                f"{item.complete_usage_records:,} of {item.usage_records:,} records have complete "
+                "input and output token counts."
+            ),
+            action_id="usage",
+        )
     if item.estimated_cost is not None and not item.unpriced_tokens:
         return AvailabilityState(status="available", label="Priced")
     if item.estimated_cost is not None:
@@ -1197,10 +1384,34 @@ def _workload_pricing_state(item) -> AvailabilityState:
             reason=f"{item.unpriced_tokens:,} tokens excluded",
             action_id="pricing",
         )
-    if not total:
+    if item.total_tokens_state == "unavailable":
+        if item.modality in {"text_to_speech", "speech_to_text", "audio", "image", "video"}:
+            return AvailabilityState(
+                status="not_applicable",
+                label="Token pricing not applicable",
+                reason="Request activity is present, but this modality needs its native usage unit.",
+            )
+        if item.requests is not None and item.requests > 0:
+            return AvailabilityState(
+                status="missing_actionable",
+                label="Usage metric unavailable",
+                reason="Requests were observed; compatible token usage was not reported.",
+                action_id="usage",
+            )
+        return AvailabilityState(
+            status="not_measured",
+            label="Token usage unavailable",
+        )
+    if not total and not (item.requests is not None and item.requests > 0):
         return AvailabilityState(
             status="not_measured",
             label="No traffic in this window",
+        )
+    if not total and item.requests is not None and item.requests > 0:
+        return AvailabilityState(
+            status="available",
+            label="Requests observed · zero measured tokens",
+            reason="Token telemetry reported zero for requests in this window.",
         )
     return AvailabilityState(
         status="missing_actionable",
@@ -1233,12 +1444,17 @@ def _workload_rows(rollups, *, scope: str) -> str:
             else "Not measured"
         )
         requests = f"{item.requests:,}" if item.requests is not None else "Not measured"
+        token_mix = (
+            f"{_token_measurement(item.input_tokens, item.input_tokens_state)} input / "
+            f"{_token_measurement(item.cached_tokens, item.cached_tokens_state)} cached / "
+            f"{_token_measurement(item.output_tokens, item.output_tokens_state)} output"
+        )
         detail = (
             '<tr class="row-detail"><td colspan="9"><details><summary>Workload detail</summary>'
             f'<ul class="detail-list">'
             f'<li>Deployments: {_escape(", ".join(item.deployments) or "none")}</li>'
             f'<li>Models: {_escape(", ".join(item.models) or "none")}</li>'
-            f'<li>Token mix: {item.input_tokens or 0:,} input / {item.cached_tokens or 0:,} cached / {item.output_tokens or 0:,} output</li>'
+            f'<li>Token mix: {_escape(token_mix)}</li>'
             f'<li>Allocation: {_escape(item.allocation_confidence.replace("_", " "))} · source {_escape(item.identity_source.replace("_", " "))}</li>'
             f'<li>Daily cost: average {_workload_value(item.average_daily_cost, currency=item.pricing_currency)} · '
             f'P50 {_workload_value(item.p50_daily_cost, currency=item.pricing_currency)} · '
@@ -1262,7 +1478,7 @@ def _workload_rows(rollups, *, scope: str) -> str:
             f"<td>{_escape(item.workload_type.replace('_', ' '))}</td>"
             f"<td>{_escape(', '.join(item.deployments) or 'none')}</td>"
             f"<td>{_escape(requests)}</td>"
-            f"<td>{item.total_tokens or 0:,}</td>"
+            f"<td>{_escape(_token_measurement(item.total_tokens, item.total_tokens_state))}</td>"
             f"<td>{_escape(_workload_value(item.estimated_cost, currency=item.pricing_currency))}</td>"
             f"<td>{_escape(cost_per_request)}</td>"
             f"<td>{_escape(cost_per_solved)}</td>"
@@ -1277,6 +1493,8 @@ def _workload_cost_chart(rollups) -> str:
     if not priced:
         tokens = [item for item in rollups if (item.total_tokens or 0) > 0]
         if not tokens:
+            if any(item.requests is not None and item.requests > 0 for item in rollups):
+                return '<p class="muted">Requests were observed, but compatible token usage is unavailable or not applicable.</p>'
             return '<p class="muted">No workload traffic was observed in this window.</p>'
         largest = max(item.total_tokens or 0 for item in tokens) or 1
         bars = "".join(
@@ -1752,7 +1970,7 @@ def report_html(report: AnalysisReport) -> str:
         else pricing_reason
     )
     model_chart = (
-        f'''<article class="chart-card"><h2>Token share by model</h2><p>Case variants of the same model family combine into one model slice.</p><div class="donut-wrap">{donut_svg}<div class="legend">{"".join(f'<div class="legend-row"><span class="swatch" style="background:{["#73c7ff","#57d68b","#ffc857","#ff8fa3","#b9a7ff","#5eead4","#f4a261"][i % 7]}"></span>{_escape(m.model_name)} · {m.total_tokens:,} · {m.token_share_percent:.1f}%</div>' for i, m in enumerate(models))}</div></div>{donut_table}</article>'''
+        f'''<article class="chart-card"><h2>Token share by model</h2><p>Case variants of the same model family combine into one model slice.</p><div class="donut-wrap">{donut_svg}<div class="legend">{"".join(f'<div class="legend-row"><span class="swatch" style="background:{["#73c7ff","#57d68b","#ffc857","#ff8fa3","#b9a7ff","#5eead4","#f4a261"][i % 7]}"></span>{_escape(m.model_name)} · {_format_optional(m.total_tokens, "tokens")} · {_format_optional_percent(m.token_share_percent)}</div>' for i, m in enumerate(models))}</div></div>{donut_table}</article>'''
         if multi_model
         else _composition_card(report)
     )
@@ -1786,7 +2004,7 @@ def report_html(report: AnalysisReport) -> str:
 <div class="card"><div class="label">Pricing coverage</div><div class="value">{summary.pricing_coverage_tokens_percent:.1f}% priced</div><div class="sub">{_escape(pricing_headline)} · {_escape(pricing_reason)}</div></div></section>
 <section class="overview-grid"><section class="panel"><div class="panel-head"><div><h2>Portfolio usage</h2><small>Token share by deployment</small></div><a href="#usage" data-tab-link="usage">View analytics →</a></div><div class="portfolio">{_deployment_rows(report)}</div></section>
 <aside class="panel"><div class="panel-head"><div><h2>Azure actions</h2><small>Prioritized for a first decision</small></div></div><div class="actions"><ol>{_overview_actions(actions, report)}</ol></div></aside></section>
-<section class="panel finding-panel"><div class="panel-head"><div><h2>Material findings</h2><small>Only diagnostics that ran against supporting evidence appear here, at or above {float(config.get("overview_min_impact_percent", 1.0)):.1f}% impact or {int(config.get("overview_min_impact_tokens", 100000)):,} tokens. Impact share and evidence strength are stated separately, and rules that could not be evaluated are excluded.</small></div></div><div class="finding-list">{_finding_cards(overview, compact=True, empty=_no_findings_message(report), denominator=f"{summary.input_tokens:,} input tokens")}</div>
+<section class="panel finding-panel"><div class="panel-head"><div><h2>Material findings</h2><small>Only diagnostics that ran against supporting evidence appear here, at or above {float(config.get("overview_min_impact_percent", 1.0)):.1f}% impact or {int(config.get("overview_min_impact_tokens", 100000)):,} tokens. Impact share and evidence strength are stated separately, and rules that could not be evaluated are excluded.</small></div></div><div class="finding-list">{_finding_cards(overview, compact=True, empty=_no_findings_message(report), denominator=f"{_token_measurement(summary.input_tokens, summary.input_tokens_state)} input tokens")}</div>
 {f'<p class="empty">{hidden_count:,} additional evaluated opportunities are available in Usage analytics.</p>' if hidden_count else ""}
 {f'<p class="empty">{report.diagnostics.not_evaluated:,} diagnostic(s) were not evaluated for lack of evidence and are listed under Usage &rarr; Not evaluated.</p>' if report.diagnostics.not_evaluated else ""}</section>
 <footer>tokenlens-for-azure · created by Tzahi Ariel</footer></section>
@@ -1913,12 +2131,16 @@ def _model_table(report: AnalysisReport) -> str:
     rows = []
     for item in model_rollups(report):
         requests = f"{item.requests:,}" if item.requests is not None else "Unavailable"
-        cached = f"{item.cached_tokens:,}" if item.cached_tokens_available else "Unavailable"
+        cached = _token_measurement(item.cached_tokens, item.cached_tokens_state)
+        total = _token_measurement(item.total_tokens, item.total_tokens_state)
+        inputs = _token_measurement(item.input_tokens, item.input_tokens_state)
+        outputs = _token_measurement(item.output_tokens, item.output_tokens_state)
+        share = f"{item.token_share_percent:.1f}%" if item.token_share_percent is not None else "Unavailable"
         status, reason = _PRICING_STATUS_COPY.get(item.pricing_status, ("Unresolved", "No exact model/mode price"))
         rows.append(
-            f"<tr><th scope=\"row\">{_escape(_model_label(item))}<small>{_escape(item.deployment_mode.title())} · {_escape(requests)} requests</small></th>"
-            f"<td>{item.total_tokens:,}<small>{item.input_tokens:,} / {_escape(cached)} / {item.output_tokens:,}</small></td>"
-            f"<td>{item.token_share_percent:.1f}%</td>"
+            f"<tr><th scope=\"row\">{_escape(_model_label(item))}<small>{_escape(item.modality.replace('_', ' '))} · {_escape(item.deployment_mode.title())} · {_escape(requests)} requests</small></th>"
+            f"<td>{_escape(total)}<small>{_escape(inputs)} / {_escape(cached)} / {_escape(outputs)}</small></td>"
+            f"<td>{_escape(share)}</td>"
             f"<td>{item.active_buckets:,}<small>of {item.elapsed_buckets:,} elapsed</small></td>"
             f"<td>{_rate(item.input_price_per_million, currency=item.pricing_currency)} / {_rate(item.cached_input_price_per_million, currency=item.pricing_currency)} / {_rate(item.output_price_per_million, currency=item.pricing_currency)}</td>"
             f"<td>{_money(item.estimated_cost_usd, currency=item.pricing_currency, precision=2)}<small>{_escape(status)}: {_escape(reason)}</small></td></tr>"
@@ -2003,7 +2225,7 @@ def task_economics_html(
             if overview_summary.requests_available and overview_summary.requests_observed is not None
             else "Unavailable"
         )
-        overview_content = f"""<section class="metrics"><div class="kpi"><span>Requests</span><b>{_escape(overview_requests)}</b><p>{overview_summary.total_tokens:,} total tokens</p></div>
+        overview_content = f"""<section class="metrics"><div class="kpi"><span>Requests</span><b>{_escape(overview_requests)}</b><p>{_escape(_token_measurement(overview_summary.total_tokens, overview_summary.total_tokens_state))} total tokens</p></div>
 <div class="kpi"><span>Deployments</span><b>{len(overview_report.deployments):,}</b><p>Consumption routes</p></div>
 <div class="kpi"><span>Optimisation scenarios</span><b>{len(overview_report.report_metadata.get("scenarios", [])):,}</b><p>Independent ranges · not additive</p></div>
 <div class="kpi"><span>Findings</span><b>{len(overview_report.findings):,}</b><p>Usage diagnostics</p></div></section>

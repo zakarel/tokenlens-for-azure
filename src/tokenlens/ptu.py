@@ -152,7 +152,8 @@ class PtuDailyCostPoint(BaseModel):
     output_cost: float | None = Field(default=None, ge=0)
     total_cost: float | None = Field(default=None, ge=0)
     pricing_coverage_tokens_percent: float = Field(default=0, ge=0, le=100)
-    total_tokens: int = Field(default=0, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    usage_state: Literal["measured", "partial", "unavailable"] = "unavailable"
     unpriced_tokens: int = Field(default=0, ge=0)
     partial_day: bool = False
 
@@ -165,6 +166,10 @@ class PtuDashboardSummary(BaseModel):
     deployment_name: str
     model_name: str
     model_version: str | None = None
+    modality: str = "unknown"
+    usage_bases: tuple[str, ...] = ()
+    ptu_eligible: bool | None = None
+    capability_status: Literal["verified", "unknown", "mixed"] = "unknown"
     deployment_mode: str
     state: DashboardState
     state_label: str
@@ -186,6 +191,10 @@ class PtuDashboardSummary(BaseModel):
     total_cached_tokens: int | None = Field(default=None, ge=0)
     total_output_tokens: int | None = Field(default=None, ge=0)
     total_tokens: int | None = Field(default=None, ge=0)
+    input_tokens_state: Literal["measured", "partial", "unavailable"] = "unavailable"
+    cached_tokens_state: Literal["measured", "partial", "unavailable"] = "unavailable"
+    output_tokens_state: Literal["measured", "partial", "unavailable"] = "unavailable"
+    total_tokens_state: Literal["measured", "partial", "unavailable"] = "unavailable"
     daily_average_tokens: float | None = Field(default=None, ge=0)
     rate_limited_requests: int | None = Field(default=None, ge=0)
     rate_limit_percent: float | None = Field(default=None, ge=0, le=100)
@@ -466,8 +475,8 @@ def _series(
         else:
             bucket_requests = 1.0
         buckets[key] = (
-            input_tokens + record.usage.input_tokens,
-            output_tokens + record.usage.output_tokens,
+            input_tokens + (record.usage.input_tokens or 0),
+            output_tokens + (record.usage.output_tokens or 0),
             requests + bucket_requests,
         )
     first, last = min(buckets), max(buckets)
@@ -734,8 +743,13 @@ def _bucket_key(stamp: datetime, bucket_minutes: int = BUCKET_MINUTES) -> dateti
 class _BucketAggregate:
     __slots__ = (
         "input_tokens",
+        "input_seen",
+        "input_missing",
         "cached_tokens",
+        "cached_missing",
         "output_tokens",
+        "output_seen",
+        "output_missing",
         "successful",
         "rate_limited",
         "failed",
@@ -747,8 +761,13 @@ class _BucketAggregate:
 
     def __init__(self) -> None:
         self.input_tokens = 0
+        self.input_seen = False
+        self.input_missing = False
         self.cached_tokens = 0
+        self.cached_missing = False
         self.output_tokens = 0
+        self.output_seen = False
+        self.output_missing = False
         self.successful = 0
         self.rate_limited = 0
         self.failed = 0
@@ -775,12 +794,25 @@ def _evidence_table(records: list[TraceRecord]) -> tuple[dict[datetime, _BucketA
         bucket = table.setdefault(_bucket_key(stamp), _BucketAggregate())
         metrics = _aggregate_metrics(record)
         if metrics is not None:
-            bucket.input_tokens += int(metrics.get("input_tokens") or 0)
-            bucket.output_tokens += int(metrics.get("output_tokens") or 0)
+            for metric, counter, seen, missing_attr in (
+                ("input_tokens", "input_tokens", "input_seen", "input_missing"),
+                ("output_tokens", "output_tokens", "output_seen", "output_missing"),
+            ):
+                value = metrics.get(metric)
+                if value is None:
+                    setattr(bucket, missing_attr, True)
+                else:
+                    setattr(bucket, seen, True)
+                    setattr(bucket, counter, getattr(bucket, counter) + int(value))
+            if metrics.get("input_tokens") is None:
+                missing.add("input_tokens")
+            if metrics.get("output_tokens") is None:
+                missing.add("output_tokens")
             if metrics.get("cached_tokens") is not None:
                 bucket.cached_tokens += int(metrics["cached_tokens"])
                 bucket.cached_known = True
             else:
+                bucket.cached_missing = True
                 missing.add("cached_tokens")
             requests = metrics.get("requests")
             successful = metrics.get("successful_requests")
@@ -804,12 +836,23 @@ def _evidence_table(records: list[TraceRecord]) -> tuple[dict[datetime, _BucketA
                 else:
                     missing.add("failed_requests")
             continue
-        bucket.input_tokens += record.usage.input_tokens
-        bucket.output_tokens += record.usage.output_tokens
-        bucket.cached_tokens += record.usage.cached_tokens
-        # Request-level telemetry always knows its own cached count, including
-        # a genuine zero.
-        bucket.cached_known = True
+        for metric, counter, seen, missing_attr in (
+            ("input_tokens", "input_tokens", "input_seen", "input_missing"),
+            ("output_tokens", "output_tokens", "output_seen", "output_missing"),
+        ):
+            value = getattr(record.usage, metric)
+            if value is None:
+                setattr(bucket, missing_attr, True)
+                missing.add(metric)
+            else:
+                setattr(bucket, seen, True)
+                setattr(bucket, counter, getattr(bucket, counter) + value)
+        if record.usage.cached_tokens is None:
+            bucket.cached_missing = True
+            missing.add("cached_tokens")
+        else:
+            bucket.cached_tokens += record.usage.cached_tokens
+            bucket.cached_known = True
         bucket.requests += 1
         bucket.requests_known = True
         status = record.status_code
@@ -985,15 +1028,33 @@ def _daily_cost(
         day = stamp.date()
         entry = buckets.setdefault(
             day,
-            {"input": 0.0, "cached": 0.0, "output": 0.0, "total": 0.0, "tokens": 0, "priced_tokens": 0, "components": True, "priced": False},
+            {
+                "input": 0.0,
+                "cached": 0.0,
+                "output": 0.0,
+                "total": 0.0,
+                "tokens": 0,
+                "tokens_seen": False,
+                "tokens_missing": False,
+                "priced_tokens": 0,
+                "components": True,
+                "priced": False,
+            },
         )
-        tokens = record.usage.input_tokens + record.usage.output_tokens
-        entry["tokens"] = int(entry["tokens"]) + tokens
+        usage_complete = record.usage.input_tokens is not None and record.usage.output_tokens is not None
+        if usage_complete:
+            tokens = record.usage.input_tokens + record.usage.output_tokens
+            entry["tokens"] = int(entry["tokens"]) + tokens
+            entry["tokens_seen"] = True
+        else:
+            tokens = (record.usage.input_tokens or 0) + (record.usage.output_tokens or 0)
+            entry["tokens_missing"] = True
         resolution = cost_resolver(record)
         if not resolution.resolved or resolution.cost_usd is None:
             continue
         entry["priced"] = True
-        entry["priced_tokens"] = int(entry["priced_tokens"]) + tokens
+        if usage_complete:
+            entry["priced_tokens"] = int(entry["priced_tokens"]) + tokens
         entry["total"] = float(entry["total"]) + resolution.cost_usd
         if (
             resolution.fresh_input_cost_usd is None
@@ -1009,6 +1070,13 @@ def _daily_cost(
     for day in sorted(buckets):
         entry = buckets[day]
         tokens = int(entry["tokens"])
+        usage_state = (
+            "unavailable"
+            if not entry["tokens_seen"]
+            else "partial"
+            if entry["tokens_missing"]
+            else "measured"
+        )
         priced_tokens = int(entry["priced_tokens"])
         has_components = bool(entry["components"]) and bool(entry["priced"])
         points.append(
@@ -1018,8 +1086,13 @@ def _daily_cost(
                 cached_input_cost=round(float(entry["cached"]), 10) if has_components else None,
                 output_cost=round(float(entry["output"]), 10) if has_components else None,
                 total_cost=round(float(entry["total"]), 10) if entry["priced"] else None,
-                pricing_coverage_tokens_percent=round(priced_tokens / max(1, tokens) * 100, 1),
-                total_tokens=tokens,
+                pricing_coverage_tokens_percent=(
+                    round(priced_tokens / max(1, tokens) * 100, 1)
+                    if usage_state != "unavailable"
+                    else 0.0
+                ),
+                total_tokens=tokens if usage_state != "unavailable" else None,
+                usage_state=usage_state,  # type: ignore[arg-type]
                 unpriced_tokens=max(0, tokens - priced_tokens),
                 partial_day=_is_partial_day(day, window_start, window_end),
             )
@@ -1033,6 +1106,14 @@ def _is_partial_day(day: date, window_start: datetime | None, window_end: dateti
     day_start = datetime.combine(day, datetime.min.time(), tzinfo=UTC)
     day_end = day_start + timedelta(days=1)
     return window_start > day_start or window_end < day_end - timedelta(minutes=BUCKET_MINUTES)
+
+
+def _sum_record_usage(records: list[TraceRecord], metric: str) -> tuple[int | None, str]:
+    values = [getattr(record.usage, metric) for record in records]
+    observed = [value for value in values if value is not None]
+    if not observed:
+        return None, "unavailable"
+    return sum(observed), "partial" if len(observed) != len(values) else "measured"
 
 
 def _dashboard(
@@ -1076,10 +1157,29 @@ def _dashboard(
     evidence = [
         PtuEvidencePoint(
             timestamp=stamp,
-            input_tokens=bucket.input_tokens,
-            cached_tokens=bucket.cached_tokens if bucket.cached_known else None,
-            output_tokens=bucket.output_tokens,
-            total_tokens=bucket.input_tokens + bucket.output_tokens,
+            input_tokens=(
+                bucket.input_tokens
+                if bucket.input_seen and not bucket.input_missing
+                else None
+            ),
+            cached_tokens=(
+                bucket.cached_tokens
+                if bucket.cached_known and not bucket.cached_missing
+                else None
+            ),
+            output_tokens=(
+                bucket.output_tokens
+                if bucket.output_seen and not bucket.output_missing
+                else None
+            ),
+            total_tokens=(
+                bucket.input_tokens + bucket.output_tokens
+                if bucket.input_seen
+                and not bucket.input_missing
+                and bucket.output_seen
+                and not bucket.output_missing
+                else None
+            ),
             successful_requests=bucket.successful if bucket.outcome_known else None,
             rate_limited_requests=bucket.rate_limited if bucket.outcome_known else None,
             failed_requests=bucket.failed if bucket.outcome_known else None,
@@ -1088,10 +1188,31 @@ def _dashboard(
         for stamp, bucket in ordered
     ]
 
-    total_input = sum(record.usage.input_tokens for record in records)
-    total_output = sum(record.usage.output_tokens for record in records)
-    total_cached = sum(bucket.cached_tokens for _, bucket in ordered) if cached_known else None
-    total_tokens = total_input + total_output
+    if aggregate is not None:
+        total_input = aggregate.input_tokens
+        total_output = aggregate.output_tokens
+        total_cached = aggregate.cached_tokens
+        input_state = aggregate.input_tokens_state
+        output_state = aggregate.output_tokens_state
+        cached_state = aggregate.cached_tokens_state
+        total_tokens = aggregate.total_tokens
+        total_state = aggregate.total_tokens_state
+    else:
+        total_input, input_state = _sum_record_usage(records, "input_tokens")
+        total_output, output_state = _sum_record_usage(records, "output_tokens")
+        total_cached, cached_state = _sum_record_usage(records, "cached_tokens")
+        total_tokens = (
+            None
+            if total_input is None and total_output is None
+            else (total_input or 0) + (total_output or 0)
+        )
+        total_state = (
+            "unavailable"
+            if input_state == output_state == "unavailable"
+            else "measured"
+            if input_state == output_state == "measured"
+            else "partial"
+        )
     requests_known = any(bucket.requests_known for _, bucket in ordered)
     total_requests = sum(bucket.requests for _, bucket in ordered) if requests_known else None
     rate_limited = sum(bucket.rate_limited for _, bucket in ordered) if outcome_known else None
@@ -1110,8 +1231,15 @@ def _dashboard(
         missing_metrics.add("request_totals")
 
     daily_totals: dict[date, int] = defaultdict(int)
-    for stamp, bucket in ordered:
-        daily_totals[stamp.date()] += bucket.input_tokens + bucket.output_tokens
+    if total_state == "measured":
+        for stamp, bucket in ordered:
+            if (
+                bucket.input_seen
+                and not bucket.input_missing
+                and bucket.output_seen
+                and not bucket.output_missing
+            ):
+                daily_totals[stamp.date()] += bucket.input_tokens + bucket.output_tokens
     partial_days = sum(_is_partial_day(day, window_start, window_end) for day in daily_totals)
     complete_days = len(daily_totals) - partial_days
     daily_average_tokens = round(sum(daily_totals.values()) / len(daily_totals), 1) if daily_totals else None
@@ -1169,6 +1297,10 @@ def _dashboard(
 
     if not cached_known:
         missing_metrics.add("cached_tokens")
+    if input_state != "measured":
+        missing_metrics.add("input_tokens")
+    if output_state != "measured":
+        missing_metrics.add("output_tokens")
     if not outcome_known:
         missing_metrics.add("request_outcomes")
     if latency_coverage == 0:
@@ -1189,6 +1321,10 @@ def _dashboard(
         deployment_name=summary.deployment_name,
         model_name=summary.model_name,
         model_version=str((records[0].metadata or {}).get("model_version")) if records and (records[0].metadata or {}).get("model_version") else None,
+        modality=summary.modality,
+        usage_bases=summary.usage_bases,
+        ptu_eligible=summary.ptu_eligible,
+        capability_status=summary.capability_status,
         deployment_mode=summary.deployment_mode,
         state=state,
         state_label=DASHBOARD_STATE_LABELS[state],
@@ -1203,11 +1339,15 @@ def _dashboard(
         active_p95_weighted_tpm=active_p95_weighted,
         busy_hour_available=busy_hour_available,
         weighted_basis=weighted_basis,
-        total_input_tokens=total_input or None if records else None,
+        total_input_tokens=total_input,
         total_cached_tokens=total_cached,
-        total_output_tokens=total_output or None if records else None,
-        total_tokens=total_tokens or None if records else None,
-        daily_average_tokens=daily_average_tokens,
+        total_output_tokens=total_output,
+        total_tokens=total_tokens,
+        input_tokens_state=input_state,
+        cached_tokens_state=cached_state,
+        output_tokens_state=output_state,
+        total_tokens_state=total_state,
+        daily_average_tokens=daily_average_tokens if total_state == "measured" else None,
         rate_limited_requests=rate_limited,
         rate_limit_percent=rate_limit_percent,
         successful_requests=successful,
@@ -1448,10 +1588,15 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
     recommendation = _recommendation(
         dimensions, capacity is not None, publisher, identity_resolved=identity_resolved
     )
+    if summary.ptu_eligible is False:
+        recommendation = "PTU not applicable"
     average_tpm = mean(tpm) if tpm else 0
     p95_tpm = _percentile(tpm, 95)
-    total_tokens = sum(record.usage.input_tokens + record.usage.output_tokens for record in filtered_records)
-    completion_ratio = sum(record.usage.output_tokens for record in filtered_records) / max(1, total_tokens)
+    total_tokens = sum(
+        (record.usage.input_tokens or 0) + (record.usage.output_tokens or 0)
+        for record in filtered_records
+    )
+    completion_ratio = sum(record.usage.output_tokens or 0 for record in filtered_records) / max(1, total_tokens)
 
     suggested_ptu = None
     ptu_capacity_tpm = None
@@ -1472,10 +1617,18 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
     mode = summary.deployment_mode.casefold()
     # Sufficiency is measured in *active* buckets. A window padded with silent
     # intervals is not evidence of sustained demand.
-    sufficient_evidence = active_buckets >= MINIMUM_ACTIVE_BUCKETS
+    token_usage_complete = (
+        summary.input_tokens_state == "measured"
+        and summary.output_tokens_state == "measured"
+    )
+    sufficient_evidence = (
+        active_buckets >= MINIMUM_ACTIVE_BUCKETS and token_usage_complete
+    )
     secondary_blockers: list[str] = []
     if not identity_resolved:
         eligibility_status: EligibilityStatus = "collection_identity_error"
+    elif summary.ptu_eligible is False:
+        eligibility_status = "ptu_not_applicable"
     elif capacity is None:
         eligibility_status = "ptu_not_applicable" if publisher and publisher != "microsoft" else "model_capacity_unavailable"
     elif mode not in {"global", "regional"}:
@@ -1486,14 +1639,20 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
         eligibility_status = "eligible_sufficient_evidence"  # may be downgraded to pricing_unavailable below
     # Capacity and pricing remain real blockers, but they are badges behind the
     # primary state rather than a headline that hides the actual problem.
-    if capacity is None and identity_resolved:
+    if capacity is None and identity_resolved and eligibility_status != "ptu_not_applicable":
         secondary_blockers.append("Capacity data required")
-    if mode not in {"global", "regional"}:
+    if mode not in {"global", "regional"} and eligibility_status != "ptu_not_applicable":
         secondary_blockers.append("Deployment mode unconfirmed")
-    if summary.pricing_status != "priced":
+    if not token_usage_complete and eligibility_status != "ptu_not_applicable":
+        secondary_blockers.append("Token usage data required")
+    if summary.pricing_status != "priced" and eligibility_status != "ptu_not_applicable":
         secondary_blockers.append("Pricing required")
 
-    if capacity and mode in {"global", "regional"}:
+    if (
+        capacity
+        and mode in {"global", "regional"}
+        and eligibility_status != "ptu_not_applicable"
+    ):
         regional = mode == "regional"
         minimum = capacity.regional_min_ptu if regional else capacity.global_min_ptu
         increment = capacity.regional_increment if regional else capacity.global_increment
@@ -1509,12 +1668,21 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
         effective_capacity_per_ptu = capacity.input_tpm_per_ptu
 
         cached_rate = summary.cached_input_price_per_million
-        cached_tokens = summary.cached_tokens
-        fresh_tokens = max(0, summary.input_tokens - cached_tokens)
+        cached_tokens = summary.cached_tokens or 0
+        fresh_tokens = max(0, (summary.input_tokens or 0) - cached_tokens)
+        usage_complete = (
+            summary.input_tokens is not None
+            and summary.cached_tokens is not None
+            and summary.output_tokens is not None
+            and summary.input_tokens_state == "measured"
+            and summary.cached_tokens_state == "measured"
+            and summary.output_tokens_state == "measured"
+        )
         pricing_ready = (
             # Economics are a recommendation too: they are withheld until the
             # active sample can support one.
             sufficient_evidence
+            and usage_complete
             and summary.input_price_per_million is not None
             and summary.output_price_per_million is not None
             and (not cached_tokens or cached_rate is not None)
@@ -1526,9 +1694,14 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
         )
         if pricing_ready:
             blended = (
-                sum(max(0, record.usage.input_tokens - record.usage.cached_tokens) for record in filtered_records) * summary.input_price_per_million
-                + sum(record.usage.cached_tokens for record in filtered_records) * (cached_rate or 0)
-                + sum(record.usage.output_tokens for record in filtered_records) * summary.output_price_per_million
+                sum(
+                    max(0, (record.usage.input_tokens or 0) - (record.usage.cached_tokens or 0))
+                    for record in filtered_records
+                )
+                * summary.input_price_per_million
+                + sum(record.usage.cached_tokens or 0 for record in filtered_records) * (cached_rate or 0)
+                + sum(record.usage.output_tokens or 0 for record in filtered_records)
+                * summary.output_price_per_million
             ) / max(1, total_tokens)
             payg_monthly = mean(tpm) * 43_200 / 1_000_000 * blended
             peak_raw_ptu = max(weighted_tpm, default=0) * 1.2 / capacity.input_tpm_per_ptu
@@ -1603,28 +1776,54 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
             "deployment inventory can supply the exact model and version."
         )
     elif eligibility_status == "ptu_not_applicable":
-        note = (
-            f"{publisher.title() if publisher else 'This publisher'}'s models are served through Foundry as "
-            "partner/Marketplace models billed per token or in provider credit units (Anthropic CCUs); "
-            "Azure PTU capacity is a first-party purchase that cannot be bought for them, so no PTU "
-            "recommendation, sizing, or break-even is produced."
-        )
+        if summary.ptu_eligible is False:
+            note = (
+                f"The verified capability catalog classifies this deployment as {summary.modality.replace('_', ' ')} "
+                "and not PTU-eligible. Token-based PTU sizing, capacity, and break-even analysis do not apply."
+            )
+        else:
+            note = (
+                f"{publisher.title() if publisher else 'This publisher'}'s models are served through Foundry as "
+                "partner/Marketplace models billed per token or in provider credit units (Anthropic CCUs); "
+                "Azure PTU capacity is a first-party purchase that cannot be bought for them, so no PTU "
+                "recommendation, sizing, or break-even is produced."
+            )
     elif eligibility_status == "eligible_insufficient_evidence" or not sufficient_evidence:
-        note = (
-            f"{active_buckets} of the required {MINIMUM_ACTIVE_BUCKETS} active five-minute buckets were observed "
-            f"across {evidence.elapsed_buckets:,} elapsed buckets; TokenLens shows the observed workload evidence "
-            "but withholds a PTU recommendation and cost curve until there is enough sustained activity to size "
-            "and cost dedicated capacity."
-        )
+        if not token_usage_complete:
+            note = (
+                "Token usage is unavailable or incomplete for this deployment, so PTU throughput and "
+                "sizing are withheld. Collect complete input and output token metrics before assessing "
+                "dedicated capacity."
+            )
+        else:
+            note = (
+                f"{active_buckets} of the required {MINIMUM_ACTIVE_BUCKETS} active five-minute buckets were observed "
+                f"across {evidence.elapsed_buckets:,} elapsed buckets; TokenLens shows the observed workload evidence "
+                "but withholds a PTU recommendation and cost curve until there is enough sustained activity to size "
+                "and cost dedicated capacity."
+            )
 
     # Secondary blockers are appended to the note so the primary state stays the
     # real blocker while nothing that also blocks a decision is hidden.
     secondary_notes: list[str] = []
-    if capacity is None and identity_resolved and "PTU capacity" not in note:
+    if (
+        capacity is None
+        and identity_resolved
+        and eligibility_status != "ptu_not_applicable"
+        and "PTU capacity" not in note
+    ):
         secondary_notes.append("Exact PTU capacity for this model and version is unavailable, so sizing stays blocked.")
-    if mode not in {"global", "regional"} and "deployment mode" not in note:
+    if (
+        mode not in {"global", "regional"}
+        and eligibility_status != "ptu_not_applicable"
+        and "deployment mode" not in note
+    ):
         secondary_notes.append("The deployment mode must be Global or Regional before PTU sizing and economics.")
-    if summary.pricing_status != "priced" and "pricing" not in note.casefold():
+    if (
+        summary.pricing_status != "priced"
+        and eligibility_status != "ptu_not_applicable"
+        and "pricing" not in note.casefold()
+    ):
         secondary_notes.append("Exact pricing is required before break-even and hybrid economics can be shown.")
     if secondary_notes:
         note = " ".join([note, *secondary_notes])
