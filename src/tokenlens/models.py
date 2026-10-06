@@ -293,6 +293,33 @@ class DataQualityIssue(BaseModel):
     detail: str
 
 
+class Insight(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    insight_id: str
+    rule_version: str
+    category: str
+    scope_type: str
+    scope_id: str
+    title: str
+    observation: str
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    impact: dict[str, Any] | None = None
+    recommendation: str
+    verification: str
+    confidence: Literal["high", "medium", "low"]
+    applicability: Literal[
+        "ACTIONABLE_FINDING",
+        "EVALUATED_NO_ISSUE",
+        "NOT_EVALUATED_MISSING_EVIDENCE",
+        "NOT_APPLICABLE",
+        "INSUFFICIENT_SAMPLE",
+    ]
+    missing_evidence: list[str] = Field(default_factory=list)
+    caveats: list[str] = Field(default_factory=list)
+    priority: int = Field(ge=0)
+
+
 class AvailabilityState(BaseModel):
     """One shared statement about whether a value is available.
 

@@ -1035,6 +1035,27 @@ def _cost_composition(report: AnalysisReport) -> str:
     return "".join(rows)
 
 
+def _aggregate_insights_panel(report: AnalysisReport) -> str:
+    insights = report.report_metadata.get("insights") or []
+    if not insights:
+        return ""
+    cards = "".join(
+        f'<article class="finding-card {("high" if item.get("applicability") == "ACTIONABLE_FINDING" else "low")}">'
+        f'<div class="finding-rule">{_escape(item.get("insight_id", "INSIGHT"))}</div>'
+        f'<div class="finding-copy"><strong>{_escape(item.get("title", ""))}</strong>'
+        f'<span>{_escape(item.get("observation", ""))}</span></div>'
+        f'<div class="finding-action"><strong>Recommended action</strong>'
+        f'<span>{_escape(item.get("recommendation", ""))}</span>'
+        f'<span>Verify: {_escape(item.get("verification", ""))}</span></div></article>'
+        for item in insights
+    )
+    return (
+        '<section class="panel finding-panel"><div class="panel-head"><div>'
+        '<h2>Actionable insights</h2><small>Aggregate evidence, impact, action, and verification</small>'
+        f'</div></div><div class="finding-list">{cards}</div></section>'
+    )
+
+
 def _pricing_provenance(report: AnalysisReport, models) -> str:
     """Two lines by default; everything technical is collapsed behind a disclosure."""
     summary = report.summary
@@ -2064,7 +2085,7 @@ def report_html(report: AnalysisReport) -> str:
 <div class="card"><div class="label">Pricing coverage</div><div class="value">{summary.pricing_coverage_tokens_percent:.1f}% priced</div><div class="sub">{_escape(pricing_headline)} · {_escape(pricing_reason)}</div></div></section>
 <section class="overview-grid"><section class="panel"><div class="panel-head"><div><h2>Portfolio usage</h2><small>Token share by deployment</small></div><a href="#usage" data-tab-link="usage">View analytics →</a></div><div class="portfolio">{_deployment_rows(report)}</div></section>
 <aside class="panel"><div class="panel-head"><div><h2>Azure actions</h2><small>Prioritized for a first decision</small></div></div><div class="actions"><ol>{_overview_actions(actions, report)}</ol></div></aside></section>
-<section class="panel finding-panel"><div class="panel-head"><div><h2>Material findings</h2><small>Only diagnostics that ran against supporting evidence appear here, at or above {float(config.get("overview_min_impact_percent", 1.0)):.1f}% impact or {int(config.get("overview_min_impact_tokens", 100000)):,} tokens. Impact share and evidence strength are stated separately, and rules that could not be evaluated are excluded.</small></div></div><div class="finding-list">{_finding_cards(overview, compact=True, empty=_no_findings_message(report), denominator=f"{_token_measurement(summary.input_tokens, summary.input_tokens_state)} input tokens")}</div>
+{_aggregate_insights_panel(report)}<section class="panel finding-panel"><div class="panel-head"><div><h2>Material findings</h2><small>Only diagnostics that ran against supporting evidence appear here, at or above {float(config.get("overview_min_impact_percent", 1.0)):.1f}% impact or {int(config.get("overview_min_impact_tokens", 100000)):,} tokens. Impact share and evidence strength are stated separately, and rules that could not be evaluated are excluded.</small></div></div><div class="finding-list">{_finding_cards(overview, compact=True, empty=_no_findings_message(report), denominator=f"{_token_measurement(summary.input_tokens, summary.input_tokens_state)} input tokens")}</div>
 {f'<p class="empty">{hidden_count:,} additional evaluated opportunities are available in Usage analytics.</p>' if hidden_count else ""}
 {f'<p class="empty">{report.diagnostics.not_evaluated:,} diagnostic(s) were not evaluated for lack of evidence and are listed under Usage &rarr; Not evaluated.</p>' if report.diagnostics.not_evaluated else ""}</section>
 <footer>tokenlens-for-azure · created by Tzahi Ariel</footer></section>

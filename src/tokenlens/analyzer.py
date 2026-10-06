@@ -7,6 +7,7 @@ from . import __version__
 from .aggregate import MixedTelemetryError, aggregate_summary, field_coverage, source_kinds, telemetry_kind
 from .economics import TaskEconomicsReport, build_savings_scenarios, calculate_task_economics
 from .events import TaskEvent
+from .insights import build_aggregate_insights
 from .models import (
     AggregateAnalysisSummary,
     AnalysisReport,
@@ -668,8 +669,13 @@ def analyze(
                 reference_catalog=reference_catalog,
                 applied_assumptions=applied_assumptions,
             ),
+            "insights": [],
         },
     )
+    report.report_metadata["insights"] = [
+        insight.model_dump(mode="json")
+        for insight in build_aggregate_insights(summary.aggregate)
+    ]
     request_models = sorted(
         {
             record.model_name
