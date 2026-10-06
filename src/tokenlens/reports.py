@@ -471,29 +471,12 @@ def _diagnostic_sections(report: AnalysisReport) -> str:
         f'<li><strong>{_escape(item.rule_id)} {_escape(item.title)}</strong><span>{_escape(item.detail)}</span></li>'
         for item in no_issue
     ) or '<li class="empty">No rule completed without a finding.</li>'
-    coverage_rows = "".join(
-        f'<tr><th scope="row">{_escape(item.rule_id)} {_escape(item.title)}</th>'
-        f'<td>{_escape(", ".join(item.applicable_sources) or "request")}</td>'
-        f'<td>{_escape(", ".join(item.missing_fields) or "—")}</td>'
-        f"<td>{_escape(item.detail)}</td></tr>"
-        for item in not_evaluated
-    )
-    coverage = (
-        f"""<section class="panel analytics-section not-evaluated-panel"><div class="panel-head"><div>
-          <h2>Not evaluated</h2><small>{len(not_evaluated):,} rule(s) had no supporting evidence. These are coverage gaps, not findings, and are excluded from every finding count.</small></div></div>
-          <div class="table-scroll"><table class="data-table"><caption>Diagnostic applicability and missing evidence</caption>
-          <thead><tr><th scope="col">Rule</th><th scope="col">Applies to</th><th scope="col">Missing evidence</th><th scope="col">Why</th></tr></thead>
-          <tbody>{coverage_rows}</tbody></table></div></section>"""
-        if not_evaluated
-        else ""
-    )
     return f"""<section class="panel analytics-section"><div class="panel-head"><div><h2>Evaluated findings</h2>
       <small>{len(evaluated):,} rule(s) ran against supporting evidence and detected an addressable issue.</small></div></div>
       <div class="finding-list">{finding_cards}</div></section>
     <section class="panel analytics-section"><div class="panel-head"><div><h2>Evaluated — no issue detected</h2>
       <small>{len(no_issue):,} rule(s) ran and found nothing addressable.</small></div></div>
       <ul class="status-list">{no_issue_rows}</ul></section>
-    {coverage}
     <section class="panel analytics-section additional"><div class="panel-head"><div><h2>Additional evaluated opportunities</h2>
       <small>{len(additional):,} evaluated finding(s) below the Overview materiality threshold.</small></div></div>
       {_finding_cards(additional, denominator=denominator) if additional else '<p class="empty">Every evaluated finding is already shown in Overview.</p>'}</section>"""

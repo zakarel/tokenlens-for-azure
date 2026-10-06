@@ -79,7 +79,7 @@ def test_missing_telemetry_is_reported_as_not_evaluated_not_as_efficiency():
     assert report.summary.findings == len(report.findings)
     assert report.summary.not_evaluated_rules == len(unevaluated)
     rendered = report_html(report)
-    assert "not evaluated" in rendered.casefold()
+    assert "<h2>Not evaluated</h2>" not in rendered
 
 
 def test_fingerprint_evidence_suppresses_the_not_evaluated_notice_for_that_rule():
