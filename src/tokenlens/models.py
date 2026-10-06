@@ -293,6 +293,14 @@ class DataQualityIssue(BaseModel):
     detail: str
 
 
+class HelpLink(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
+    url: str
+    source: Literal["microsoft_learn", "azure_pricing", "github", "other"] = "other"
+
+
 class Insight(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -318,6 +326,8 @@ class Insight(BaseModel):
     missing_evidence: list[str] = Field(default_factory=list)
     caveats: list[str] = Field(default_factory=list)
     priority: int = Field(ge=0)
+    materiality: Literal["material", "advisory", "observation"] = "advisory"
+    help_links: list[HelpLink] = Field(default_factory=list)
 
 
 class AvailabilityState(BaseModel):

@@ -39,3 +39,20 @@ def test_rate_limit_insight_is_not_a_ptu_verdict():
 def test_insights_are_present_in_report_metadata_for_json_and_html():
     report = analyze([], "synthetic")
     assert isinstance(report.report_metadata["insights"], list)
+
+
+def test_missing_latency_is_a_direct_data_quality_action():
+    summary = AggregateAnalysisSummary(
+        elapsed_buckets=10,
+        observed_buckets=10,
+        requests_observed=10,
+        input_tokens=100,
+        output_tokens=50,
+        latency_coverage_percent=0,
+        input_tokens_state="measured",
+        output_tokens_state="measured",
+        total_tokens_state="measured",
+    )
+    insight = next(item for item in build_aggregate_insights(summary) if item.insight_id == "DQ-LATENCY-GAP")
+    assert "Time to Response" in insight.recommendation
+    assert insight.help_links

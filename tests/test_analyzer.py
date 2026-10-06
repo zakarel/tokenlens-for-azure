@@ -125,7 +125,7 @@ def test_combined_report_keeps_brand_tabs_and_usage_charts():
     assert "Task economics</button>" not in rendered
     assert 'style="fill:none;stroke:#73c7ff;stroke-width:28"' in rendered
     assert "Model summary" in rendered
-    assert rendered.index("Model summary") < rendered.index("Evaluated findings")
+    assert rendered.index("Evaluated findings") < rendered.index("Model summary")
 
 
 def test_single_model_replaces_the_donut_with_composition():

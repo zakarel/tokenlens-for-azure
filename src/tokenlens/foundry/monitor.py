@@ -193,6 +193,44 @@ class CollectionResult:
         }
 
 
+def merge_collection_results(
+    results: Iterable[CollectionResult],
+    *,
+    window: CollectionWindow,
+) -> CollectionResult:
+    """Merge chunk results deterministically and suppress exact bucket overlaps."""
+    merged = CollectionResult(
+        window_start=window.start,
+        window_end=window.end,
+        granularity_minutes=window.granularity_minutes,
+        collected_at=datetime.now(UTC),
+    )
+    seen: set[tuple[datetime, str]] = set()
+    for result in results:
+        for record in result.records:
+            key = (record.timestamp, record.deployment_name)
+            if key in seen:
+                merged.duplicate_buckets_skipped += 1
+                continue
+            seen.add(key)
+            merged.records.append(record)
+        merged.missing_metrics = sorted(set(merged.missing_metrics) | set(result.missing_metrics))
+        merged.unsupported_metrics = sorted(set(merged.unsupported_metrics) | set(result.unsupported_metrics))
+        merged.requested_metrics = sorted(set(merged.requested_metrics) | set(result.requested_metrics))
+        merged.excluded_metrics.update(result.excluded_metrics)
+        merged.observed_dimensions.update(result.observed_dimensions)
+        merged.identity_conflicts.extend(
+            item for item in result.identity_conflicts if item not in merged.identity_conflicts
+        )
+        merged.pages_read += result.pages_read
+        merged.retries += result.retries
+        merged.active_buckets += result.active_buckets
+        for code, count in result.status_codes.items():
+            merged.status_codes[code] = merged.status_codes.get(code, 0) + count
+    merged.records.sort(key=lambda item: (item.timestamp, item.deployment_name, item.event_id))
+    return merged
+
+
 def resource_uri(subscription_id: str, resource_group: str, account: str) -> str:
     return (
         f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}"

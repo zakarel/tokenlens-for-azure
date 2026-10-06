@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from .models import AggregateAnalysisSummary, Insight
+from .models import AggregateAnalysisSummary, HelpLink, Insight
+
+
+def _materiality(*, impact_percent: float | None, priority: int) -> str:
+    if impact_percent is not None and impact_percent >= 10:
+        return "material"
+    return "advisory" if priority <= 1 else "observation"
 
 
 def build_aggregate_insights(summary: AggregateAnalysisSummary | None, *, scope_id: str = "portfolio") -> list[Insight]:
@@ -18,15 +24,17 @@ def build_aggregate_insights(summary: AggregateAnalysisSummary | None, *, scope_
             scope_type="portfolio",
             scope_id=scope_id,
             title="Collection coverage is incomplete",
-            observation=f"Only {coverage:.1f}% of the requested collection buckets were returned.",
+            observation=f"Azure Monitor returned {coverage:.1f}% of the requested window; older data is outside the available retention window.",
             evidence=[{"observed_buckets": summary.observed_buckets, "expected_buckets": summary.elapsed_buckets}],
             impact={"coverage_percent": coverage},
-            recommendation="Use a narrower retained window or repair the collection source before making capacity or trend decisions.",
-            verification="Repeat collection and confirm coverage approaches the requested window.",
+            recommendation="Use a window inside retention, or export metrics to Log Analytics/storage for longer history. See https://learn.microsoft.com/azure/azure-monitor/essentials/data-platform-metrics.",
+            verification="Rerun collection and confirm returned coverage matches the analysis window.",
             confidence="high",
             applicability="ACTIONABLE_FINDING",
             caveats=["Returned telemetry may be retention-limited."],
             priority=0,
+            materiality="material",
+            help_links=[HelpLink(title="Azure Monitor metrics retention", url="https://learn.microsoft.com/azure/azure-monitor/essentials/data-platform-metrics", source="microsoft_learn")],
         ))
     if summary.requests_observed and summary.rate_limited_requests:
         rate = summary.rate_limited_requests / summary.requests_observed * 100
@@ -47,6 +55,8 @@ def build_aggregate_insights(summary: AggregateAnalysisSummary | None, *, scope_
                 applicability="ACTIONABLE_FINDING",
                 caveats=["PTU is not implied by rate-limit pressure alone."],
                 priority=1,
+                materiality="material" if rate >= 10 else "advisory",
+                help_links=[HelpLink(title="Azure OpenAI monitoring reference", url="https://learn.microsoft.com/azure/ai-foundry/openai/monitor-openai-reference", source="microsoft_learn")],
             ))
     if summary.requests_observed and summary.failed_requests:
         non_rate_failures = max(0, summary.failed_requests - (summary.rate_limited_requests or 0))
@@ -59,15 +69,17 @@ def build_aggregate_insights(summary: AggregateAnalysisSummary | None, *, scope_
                 scope_type="portfolio",
                 scope_id=scope_id,
                 title="Non-rate-limit failure pressure is present",
-                observation=f"{non_rate_failures:,} requests failed for reasons other than rate limiting ({rate:.1f}%).",
+                observation=f"{non_rate_failures:,} of {summary.requests_observed:,} requests failed with non-429 responses ({rate:.1f}%): inspect HTTP 400/404 causes.",
                 evidence=[{"non_rate_failures": non_rate_failures, "requests": summary.requests_observed}],
                 impact={"failure_percent": round(rate, 1)},
-                recommendation="Separate client, server, and unknown error categories before changing retries or capacity.",
-                verification="Compare categorized failure rates after correcting error handling and retry policy.",
+                recommendation="Fix invalid requests and deployment/endpoint references before adding retries. See https://learn.microsoft.com/azure/ai-foundry/openai/monitor-openai-reference.",
+                verification="Rerun the workload and confirm 400/404 rates fall.",
                 confidence="high" if summary.outcome_coverage == "complete" else "medium",
                 applicability="ACTIONABLE_FINDING",
                 caveats=["Do not estimate retry waste without explicit retry identity."],
                 priority=1,
+                materiality="material" if rate >= 10 else "advisory",
+                help_links=[HelpLink(title="Azure OpenAI monitoring reference", url="https://learn.microsoft.com/azure/ai-foundry/openai/monitor-openai-reference", source="microsoft_learn")],
             ))
     if summary.requests_observed and summary.total_tokens is not None:
         insights.append(Insight(
@@ -77,16 +89,18 @@ def build_aggregate_insights(summary: AggregateAnalysisSummary | None, *, scope_
             scope_type="portfolio",
             scope_id=scope_id,
             title="Request token footprint is measurable",
-            observation=f"Average measured footprint is {summary.total_tokens / summary.requests_observed:,.0f} tokens per request.",
+            observation=f"Requests average {summary.total_tokens / summary.requests_observed:,.0f} measured tokens; aggregate telemetry cannot explain why.",
             evidence=[{"total_tokens": summary.total_tokens, "requests": summary.requests_observed}],
             impact=None,
-            recommendation="Inspect request-level telemetry for prompt growth, retrieval duplication, and output budgets before claiming waste.",
-            verification="Instrument request-level token structure and compare the per-request distribution.",
+            recommendation="Enable request telemetry, then inspect prompt growth, repeated context, retrieval duplication, output limits, and cache usage. See https://learn.microsoft.com/azure/foundry/openai/how-to/prompt-caching.",
+            verification="Compare per-request token distributions before and after the change.",
             confidence="medium",
             applicability="EVALUATED_NO_ISSUE",
             missing_evidence=["request-level message and retrieval structure"],
             caveats=["A large footprint is an investigation trigger, not proof of waste."],
             priority=2,
+            materiality="observation",
+            help_links=[HelpLink(title="Prompt caching guidance", url="https://learn.microsoft.com/azure/foundry/openai/how-to/prompt-caching", source="microsoft_learn")],
         ))
     if summary.requests_observed and summary.total_tokens is None:
         insights.append(Insight(
@@ -139,5 +153,23 @@ def build_aggregate_insights(summary: AggregateAnalysisSummary | None, *, scope_
             applicability="NOT_EVALUATED_MISSING_EVIDENCE",
             missing_evidence=["request outcomes"],
             priority=1,
+        ))
+    if summary.requests_observed and summary.latency_coverage_percent == 0:
+        insights.append(Insight(
+            insight_id="DQ-LATENCY-GAP",
+            rule_version="1.0",
+            category="data_quality",
+            scope_type="portfolio",
+            scope_id=scope_id,
+            title="Latency telemetry is unavailable",
+            observation="Requests and usage are present, but no compatible Azure OpenAI latency metric was returned.",
+            evidence=[{"requests": summary.requests_observed, "latency_coverage_percent": 0}],
+            recommendation="Enable a documented Azure OpenAI latency metric such as Time to Response or Time to Last Byte; do not use legacy Cognitive Services Latency.",
+            verification="Rerun collection and confirm latency point coverage is non-zero.",
+            confidence="high",
+            applicability="NOT_EVALUATED_MISSING_EVIDENCE",
+            missing_evidence=["documented Azure OpenAI latency metric"],
+            priority=1,
+            help_links=[HelpLink(title="Azure OpenAI monitoring reference", url="https://learn.microsoft.com/azure/ai-foundry/openai/monitor-openai-reference", source="microsoft_learn")],
         ))
     return sorted(insights, key=lambda item: (item.priority, item.insight_id))

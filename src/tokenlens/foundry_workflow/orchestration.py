@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -426,7 +426,7 @@ def _collect_account(
     progress: Callable[[str, str], None] | None,
 ) -> None:
     """Collect one account's deployments into the shared run summary."""
-    from ..foundry.monitor import resource_uri
+    from ..foundry.monitor import merge_collection_results, resource_uri
 
     selected = list(target.deployments)
     try:
@@ -497,24 +497,36 @@ def _collect_account(
     def _collect_one(deployment: DeploymentRecord) -> tuple[DeploymentRecord, Any, Exception | None]:
         try:
             client = services.metrics_client(endpoint)
-            result = services.collect(
-                metrics_client=client,
-                subscription_id=target.subscription_id,
-                resource_group=target.resource_group,
-                account=target.account,
-                window=window,
-                available_metrics=available,
-                deployments=[deployment.name],
-                deployment_inventory=inventory,
-                family=_family_for(deployment),
-                deployment_modes={deployment.name: deployment.deployment_mode},
-                default_deployment_mode=deployment.deployment_mode,
-                workload_assignments=(
-                    {deployment.name: assignments[deployment.name]}
-                    if deployment.name in assignments
-                    else None
-                ),
-            )
+            chunks = []
+            cursor = window.start
+            chunk_days = 30
+            while cursor < window.end:
+                chunk_end = min(window.end, cursor + timedelta(days=chunk_days))
+                chunk_window = type(window)(
+                    start=cursor,
+                    end=chunk_end,
+                    granularity_minutes=window.granularity_minutes,
+                )
+                chunks.append(services.collect(
+                    metrics_client=client,
+                    subscription_id=target.subscription_id,
+                    resource_group=target.resource_group,
+                    account=target.account,
+                    window=chunk_window,
+                    available_metrics=available,
+                    deployments=[deployment.name],
+                    deployment_inventory=inventory,
+                    family=_family_for(deployment),
+                    deployment_modes={deployment.name: deployment.deployment_mode},
+                    default_deployment_mode=deployment.deployment_mode,
+                    workload_assignments=(
+                        {deployment.name: assignments[deployment.name]}
+                        if deployment.name in assignments
+                        else None
+                    ),
+                ))
+                cursor = chunk_end
+            result = merge_collection_results(chunks, window=window)
             return deployment, result, None
         except Exception as exc:  # noqa: BLE001 - classified per deployment below
             # KeyboardInterrupt and SystemExit deliberately propagate: an abort
