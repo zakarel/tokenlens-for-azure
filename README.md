@@ -6,15 +6,15 @@
 
 ### Understand usage, cost, workloads, and PTU readiness across Microsoft Foundry
 
-[![Status](https://img.shields.io/badge/status-pre--alpha-7A5AF8?style=flat-square)](#status)
+[![Status](https://img.shields.io/badge/status-GA--track-7A5AF8?style=flat-square)](#status)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](#quick-start)
 [![Offline analysis](https://img.shields.io/badge/analysis-offline-107C10?style=flat-square)](#privacy)
 [![Azure](https://img.shields.io/badge/Microsoft-Foundry-0078D4?style=flat-square&logo=microsoftazure&logoColor=white)](#what-you-get)
 
 </div>
 
-TokenLens discovers your Microsoft Foundry deployments, collects aggregate Azure
-Monitor metrics, and creates a self-contained report with:
+TokenLens discovers your Microsoft Foundry deployments, collects aggregate or
+request telemetry, and creates a self-contained report with:
 
 - usage by deployment, model, and workload;
 - estimated cost when an exact verified rate is available;
@@ -22,13 +22,17 @@ Monitor metrics, and creates a self-contained report with:
 - PTU suitability and evidence quality;
 - request outcomes, throughput, and rate-limit activity;
 - token-efficiency diagnostics supported by the available telemetry.
+- ranked aggregate operational insights with evidence, confidence, actions, and
+  verification steps;
+- separate public, contract, Marketplace, override, and actual-cost views.
 
 TokenLens does not send prompts or responses to another service and never guesses
 pricing or PTU capacity.
 
 > [!IMPORTANT]
-> TokenLens is currently **pre-alpha**. Interfaces and calculation rules may
-> change before v0.1.
+> TokenLens is on the GA implementation track. Pricing, insight, telemetry,
+> and report contracts are versioned and remain conservative when evidence is
+> missing.
 
 ## Quick start
 
@@ -54,6 +58,19 @@ az login
 ```
 
 That is the only TokenLens command most users need.
+
+Assessment modes are explicit:
+
+```bash
+tokenlens-azure foundry configure --assessment-mode operational
+tokenlens-azure foundry configure --assessment-mode optimization
+tokenlens-azure foundry configure --assessment-mode full
+```
+
+Operational mode uses deployment inventory, Azure Monitor, pricing, workloads,
+and PTU evidence. Optimization mode uses SDK, OpenTelemetry, Application
+Insights, or JSONL request telemetry for TL001-TL008. Full mode runs both
+tracks; aggregate telemetry alone never claims request-level optimization.
 
 The wizard:
 
@@ -180,6 +197,8 @@ default.
 Rates come from official sources, cached locally and read offline:
 
 - the **Azure Retail Prices API** for Foundry Models token meters;
+- the official Microsoft Foundry provider pricing pages when a published rate
+  is not present in Retail Prices API;
 - **Anthropic's published Claude pricing** (USD only), converted to Foundry
   consumption units at 100 CCU = $1 and labelled as a CCU-derived estimate, not
   an Azure token meter. Customer-specific private discounts are not included.
@@ -194,7 +213,18 @@ completion is reported as truncated rather than cached.
 If pricing is unresolved, usage and operational analysis still work. The report
 shows the affected deployment, excluded tokens, reason, and next safe action.
 
-See [Pricing methodology](docs/pricing.md).
+Use the nested pricing workflow for synchronization, imports, and provenance:
+
+```bash
+tokenlens-azure foundry pricing sync --source all
+tokenlens-azure foundry pricing audit
+tokenlens-azure foundry pricing import-pricesheet FILE
+tokenlens-azure foundry pricing import-cost-details FILE
+tokenlens-azure foundry pricing provenance
+```
+
+Actual billed cost is reconciled separately from forward estimates. Unattributed
+Cost Details rows remain visible rather than being assigned by guesswork.
 
 ## PTU states
 
