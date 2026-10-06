@@ -1766,10 +1766,23 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
                 hourly_monthly = suggested_ptu * hourly_rate * 720
                 reserved_monthly = hourly_monthly * 0.35
             note = "Timestamped request evidence is required for PTU economics." if not filtered_records else "Workload fit is available; USD PAYG model pricing is required for break-even and hybrid cost."
-            if eligibility_status == "eligible_sufficient_evidence":
+            if (
+                eligibility_status == "eligible_sufficient_evidence"
+                and suggested_ptu is not None
+                and (
+                    summary.pricing_status in {"catalog_missing", "identity_unresolved", "currency_mismatch"}
+                    or (
+                        summary.pricing_status == "partial"
+                        and summary.input_price_per_million is None
+                        and aggregate is None
+                    )
+                )
+            ):
                 eligibility_status = "pricing_unavailable"
-                if suggested_ptu is not None:
-                    throughput_series = _throughput_series(tpm, bucket_minutes=5, ptu_capacity_tpm=ptu_capacity_tpm)
+            if eligibility_status == "eligible_sufficient_evidence" and suggested_ptu is not None:
+                throughput_series = _throughput_series(
+                    tpm, bucket_minutes=5, ptu_capacity_tpm=ptu_capacity_tpm
+                )
     elif capacity:
         note = "Workload fit is available; deployment mode must be Global or Regional before PTU sizing and economics."
 

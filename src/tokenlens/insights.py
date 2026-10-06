@@ -116,11 +116,11 @@ def build_aggregate_insights(summary: AggregateAnalysisSummary | None, *, scope_
             title="Cached-input telemetry is unavailable",
             observation="Token usage is present, but cached-input usage is not measured.",
             evidence=[{"cached_tokens_state": summary.cached_tokens_state}],
-            recommendation="Enable cached-input usage collection before attributing prompt cost or cache savings.",
-            verification="Repeat the analysis and confirm cached-input coverage is measured.",
+            recommendation="For Standard GPT-5.6 PAYG, collect response usage through SDK, OpenTelemetry, Application Insights, or JSONL; Azure Monitor does not expose cached-token counts.",
+            verification="Repeat analysis with per-request prompt_tokens_details.cached_tokens and cache_write_tokens present.",
             confidence="high",
             applicability="NOT_EVALUATED_MISSING_EVIDENCE",
-            missing_evidence=["cached-input usage"],
+            missing_evidence=["per-request cached_tokens and cache_write_tokens"],
             priority=2,
         ))
     if summary.outcome_coverage == "unavailable" and summary.requests_observed:

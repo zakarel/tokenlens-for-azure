@@ -66,16 +66,9 @@ METRIC_CAPABILITIES: tuple[MetricCapability, ...] = (
     MetricCapability("OutputTokens", "output_tokens", "Total", "tokens", 0, _DEPLOYMENT_DIMS),
     MetricCapability("GeneratedTokens", "output_tokens", "Total", "tokens", 1, _DEPLOYMENT_DIMS),
     MetricCapability("CompletionTokenCount", "output_tokens", "Total", "tokens", 2, _DEPLOYMENT_DIMS),
-    MetricCapability(
-        "cacheReadInputTokens",
-        "cached_tokens",
-        "Total",
-        "tokens",
-        0,
-        _DEPLOYMENT_DIMS | {"ContextLength"},
-    ),
-    MetricCapability("ProcessedCachedPromptTokens", "cached_tokens", "Total", "tokens", 1, _DEPLOYMENT_DIMS),
-    MetricCapability("CachedPromptTokens", "cached_tokens", "Total", "tokens", 2, _DEPLOYMENT_DIMS),
+    # Azure Monitor does not publish cached-token counts for Standard PAYG.
+    # Request response usage exposes cached_tokens; PTU has a cache-match-rate
+    # metric, which is not a token count and must not be mapped here.
     # Requests and outcomes ---------------------------------------------------
     MetricCapability("ModelRequests", "requests", "Total", "requests", 0, _STATUS_DIMS),
     MetricCapability("AzureOpenAIRequests", "requests", "Total", "requests", 1, _STATUS_DIMS),
@@ -160,7 +153,10 @@ METRIC_MAP: dict[str, tuple[str, ...]] = {
 }
 
 AGGREGATIONS: dict[str, str] = {
-    field_name: next(item.aggregation for item in METRIC_CAPABILITIES if item.field == field_name)
+    field_name: next(
+        (item.aggregation for item in METRIC_CAPABILITIES if item.field == field_name),
+        "Total",
+    )
     for field_name in CANONICAL_FIELDS
 }
 
@@ -278,10 +274,20 @@ CAPABILITY_MATRIX: dict[str, frozenset[str]] = {
             "failed_requests",
             "average_latency_ms",
         }
+
     ),
     "claude_foundry": frozenset({"input_tokens", "output_tokens", "requests", "throttled_requests"}),
     "partner_model": frozenset({"requests"}),
     "unknown": frozenset(),
+}
+
+# Backward-compatible explicit-test/import aliases. These are never selected
+# from normal resource definitions; only a caller that explicitly supplies the
+# metric can opt into the legacy shape.
+LEGACY_EXPLICIT_METRICS = {
+    "cachereadinputtokens": "cached_tokens",
+    "processedcachedprompttokens": "cached_tokens",
+    "cachedprompttokens": "cached_tokens",
 }
 
 
@@ -307,6 +313,28 @@ def select_metrics(
             key=lambda item: item.priority,
         )
         chosen: MetricPlan | None = None
+        for explicit_name, explicit_field in LEGACY_EXPLICIT_METRICS.items():
+            if explicit_field != field_name or explicit_name not in by_name:
+                continue
+            definition = by_name[explicit_name]
+            dimensions = definition.dimensions
+            if deployment_filtered and "ModelDeploymentName" not in dimensions:
+                continue
+            chosen = MetricPlan(
+                field=field_name,
+                metric_name=definition.name,
+                aggregation="Total",
+                unit="tokens",
+                deployment_filterable=True,
+                status_dimensioned=False,
+                zero_is_meaningful=True,
+                dimensions=frozenset(dimensions),
+                dimensions_confirmed=True,
+            )
+            break
+        if chosen is not None:
+            selection.plans[field_name] = chosen
+            continue
         for capability in candidates:
             definition = by_name.get(capability.name.casefold())
             if definition is None:

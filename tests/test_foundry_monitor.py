@@ -159,6 +159,7 @@ def test_capability_matrix_and_metric_map_stay_explicit():
     assert set(CAPABILITY_MATRIX) == {"azure_openai", "claude_foundry", "partner_model", "unknown"}
     for family, expected in CAPABILITY_MATRIX.items():
         assert expected <= set(METRIC_MAP), family
+    assert "cacheReadInputTokens" not in METRIC_MAP
 
 
 def test_deployment_capability_flows_from_inventory_into_aggregate_record():
@@ -368,9 +369,9 @@ def test_collected_buckets_analyze_into_a_ptu_dashboard():
     assert assessment.eligibility_status == "eligible_sufficient_evidence"
     data = assessment.dashboard
     assert data.summary.rate_limited_requests == 240 * 2
-    assert data.summary.total_cached_tokens == 240 * 40_000
+    assert data.summary.total_cached_tokens is None
     assert data.throughput is not None
-    assert data.cost_curve is not None
+    assert data.cost_curve is None
 
 
 def test_three_request_smoke_fixture_stays_insufficient():
