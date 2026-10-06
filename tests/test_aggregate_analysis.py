@@ -17,6 +17,7 @@ import pytest
 from tokenlens.aggregate import MixedTelemetryError, aggregate_summary
 from tokenlens.analyzer import analyze
 from tokenlens.ingest import iter_records
+from tokenlens.ingest import iter_records_many
 from tokenlens.reports import report_html
 from tokenlens.telemetry.schema import BucketMetrics, MetricBucketRecord, record_json
 
@@ -337,6 +338,14 @@ def test_aggregate_summary_accepts_one_shot_iterators():
     records = iter([bucket(index=0, input_tokens=3, output_tokens=2, status_codes={"200": 1})])
     summary = aggregate_summary(records)
     assert summary.total_tokens == 5
+
+
+def test_iter_records_many_is_bounded_and_duplicate_free(tmp_path):
+    path = tmp_path / "records.jsonl"
+    raw = record_json(bucket(index=0, input_tokens=3, output_tokens=2, status_codes={"200": 1}))
+    path.write_text(json.dumps(raw) + "\n" + json.dumps(raw) + "\n", encoding="utf-8")
+    records = list(iter_records_many([str(path)], max_records=10))
+    assert len(records) == 1
 
 
 def test_report_states_data_quality_before_the_kpis(audited_report):

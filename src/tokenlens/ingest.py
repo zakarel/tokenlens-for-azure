@@ -397,6 +397,38 @@ def load_records_many(paths: Iterable[str]) -> tuple[list[TraceRecord], str]:
     return dedupe_records(records), ", ".join(str(path) for path in unique)
 
 
+def iter_records_many(
+    paths: Iterable[str],
+    *,
+    max_records: int | None = None,
+) -> Iterator[TraceRecord]:
+    """Stream deterministic, duplicate-free records from files or directories."""
+    expanded: list[Path] = []
+    for value in paths:
+        path = Path(value)
+        matches = [Path(item) for item in glob.glob(value, recursive=True)] if any(char in value for char in "*?[") else [path]
+        for match in matches:
+            if match.is_dir():
+                expanded.extend(sorted(item for item in match.glob("*.jsonl") if item.is_file()))
+            elif match.is_file():
+                expanded.append(match)
+    seen: set[str] = set()
+    yielded = 0
+    for path in dict.fromkeys(expanded):
+        with path.open("r", encoding="utf-8") as source:
+            for record in iter_records(source):
+                key = record.request_id or str((record.metadata or {}).get("event_id") or "")
+                if not key:
+                    key = f"{record.timestamp}|{record.deployment_name}|{record.model_name}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield record
+                yielded += 1
+                if max_records is not None and yielded >= max_records:
+                    return
+
+
 def message_text(messages: Iterable[dict[str, Any]]) -> str:
     return "\n".join(
         f"{message.get('role', '')}:{_content(message.get('content', ''))}"
