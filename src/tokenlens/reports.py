@@ -92,6 +92,56 @@ def report_sarif(report: AnalysisReport) -> str:
     return json.dumps(payload, indent=2) + "\n"
 
 
+def task_economics_sarif(report: TaskEconomicsReport) -> str:
+    """Serialize task economics as a stable SARIF diagnostic artifact."""
+    results = []
+    for cohort in report.task_types:
+        if cohort.pricing.unresolved_billable_events:
+            results.append(
+                {
+                    "ruleId": "TL-ECO-PRICING",
+                    "level": "warning",
+                    "message": {
+                        "text": (
+                            f"{cohort.task_type}: pricing is unresolved for "
+                            f"{cohort.pricing.unresolved_billable_events} billable events"
+                        )
+                    },
+                    "properties": {
+                        "task_type": cohort.task_type,
+                        "pricing_coverage_percent": cohort.pricing.coverage_percent,
+                        "unresolved_tasks": cohort.unresolved_tasks,
+                    },
+                }
+            )
+    payload = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "TokenLens for Azure task economics",
+                    "version": str(report.schema_version),
+                    "rules": [{
+                        "id": "TL-ECO-PRICING",
+                        "name": "Unresolved task economics pricing",
+                        "shortDescription": {
+                            "text": "Task economics has unresolved billable events."
+                        },
+                    }],
+                }
+            },
+            "properties": {
+                "schema_version": report.schema_version,
+                "total_attempted_tasks": report.total_attempted_tasks,
+                "total_solved_tasks": report.total_solved_tasks,
+            },
+            "results": results,
+        }],
+    }
+    return json.dumps(payload, indent=2) + "\n"
+
+
 def _logo_data_uri() -> str:
     logo = files("tokenlens").joinpath("assets/tokenlens-logo-dark.png").read_bytes()
     return "data:image/png;base64," + base64.b64encode(logo).decode("ascii")

@@ -22,7 +22,7 @@ from .output import choose_output, economics_text, pricing_audit_text
 from .pricing import PricingCatalog
 from .reference import load_effective_reference_catalog
 from .presentation import impact_category, is_material, materiality_config
-from .reports import report_html, report_json, report_sarif, write_output
+from .reports import report_html, report_json, report_sarif, task_economics_sarif, write_output
 from .telemetry import TelemetryConfig, TelemetryWriter
 from .telemetry.manifest import CollectionManifest, build_deployment_manifest
 from .foundry_workflow.configuration import atomic_write
@@ -97,7 +97,7 @@ def _render(report, output_format: str) -> str:
 
             return task_economics_html(report)
         if output_format == "sarif":
-            raise typer.BadParameter("SARIF is available for legacy request analysis, not task economics")
+            return task_economics_sarif(report)
         return economics_text(report)
     if output_format == "json":
         return report_json(report)

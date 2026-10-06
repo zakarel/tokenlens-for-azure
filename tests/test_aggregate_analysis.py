@@ -333,6 +333,12 @@ def test_overview_widgets_reconcile_with_the_aggregate_summary(audited_report):
     assert "Request-level optimisation not evaluated" in overview
 
 
+def test_aggregate_summary_accepts_one_shot_iterators():
+    records = iter([bucket(index=0, input_tokens=3, output_tokens=2, status_codes={"200": 1})])
+    summary = aggregate_summary(records)
+    assert summary.total_tokens == 5
+
+
 def test_report_states_data_quality_before_the_kpis(audited_report):
     rendered = report_html(audited_report)
     assert rendered.index('class="data-quality') < rendered.index('id="overview-panel"')

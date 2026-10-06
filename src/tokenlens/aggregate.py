@@ -109,8 +109,9 @@ def _measurement_state(values: list[int | None]) -> Literal["measured", "partial
     return "measured"
 
 
-def aggregate_summary(records: list[TraceRecord]) -> AggregateAnalysisSummary:
+def aggregate_summary(records: Iterable[TraceRecord]) -> AggregateAnalysisSummary:
     """Summarize aggregate buckets without ever treating a bucket as a request."""
+    records = list(records)
     buckets = [record for record in records if telemetry_kind(record) == "aggregate"]
     bucket_minutes = _bucket_minutes(buckets)
     window_start, window_end = _window(buckets)

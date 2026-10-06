@@ -211,6 +211,21 @@ def test_task_json_has_no_internal_ids_and_scenarios_are_independent():
     assert "event_id" not in payload
 
 
+def test_task_economics_accepts_iterators_and_serializes_sarif():
+    import json
+
+    from tokenlens.reports import task_economics_sarif
+
+    report = calculate_task_economics(iter(reconstruct_tasks([
+        model("m1", "task"),
+        result("r1", "task", "solved"),
+    ])))
+    payload = json.loads(task_economics_sarif(report))
+    assert report.total_attempted_tasks == 1
+    assert payload["version"] == "2.1.0"
+    assert payload["runs"][0]["results"] == []
+
+
 def test_no_argument_non_tty_is_help_only():
     result = CliRunner().invoke(app, [])
     assert result.exit_code == 0
