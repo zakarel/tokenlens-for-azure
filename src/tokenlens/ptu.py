@@ -258,6 +258,7 @@ class PtuDeploymentAssessment(BaseModel):
 
     deployment_name: str
     model_name: str
+    model_version: str | None = None
     deployment_mode: str
     eligible: bool
     eligibility_status: EligibilityStatus = "model_capacity_unavailable"
@@ -298,6 +299,8 @@ class PtuDeploymentAssessment(BaseModel):
     cost_curve: PtuCostCurve | None = None
     dashboard: PtuDashboardData | None = None
     note: str
+    capacity_source_key: str | None = None
+    capacity_source_revision: str | None = None
 
 
 class PtuPortfolioAssessment(BaseModel):
@@ -325,6 +328,7 @@ class _Capacity(BaseModel):
     #: canonical model key; a related family member is never substituted.
     source: str = CAPACITY_SOURCE
     confidence: Literal["documented_reference", "customer_override"] = "documented_reference"
+    supported_model_versions: str = "explicit reference row; version range not published"
 
 
 _CAPACITIES = {
@@ -1320,7 +1324,7 @@ def _dashboard(
     dashboard_summary = PtuDashboardSummary(
         deployment_name=summary.deployment_name,
         model_name=summary.model_name,
-        model_version=str((records[0].metadata or {}).get("model_version")) if records and (records[0].metadata or {}).get("model_version") else None,
+        model_version=summary.model_version,
         modality=summary.modality,
         usage_bases=summary.usage_bases,
         ptu_eligible=summary.ptu_eligible,
@@ -1884,6 +1888,8 @@ def _assessment(records: list[TraceRecord], deployment: DeploymentAnalysis, cost
         cost_curve=cost_curve,
         dashboard=dashboard,
         note=note,
+        capacity_source_key=canonical_model_name(summary.model_name) if capacity else None,
+        capacity_source_revision=capacity.source if capacity else None,
     )
 
 
