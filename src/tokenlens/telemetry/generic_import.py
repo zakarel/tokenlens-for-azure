@@ -37,6 +37,7 @@ from .schema import (
     deterministic_event_id,
 )
 from .writer import TelemetryWriter
+from .manifest import CollectionManifest, build_request_manifest
 
 #: Top-level keys the mapping file may define. Anything else is rejected so a
 #: typo or an attempt to add an unsupported capability fails at load time.
@@ -99,6 +100,7 @@ class GenericImportResult:
     rows_mapped: int = 0
     rows_skipped: int = 0
     duplicates_skipped: int = 0
+    manifest: CollectionManifest | None = None
 
     def summary(self) -> dict[str, int]:
         return {
@@ -356,6 +358,24 @@ def import_rows(rows: Iterable[dict[str, Any]], mapping: MappingSpec, *, max_row
         seen.add(record.event_id)
         result.records.append(record)
         result.rows_mapped += 1
+    result.manifest = build_request_manifest(
+        run_id=deterministic_event_id("generic_import", result.rows_seen, result.rows_mapped),
+        source="generic_import",
+        records=result.records,
+        records_seen=result.rows_seen,
+        records_mapped=result.rows_mapped,
+        records_skipped=result.rows_skipped,
+        duplicates_skipped=result.duplicates_skipped,
+        source_capabilities={
+            "request_model": True,
+            "input_tokens": any(record.usage.input_tokens is not None for record in result.records),
+            "output_tokens": any(record.usage.output_tokens is not None for record in result.records),
+            "cached_input_tokens": any(record.usage.cached_tokens is not None for record in result.records),
+            "latency": any(record.latency_ms is not None for record in result.records),
+            "outcomes": any(record.status_code is not None for record in result.records),
+        },
+        metric_errors={"mapping": "Some rows could not be mapped."} if result.rows_skipped else {},
+    )
     return result
 
 

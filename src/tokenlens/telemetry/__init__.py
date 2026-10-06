@@ -10,7 +10,13 @@ records defined in :mod:`tokenlens.telemetry.schema` through the shared
 from __future__ import annotations
 
 from .config import TelemetryConfig
-from .manifest import CollectionManifest, DeploymentCollectionManifest, GapInterval, MetricCoverage
+from .manifest import (
+    CollectionManifest,
+    DeploymentCollectionManifest,
+    GapInterval,
+    MetricCoverage,
+    build_request_manifest,
+)
 from .privacy import ContentLeakError, FingerprintPolicy, assert_contentless
 from .schema import (
     SCHEMA_VERSION,
@@ -42,6 +48,7 @@ __all__ = [
     "ModelRequestRecord",
     "GapInterval",
     "MetricCoverage",
+    "build_request_manifest",
     "ResourceScope",
     "TelemetryConfig",
     "TelemetryUsage",

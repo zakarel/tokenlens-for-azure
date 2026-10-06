@@ -197,6 +197,18 @@ def test_map_row_drops_an_unrecognized_error_category_instead_of_guessing(tmp_pa
     assert valid_record.error_category == "rate_limited"
 
 
+def test_generic_import_persists_source_manifest(tmp_path):
+    mapping_path = tmp_path / "mapping.yml"
+    mapping_path.write_text(VALID_MAPPING, encoding="utf-8")
+    result = import_rows(
+        [row()],
+        load_mapping(mapping_path),
+    )
+    assert result.manifest is not None
+    assert result.manifest.source == "generic_import"
+    assert result.manifest.records_mapped == 1
+
+
 # -- file import + idempotency ------------------------------------------------
 
 

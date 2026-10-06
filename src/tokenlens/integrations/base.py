@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from typing import Any, Callable, Iterable, Sequence
 
 from ..telemetry.config import TelemetryConfig
+from ..telemetry.manifest import CollectionManifest, build_request_manifest
 from ..telemetry.privacy import FingerprintPolicy
 from ..telemetry.schema import (
     ContentFeatures,
@@ -166,6 +167,13 @@ class Instrumentation:
     scope: ResourceScope = field(default_factory=ResourceScope)
     measure_tokens: bool = False
     fingerprints: FingerprintPolicy = field(default_factory=lambda: FingerprintPolicy(enabled=False, key=None))
+    _records_seen: int = 0
+    _records_mapped: int = 0
+    _records_skipped: int = 0
+    _metric_capabilities: dict[str, bool] = field(default_factory=dict)
+    _metric_errors: dict[str, str] = field(default_factory=dict)
+    _first_timestamp: datetime | None = None
+    _last_timestamp: datetime | None = None
 
     def record(
         self,
@@ -185,13 +193,16 @@ class Instrumentation:
         request_key: str | None = None,
     ) -> bool:
         """Emit one canonical record. Returns ``True`` when it was persisted."""
+        self._records_seen += 1
         key = request_key or uuid.uuid4().hex
         if not sample_decision(key, self.config.sample_rate):
+            self._records_skipped += 1
             return False
+        timestamp = datetime.now(UTC)
         record = ModelRequestRecord(
             source="sdk_wrapper",
             event_id=hashlib.sha256(key.encode("utf-8")).hexdigest()[:32],
-            timestamp=datetime.now(UTC),
+            timestamp=timestamp,
             provider=self.provider,
             deployment_name=deployment_name or "unknown",
             model_name=model_name or "unknown",
@@ -211,7 +222,39 @@ class Instrumentation:
             content_features=content_features or ContentFeatures(),
             fingerprints=fingerprints or Fingerprints(),
         )
-        return self.writer.write(record)
+        self._first_timestamp = min(self._first_timestamp, timestamp) if self._first_timestamp else timestamp
+        self._last_timestamp = max(self._last_timestamp, timestamp) if self._last_timestamp else timestamp
+        for name, value in (
+            ("input_tokens", usage.input_tokens),
+            ("cached_input_tokens", usage.cached_tokens),
+            ("output_tokens", usage.output_tokens),
+            ("latency", record.latency_ms),
+            ("outcomes", status_code),
+        ):
+            self._metric_capabilities[name] = self._metric_capabilities.get(name, False) or value is not None
+        if error_category:
+            self._metric_errors[f"error_category:{error_category}"] = f"Observed {error_category} responses."
+        written = self.writer.write(record)
+        if written:
+            self._records_mapped += 1
+        else:
+            self._records_skipped += 1
+        return written
+
+    def collection_manifest(self) -> CollectionManifest:
+        """Return a privacy-safe manifest snapshot for SDK-collected records."""
+        return build_request_manifest(
+            run_id=f"sdk-{self.provider}",
+            source="sdk",
+            records=[],
+            records_seen=self._records_seen,
+            records_mapped=self._records_mapped,
+            records_skipped=self._records_skipped,
+            source_capabilities=dict(self._metric_capabilities),
+            metric_errors=dict(self._metric_errors),
+            requested_start=self._first_timestamp,
+            requested_end=self._last_timestamp,
+        )
 
     # -- contentless request measurement --------------------------------
     def describe_request(

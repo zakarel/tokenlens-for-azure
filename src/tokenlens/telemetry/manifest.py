@@ -12,6 +12,7 @@ from .schema import BucketMetrics, MetricBucketRecord
 
 MetricState = Literal["complete", "partial", "unavailable"]
 CollectionState = Literal["succeeded", "failed", "skipped"]
+CollectionSource = Literal["azure_monitor", "sdk", "opentelemetry", "appinsights", "generic_import"]
 
 
 class MetricCoverage(BaseModel):
@@ -70,9 +71,9 @@ class DeploymentCollectionManifest(BaseModel):
 class CollectionManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: int = 2
     run_id: str
-    source: Literal["azure_monitor"] = "azure_monitor"
+    source: CollectionSource = "azure_monitor"
     generated_at: datetime
     requested_start: datetime
     requested_end: datetime
@@ -81,6 +82,12 @@ class CollectionManifest(BaseModel):
     pages_read: int = Field(default=0, ge=0)
     retries: int = Field(default=0, ge=0)
     deployments: list[DeploymentCollectionManifest] = Field(default_factory=list)
+    source_capabilities: dict[str, bool] = Field(default_factory=dict)
+    metric_errors: dict[str, str] = Field(default_factory=dict)
+    records_seen: int = Field(default=0, ge=0)
+    records_mapped: int = Field(default=0, ge=0)
+    records_skipped: int = Field(default=0, ge=0)
+    duplicates_skipped: int = Field(default=0, ge=0)
 
 
 def _coverage(points: int, expected: int) -> MetricCoverage:
@@ -303,6 +310,46 @@ def build_deployment_manifest(
         retries=retries,
         identity_conflict_count=identity_conflict_count,
         error_category=error_category,
+    )
+
+
+def build_request_manifest(
+    *,
+    run_id: str,
+    source: CollectionSource,
+    records: Sequence[object],
+    records_seen: int,
+    records_mapped: int,
+    records_skipped: int,
+    duplicates_skipped: int = 0,
+    source_capabilities: dict[str, bool] | None = None,
+    metric_errors: dict[str, str] | None = None,
+    requested_start: datetime | None = None,
+    requested_end: datetime | None = None,
+) -> CollectionManifest:
+    """Build a privacy-safe manifest for request-level collection/imports."""
+    timestamps = [
+        value
+        for record in records
+        if (value := getattr(record, "timestamp", None)) is not None
+    ]
+    now = datetime.now(UTC)
+    start = requested_start or (min(timestamps) if timestamps else now)
+    end = requested_end or (max(timestamps) if timestamps else now)
+    return CollectionManifest(
+        run_id=run_id,
+        source=source,
+        generated_at=now,
+        requested_start=start,
+        requested_end=end,
+        bucket_minutes=1,
+        expected_buckets_per_deployment=0,
+        source_capabilities=dict(source_capabilities or {}),
+        metric_errors=dict(metric_errors or {}),
+        records_seen=records_seen,
+        records_mapped=records_mapped,
+        records_skipped=records_skipped,
+        duplicates_skipped=duplicates_skipped,
     )
 
 

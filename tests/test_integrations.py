@@ -213,6 +213,11 @@ def test_chat_completion_emits_one_contentless_record_and_no_extra_call(tmp_path
     serialized = json.dumps(records)
     assert CANARY_PROMPT not in serialized
     assert CANARY_SYSTEM not in serialized
+    manifest = instrumented.tokenlens_instrumentation.collection_manifest()
+    assert manifest.source == "sdk"
+    assert manifest.records_seen == 1
+    assert manifest.records_mapped == 1
+    assert manifest.source_capabilities["input_tokens"] is True
 
 
 def test_original_response_object_is_returned_unchanged(tmp_path):

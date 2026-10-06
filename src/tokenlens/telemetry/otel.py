@@ -16,7 +16,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Literal
 
 from .config import TelemetryConfig
 from .privacy import is_content_key
@@ -27,6 +27,7 @@ from .schema import (
     TelemetryUsage,
     deterministic_event_id,
 )
+from .manifest import CollectionManifest, build_request_manifest
 from .writer import TelemetryWriter
 
 #: GenAI semantic-convention attributes TokenLens understands. Everything else
@@ -99,6 +100,7 @@ class ImportResult:
     duplicates_skipped: int = 0
     content_attributes_discarded: int = 0
     ignored_attribute_names: set[str] = field(default_factory=set)
+    manifest: CollectionManifest | None = None
 
     def summary(self) -> dict[str, int]:
         return {
@@ -284,6 +286,7 @@ def import_spans(
     *,
     scope: ResourceScope | None = None,
     max_spans: int = 1_000_000,
+    source: Literal["opentelemetry", "appinsights"] = "opentelemetry",
 ) -> ImportResult:
     result = ImportResult()
     seen: set[str] = set()
@@ -307,6 +310,28 @@ def import_spans(
         seen.add(record.event_id)
         result.records.append(record)
         result.spans_mapped += 1
+    result.manifest = build_request_manifest(
+        run_id=deterministic_event_id(source, result.spans_seen, result.spans_mapped),
+        source=source,
+        records=result.records,
+        records_seen=result.spans_seen,
+        records_mapped=result.spans_mapped,
+        records_skipped=result.spans_skipped,
+        duplicates_skipped=result.duplicates_skipped,
+        source_capabilities={
+            "request_model": True,
+            "input_tokens": any(record.usage.input_tokens is not None for record in result.records),
+            "output_tokens": any(record.usage.output_tokens is not None for record in result.records),
+            "cached_input_tokens": any(record.usage.cached_tokens is not None for record in result.records),
+            "latency": any(record.latency_ms is not None for record in result.records),
+            "outcomes": any(record.status_code is not None for record in result.records),
+        },
+        metric_errors={
+            "mapping": "Some spans could not be mapped."
+            if result.spans_skipped
+            else ""
+        } if result.spans_skipped else {},
+    )
     return result
 
 
@@ -322,7 +347,7 @@ def import_file(path: str | Path, *, scope: ResourceScope | None = None, max_spa
         raise OtelImportError(f"Input file not found: {source}")
     text = source.read_text(encoding="utf-8")
     if not text.strip():
-        return ImportResult()
+        return import_spans([], scope=scope, max_spans=max_spans)
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:

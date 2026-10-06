@@ -135,7 +135,7 @@ def _iter_export_records(payload: Any) -> Iterator[dict[str, Any]]:
 def import_export(payload: Any, *, scope: ResourceScope | None = None, max_rows: int = 1_000_000) -> ImportResult:
     """Import an already-parsed Application Insights export or Logs query result."""
     spans = (_as_span(record) for record in _iter_export_records(payload))
-    return import_spans(spans, scope=scope, max_spans=max_rows)
+    return import_spans(spans, scope=scope, max_spans=max_rows, source="appinsights")
 
 
 def import_file(path: str | Path, *, scope: ResourceScope | None = None, max_rows: int = 1_000_000) -> ImportResult:
@@ -145,11 +145,11 @@ def import_file(path: str | Path, *, scope: ResourceScope | None = None, max_row
         raise OtelImportError(f"Input file not found: {source}")
     text = source.read_text(encoding="utf-8")
     if not text.strip():
-        return ImportResult()
+        return import_spans([], scope=scope, max_spans=max_rows, source="appinsights")
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        return import_spans(_iter_jsonl_export(text), scope=scope, max_spans=max_rows)
+        return import_spans(_iter_jsonl_export(text), scope=scope, max_spans=max_rows, source="appinsights")
     return import_export(payload, scope=scope, max_rows=max_rows)
 
 

@@ -127,6 +127,12 @@ def test_import_detects_duplicates_through_a_local_identifier():
     assert result.spans_mapped == 2
     assert result.duplicates_skipped == 1
     assert result.content_attributes_discarded >= 6
+    assert result.manifest is not None
+    assert result.manifest.source == "opentelemetry"
+    assert result.manifest.records_seen == 3
+    assert result.manifest.records_mapped == 2
+    assert result.manifest.duplicates_skipped == 1
+    assert "input_tokens" in result.manifest.source_capabilities
     # The upstream span id is never written into telemetry.
     assert all("0123456789abcdef" not in record.event_id for record in result.records)
 
