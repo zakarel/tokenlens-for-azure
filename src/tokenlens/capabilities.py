@@ -37,8 +37,9 @@ UsageBasis = Literal[
     "ptu_hours",
 ]
 CommerceType = Literal["azure_direct", "marketplace", "managed_compute", "unknown"]
+LifecycleStatus = Literal["active", "preview", "retired", "unknown"]
 
-CAPABILITY_CATALOG_VERSION = "2026-10-06.1"
+CAPABILITY_CATALOG_VERSION = "2026-10-06.2"
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,19 @@ class ModelCapability:
     usage_bases: tuple[UsageBasis, ...]
     commerce_type: CommerceType
     ptu_eligible: bool | None
+    supported_deployment_types: tuple[str, ...] = (
+        "global",
+        "regional",
+        "data_zone",
+        "global_provisioned",
+        "regional_provisioned",
+        "data_zone_provisioned",
+        "batch",
+    )
+    metric_capabilities: tuple[str, ...] = ()
+    capacity_source_key: str | None = None
+    lifecycle_status: LifecycleStatus = "active"
+    base_model: str | None = None
 
 
 _CAPABILITIES = (
@@ -59,6 +73,8 @@ _CAPABILITIES = (
         usage_bases=("input_tokens", "cached_input_tokens", "output_tokens"),
         commerce_type="azure_direct",
         ptu_eligible=True,
+        metric_capabilities=("input_tokens", "cached_input_tokens", "output_tokens", "requests"),
+        capacity_source_key="azure_openai:gpt-4o",
     ),
     ModelCapability(
         canonical_model="gpt-4.1",
@@ -67,6 +83,8 @@ _CAPABILITIES = (
         usage_bases=("input_tokens", "cached_input_tokens", "output_tokens"),
         commerce_type="azure_direct",
         ptu_eligible=True,
+        metric_capabilities=("input_tokens", "cached_input_tokens", "output_tokens", "requests"),
+        capacity_source_key="azure_openai:gpt-4.1",
     ),
     ModelCapability(
         canonical_model="gpt-5",
@@ -83,6 +101,8 @@ _CAPABILITIES = (
         usage_bases=("input_tokens", "cached_input_tokens", "output_tokens"),
         commerce_type="azure_direct",
         ptu_eligible=True,
+        metric_capabilities=("input_tokens", "cached_input_tokens", "output_tokens", "requests"),
+        capacity_source_key="azure_openai:gpt-5",
     ),
     ModelCapability(
         canonical_model="text-embedding",
@@ -179,6 +199,33 @@ _CAPABILITIES = (
         usage_bases=("input_tokens", "cached_input_tokens", "output_tokens"),
         commerce_type="azure_direct",
         ptu_eligible=False,
+        metric_capabilities=("input_tokens", "cached_input_tokens", "output_tokens", "requests"),
+    ),
+    ModelCapability(
+        canonical_model="fine-tuned",
+        aliases=("fine-tuned", "fine_tuned", "fine-tuning"),
+        modality="text",
+        usage_bases=(
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "training_tokens",
+            "training_hours",
+            "hosting_hours",
+        ),
+        commerce_type="azure_direct",
+        ptu_eligible=False,
+        metric_capabilities=("input_tokens", "cached_input_tokens", "output_tokens", "requests"),
+    ),
+    ModelCapability(
+        canonical_model="managed-compute",
+        aliases=("managed-compute", "managed_compute", "managed compute"),
+        modality="managed_compute",
+        usage_bases=("compute_hours", "hosting_hours", "requests"),
+        commerce_type="managed_compute",
+        ptu_eligible=False,
+        supported_deployment_types=("managed_compute",),
+        metric_capabilities=("compute_hours", "hosting_hours", "requests"),
     ),
 )
 
@@ -203,6 +250,7 @@ def resolve_model_capability(model: str | None) -> ModelCapability | None:
 __all__ = [
     "CAPABILITY_CATALOG_VERSION",
     "CommerceType",
+    "LifecycleStatus",
     "ModelCapability",
     "Modality",
     "UsageBasis",

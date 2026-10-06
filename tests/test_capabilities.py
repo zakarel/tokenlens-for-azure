@@ -43,3 +43,50 @@ def test_catalog_separates_marketplace_from_azure_direct_commerce():
 
     assert claude is not None and claude.commerce_type == "marketplace"
     assert gpt is not None and gpt.commerce_type == "azure_direct"
+
+
+def test_ga_capability_matrix_keeps_modalities_and_units_explicit():
+    cases = {
+        "gpt-4o": ("text", "input_tokens"),
+        "text-embedding-3-large": ("embedding", "input_tokens"),
+        "gpt-4o-realtime-preview": ("audio", "audio_seconds"),
+        "gpt-4o-mini-tts": ("text_to_speech", "characters"),
+        "whisper-1": ("speech_to_text", "audio_hours"),
+        "dall-e-3": ("image", "images"),
+        "sora-2": ("video", "video_seconds"),
+        "grok-4.6": ("text", "input_tokens"),
+        "claude-sonnet-4": ("text", "input_tokens"),
+        "mistral-large": ("text", "input_tokens"),
+        "fine-tuned": ("text", "training_tokens"),
+        "model-router": ("router", "input_tokens"),
+        "managed-compute": ("managed_compute", "compute_hours"),
+    }
+    for model, (modality, usage_basis) in cases.items():
+        capability = resolve_model_capability(model)
+        assert capability is not None, model
+        assert capability.modality == modality
+        assert usage_basis in capability.usage_bases
+
+
+def test_unknown_future_model_has_no_guessed_properties():
+    assert resolve_model_capability("future-model-2027") is None
+
+
+def test_discovery_preserves_fine_tuning_and_router_identity():
+    fine_tuned = enrich_deployment({
+        "name": "tuned",
+        "model": "fine-tuned",
+        "base_model": "gpt-4o",
+        "fine_tuned": True,
+    })
+    router = enrich_deployment({
+        "name": "router",
+        "model": "model-router",
+        "router": True,
+        "spillover_deployment": "fallback",
+    })
+    assert fine_tuned.base_model == "gpt-4o"
+    assert fine_tuned.fine_tuned is True
+    assert "training_tokens" in fine_tuned.supported_usage_bases
+    assert router.router_configured is True
+    assert router.spillover_deployment == "fallback"

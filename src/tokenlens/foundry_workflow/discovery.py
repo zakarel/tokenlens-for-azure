@@ -290,6 +290,19 @@ def enrich_deployment(raw: dict[str, Any]) -> DeploymentRecord:
         ptu_eligible=capability.ptu_eligible if capability else None,
         capability_catalog_version=CAPABILITY_CATALOG_VERSION if capability else None,
         capability_status="verified" if capability else "unknown",
+        supported_deployment_types=capability.supported_deployment_types if capability else (),
+        metric_capabilities=capability.metric_capabilities if capability else (),
+        capacity_source_key=capability.capacity_source_key if capability else None,
+        lifecycle_status=capability.lifecycle_status if capability else "unknown",
+        base_model=str(raw["base_model"]) if raw.get("base_model") else capability.base_model if capability else None,
+        fine_tuned=bool(raw.get("fine_tuned") or raw.get("fineTuned")),
+        router_configured=bool(raw.get("router") or raw.get("router_configured")),
+        spillover_deployment=(
+            str(raw["spillover_deployment"])
+            if raw.get("spillover_deployment")
+            else None
+        ),
+        offer_plan=str(raw["offer_plan"]) if raw.get("offer_plan") else None,
     )
 
 

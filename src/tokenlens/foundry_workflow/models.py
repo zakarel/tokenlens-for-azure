@@ -144,6 +144,15 @@ class DeploymentRecord(BaseModel):
     ptu_eligible: bool | None = None
     capability_catalog_version: str | None = None
     capability_status: Literal["verified", "unknown"] = "unknown"
+    supported_deployment_types: tuple[str, ...] = ()
+    metric_capabilities: tuple[str, ...] = ()
+    capacity_source_key: str | None = None
+    lifecycle_status: str = "unknown"
+    base_model: str | None = None
+    fine_tuned: bool = False
+    router_configured: bool = False
+    spillover_deployment: str | None = None
+    offer_plan: str | None = None
 
     @property
     def mode_label(self) -> str:
