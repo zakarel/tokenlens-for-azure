@@ -7,11 +7,19 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e ".[dev]"
+      - run: python -m pip install -e ".[foundry,foundry-claude,otel,foundry-monitor]"
       - run: pytest
       - run: tokenlens-azure analyze examples/requests.jsonl --format json --output tokenlens.json
+      - run: python -m pip wheel . --no-deps --wheel-dir dist
+      - run: python -m pip install --no-deps dist/tokenlens_azure-*.whl
+      - run: tokenlens-azure doctor
