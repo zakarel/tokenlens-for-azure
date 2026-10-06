@@ -63,6 +63,7 @@ __all__ = [
 PUBLIC_CATALOG_NAME = "public-pricing-sync"
 RETAIL_SOURCE = "azure_retail_prices"
 CLAUDE_SOURCE = "claude_pricing_docs"
+OFFICIAL_PAGES_SOURCE = "official_foundry_pages"
 
 
 @dataclass
@@ -112,7 +113,11 @@ def cached_snapshots() -> list[PricingSnapshot]:
     """Every readable cached snapshot, in resolution order."""
     return [
         snapshot
-        for snapshot in (load_snapshot(AZURE_RETAIL_SNAPSHOT), load_snapshot(CLAUDE_SNAPSHOT))
+        for snapshot in (
+            load_snapshot(AZURE_RETAIL_SNAPSHOT),
+            load_snapshot(CLAUDE_SNAPSHOT),
+            load_snapshot(SOURCE_NAMES[OFFICIAL_PAGES_SOURCE]),
+        )
         if snapshot is not None
     ]
 

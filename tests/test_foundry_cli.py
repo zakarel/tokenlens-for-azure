@@ -344,6 +344,14 @@ def test_foundry_pricing_separates_identity_from_a_missing_rate(cli):
     assert "suggested override key unknown" not in result.output
 
 
+def test_nested_foundry_pricing_workflow_exposes_audit_and_provenance(cli):
+    audit = runner.invoke(app, ["foundry", "pricing", "audit"])
+    assert audit.exit_code == 0
+    provenance = runner.invoke(app, ["foundry", "pricing", "provenance"])
+    assert provenance.exit_code == 0
+    assert "official_foundry_pages=" in provenance.output
+
+
 def test_workloads_list_and_status_describe_the_default_technical_workloads(cli):
     assert runner.invoke(app, COLLECT_ARGS).exit_code == 0
     listed = runner.invoke(app, ["foundry", "workloads", "list"])

@@ -55,6 +55,9 @@ from .pricing_sources.assumptions import (
     canonical_deployment,
 )
 from .pricing_sources.sync import sync_public_pricing
+from .pricing_sources.official_pages import OFFICIAL_ROUTES, sync_official_pages
+from .pricing_sources.cache import snapshot_path
+from .pricing_sources.fetch import FetchError
 from .pricing_sources.imports import ImportedPriceRow
 from .foundry_workflow.wizard import (
     collect_and_report,
@@ -72,6 +75,10 @@ foundry_app = typer.Typer(
         "Run `tokenlens-azure foundry` for the guided path, or `foundry collect` with explicit "
         "options for automation."
     ),
+    invoke_without_command=True,
+)
+foundry_pricing_app = typer.Typer(
+    help="Foundry pricing readiness, synchronization, imports, and provenance.",
     invoke_without_command=True,
 )
 
@@ -388,8 +395,7 @@ def foundry_status(
         _fail(exc)
 
 
-@foundry_app.command("pricing")
-def foundry_pricing(
+def foundry_pricing_readiness(
     as_json: bool = typer.Option(False, "--json", help="Emit machine-readable pricing readiness."),
     config: str | None = typer.Option(None, "--config", help="Path to .tokenlens.yml."),
 ) -> None:
@@ -438,6 +444,41 @@ def foundry_pricing(
             )
         elif item.suggested_override_key:
             typer.echo(f"  {item.deployment}: suggested override key {item.suggested_override_key}")
+
+
+@foundry_pricing_app.callback()
+def foundry_pricing(
+    ctx: typer.Context,
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable pricing readiness."),
+    config: str | None = typer.Option(None, "--config", help="Path to .tokenlens.yml."),
+) -> None:
+    if ctx.invoked_subcommand is None:
+        foundry_pricing_readiness(as_json=as_json, config=config)
+
+
+@foundry_pricing_app.command("sync")
+def foundry_pricing_sync(source: str = typer.Option("retail", "--source")) -> None:
+    pricing_sync(source=source)
+
+
+@foundry_pricing_app.command("audit")
+def foundry_pricing_audit() -> None:
+    foundry_pricing_readiness(as_json=False, config=None)
+
+
+@foundry_pricing_app.command("import-pricesheet")
+def foundry_pricing_import_pricesheet(path: str = typer.Argument(..., metavar="FILE")) -> None:
+    pricing_import_pricesheet(path)
+
+
+@foundry_pricing_app.command("import-cost-details")
+def foundry_pricing_import_cost_details(path: str = typer.Argument(..., metavar="FILE")) -> None:
+    pricing_import_cost_details(path)
+
+
+@foundry_pricing_app.command("provenance")
+def foundry_pricing_provenance() -> None:
+    pricing_provenance()
 
 
 @workloads_app.command("list")
@@ -624,6 +665,8 @@ def pricing_provenance() -> None:
     """Show local pricing snapshot and imported-source provenance."""
     for key, path in public_snapshot_paths().items():
         typer.echo(f"{key}={safe_display_path(path)} exists={path.is_file()}")
+    official_path = snapshot_path("official-foundry-pages.json")
+    typer.echo(f"official_foundry_pages={safe_display_path(official_path)} exists={official_path.is_file()}")
     config_root = Path(os.environ.get("TOKENLENS_CONFIG_DIR", str(Path.home() / ".config" / "tokenlens")))
     imports = sorted((config_root / "pricing-imports").glob("*.json"))
     typer.echo(f"imported-sources={len(imports)}")
@@ -633,6 +676,7 @@ def pricing_provenance() -> None:
 
 @pricing_app.command("sync")
 def pricing_sync(
+    source: str = typer.Option("retail", "--source", help="retail, official-pages, or all."),
     currency: str = typer.Option("USD", "--currency", help="Billing currency to request. Never converted."),
     region: str | None = typer.Option(
         None, "--region", help="Restrict the Azure Retail Prices query to one ARM region."
@@ -657,6 +701,8 @@ def pricing_sync(
     ``0600`` permissions and every later analysis reads it offline.
     """
     try:
+        if source not in {"retail", "official-pages", "all"}:
+            raise ValueError("source must be retail, official-pages, or all")
         modes = [canonical_deployment(item) for item in deployment_mode]
         contexts = [canonical_context(item) for item in context]
     except PricingDimensionError as exc:
@@ -672,7 +718,24 @@ def pricing_sync(
         contexts=contexts or None,
         include_claude=include_claude,
         claude_deployment_modes=modes or None,
-    )
+    ) if source in {"retail", "all"} else None
+    if source in {"official-pages", "all"}:
+        try:
+            snapshot, rates = sync_official_pages(
+                OFFICIAL_ROUTES.keys() if source == "all" else ("mistral",),
+            )
+            typer.echo(
+                f"source=official_foundry_pages status=ok entries={len(rates)} "
+                f"snapshot={safe_display_path(snapshot_path('official-foundry-pages.json'))}"
+            )
+        except (FetchError, OSError, ValueError) as exc:
+            typer.echo(f"source=official_foundry_pages status=failed error={type(exc).__name__}", err=True)
+            if source == "official-pages":
+                raise typer.Exit(code=EXIT_PARTIAL) from exc
+    if report is None:
+        typer.echo("pricing-sync=ok")
+        typer.echo("analysis=offline; official page snapshot is read without any network request")
+        return
     for outcome in report.outcomes:
         typer.echo(
             f"source={outcome.source} status={outcome.status} "
@@ -759,7 +822,8 @@ def pricing_set_rate(
 def register(app: typer.Typer) -> None:
     """Attach the workflow sub-applications to the root CLI."""
     app.add_typer(foundry_app, name="foundry")
+    foundry_app.add_typer(foundry_pricing_app, name="pricing")
     app.add_typer(pricing_app, name="pricing")
 
 
-__all__ = ["foundry_app", "pricing_app", "register", "workloads_app"]
+__all__ = ["foundry_app", "foundry_pricing_app", "pricing_app", "register", "workloads_app"]
