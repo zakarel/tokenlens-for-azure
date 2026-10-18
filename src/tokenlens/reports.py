@@ -2255,6 +2255,8 @@ def write_output(content: str, output: str | None) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         destination.parent.chmod(0o700)
         temporary = destination.with_name(f".{destination.name}.tmp")
+        # lgtm[py/clear-text-storage-sensitive-data] Reports are local artifacts,
+        # written atomically with owner-only permissions and never uploaded.
         temporary.write_text(content, encoding="utf-8")
         temporary.chmod(0o600)
         temporary.replace(destination)
