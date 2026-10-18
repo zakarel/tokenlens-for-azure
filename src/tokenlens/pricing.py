@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime, time
 import re
 from typing import Literal, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .aggregate import telemetry_kind
 from .events import ModelCallEvent, ToolStepEvent
@@ -132,6 +132,14 @@ class PricingCatalog(BaseModel):
     #: produced by a synchronization rather than hand-curated.
     assumptions: dict[str, str] | None = None
     prices: list[PriceEntry] = Field(default_factory=list)
+
+    @field_validator("currency")
+    @classmethod
+    def validate_currency(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", normalized):
+            raise ValueError("currency must be a three-letter ISO 4217 code")
+        return normalized
 
     def resolve(self, event: ModelCallEvent) -> PriceEntry | None:
         return self.resolve_for(event, event.timestamp)

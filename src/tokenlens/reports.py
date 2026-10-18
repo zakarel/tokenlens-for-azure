@@ -702,7 +702,7 @@ def _analytics_deployment_sections(report: AnalysisReport) -> str:
 
 
 def _money(value: float | None, *, currency: str = "USD", precision: int = 4) -> str:
-    return money(value, currency, precision=precision, unavailable="Pricing unavailable")
+    return _escape(money(value, currency, precision=precision, unavailable="Pricing unavailable"))
 
 
 def _rate(value: float | None, *, currency: str = "USD") -> str:
@@ -2252,8 +2252,13 @@ def _model_table(report: AnalysisReport) -> str:
 def write_output(content: str, output: str | None) -> None:
     if output:
         destination = Path(output)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(content, encoding="utf-8")
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination.parent.chmod(0o700)
+        temporary = destination.with_name(f".{destination.name}.tmp")
+        temporary.write_text(content, encoding="utf-8")
+        temporary.chmod(0o600)
+        temporary.replace(destination)
+        destination.chmod(0o600)
     else:
         print(content, end="")
 

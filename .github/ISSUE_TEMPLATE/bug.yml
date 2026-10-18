@@ -1,0 +1,32 @@
+name: Bug report
+description: Report a reproducible defect using synthetic or sanitised data.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: TokenLens version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Include a minimal synthetic fixture or sanitised command. Never include secrets or customer data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behaviour
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: This report contains no prompts, responses, credentials, identifiers, endpoints, or customer data.
+          required: true

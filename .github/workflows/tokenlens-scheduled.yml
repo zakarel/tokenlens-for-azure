@@ -23,17 +23,18 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install --quiet .
-      - name: Generate report
+      - name: Validate private trace path
         env:
           TOKENLENS_TRACE_INPUT: ${{ inputs.trace-path || vars.TOKENLENS_TRACE_INPUT }}
         run: |
           test -n "${TOKENLENS_TRACE_INPUT}"
-          # TOKENLENS_TRACE_INPUT may point to rotated v2 event JSONL files.
-          # Keep enough lookback to join late task results and human reviews.
+          case "${TOKENLENS_TRACE_INPUT}" in
+            /var/lib/tokenlens/traces/*) ;;
+            *) echo "Trace input must be under /var/lib/tokenlens/traces" >&2; exit 1 ;;
+          esac
+      - name: Generate private report
+        env:
+          TOKENLENS_TRACE_INPUT: ${{ inputs.trace-path || vars.TOKENLENS_TRACE_INPUT }}
+        run: |
           tokenlens-azure analyze "${TOKENLENS_TRACE_INPUT}" --format html --output-dir reports
           tokenlens-azure analyze "${TOKENLENS_TRACE_INPUT}" --format json --output-dir reports
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tokenlens-report-${{ github.run_number }}
-          path: reports/tokenlens-report-*
-          retention-days: 7
