@@ -100,6 +100,22 @@ def test_report_output_is_owner_only_and_atomic(tmp_path):
     assert not list(destination.parent.glob("*.tmp"))
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink and mode semantics")
+def test_report_output_does_not_follow_temporary_symlinks_or_rechmod_existing_parent(tmp_path):
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o755)
+    destination = parent / "report.html"
+    target = tmp_path / "outside.txt"
+    target.write_text("keep", encoding="utf-8")
+    (parent / ".report.html.attack.tmp").symlink_to(target)
+
+    write_output("safe\n", str(destination))
+
+    assert target.read_text(encoding="utf-8") == "keep"
+    assert destination.read_text(encoding="utf-8") == "safe\n"
+    assert parent.stat().st_mode & 0o777 == 0o755
+
+
 # --- Semantic availability --------------------------------------------------
 
 

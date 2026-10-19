@@ -28,13 +28,59 @@ jobs:
           TOKENLENS_TRACE_INPUT: ${{ inputs.trace-path || vars.TOKENLENS_TRACE_INPUT }}
         run: |
           test -n "${TOKENLENS_TRACE_INPUT}"
-          case "${TOKENLENS_TRACE_INPUT}" in
-            /var/lib/tokenlens/traces/*) ;;
-            *) echo "Trace input must be under /var/lib/tokenlens/traces" >&2; exit 1 ;;
-          esac
+          mapfile -t TOKENLENS_VALIDATED_INPUTS < <(python - "${TOKENLENS_TRACE_INPUT}" <<'PY'
+          import glob
+          import sys
+          from pathlib import Path
+
+          root = Path("/var/lib/tokenlens/traces").resolve(strict=True)
+          candidates = glob.glob(sys.argv[1], recursive=True)
+          if not candidates:
+              candidates = [sys.argv[1]]
+          resolved = []
+          for candidate in candidates:
+              path = Path(candidate)
+              paths = list(path.rglob("*")) if path.is_dir() else [path]
+              for item in paths:
+                  if not item.is_file():
+                      continue
+                  real = item.resolve(strict=True)
+                  if root not in real.parents:
+                      raise SystemExit(f"Trace input escapes approved root: {item}")
+                  resolved.append(str(real))
+          if not resolved:
+              raise SystemExit("Trace input resolved to no regular files")
+          for value in sorted(set(resolved)):
+              print(value)
+          PY
+          )
+          test "${#TOKENLENS_VALIDATED_INPUTS[@]}" -gt 0
+          printf '%s\n' "${TOKENLENS_VALIDATED_INPUTS[@]}"
       - name: Generate private report
         env:
           TOKENLENS_TRACE_INPUT: ${{ inputs.trace-path || vars.TOKENLENS_TRACE_INPUT }}
         run: |
-          tokenlens-azure analyze "${TOKENLENS_TRACE_INPUT}" --format html --output-dir reports
-          tokenlens-azure analyze "${TOKENLENS_TRACE_INPUT}" --format json --output-dir reports
+          mapfile -t TOKENLENS_VALIDATED_INPUTS < <(python - "${TOKENLENS_TRACE_INPUT}" <<'PY'
+          import glob
+          import sys
+          from pathlib import Path
+
+          root = Path("/var/lib/tokenlens/traces").resolve(strict=True)
+          candidates = glob.glob(sys.argv[1], recursive=True) or [sys.argv[1]]
+          resolved = []
+          for candidate in candidates:
+              path = Path(candidate)
+              paths = list(path.rglob("*")) if path.is_dir() else [path]
+              for item in paths:
+                  if item.is_file():
+                      real = item.resolve(strict=True)
+                      if root not in real.parents:
+                          raise SystemExit("Trace input escapes approved root")
+                      resolved.append(str(real))
+          if not resolved:
+              raise SystemExit("Trace input resolved to no regular files")
+          print("\n".join(sorted(set(resolved))))
+          PY
+          )
+          tokenlens-azure analyze "${TOKENLENS_VALIDATED_INPUTS[@]}" --format html --output-dir reports
+          tokenlens-azure analyze "${TOKENLENS_VALIDATED_INPUTS[@]}" --format json --output-dir reports
