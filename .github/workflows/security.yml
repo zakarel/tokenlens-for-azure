@@ -19,8 +19,10 @@ jobs:
       - name: Reject private and generated artifacts
         shell: bash
         run: |
-          ! git ls-files | grep -E '(^|/)(\.tokenlens\.yml|reports/|local-traces/|foundry-traces/|pricing-probe\.json|test\.py)$'
-          ! git ls-files | grep -E '\.(pem|key|p12|pfx|env)$'
+          if git ls-files | grep -E '(^|/)(\.tokenlens\.yml|pricing-probe\.json|test\.py)$|(^|/)(reports|local-traces|foundry-traces)/|\.(pem|key|p12|pfx|env)$'; then
+            echo "Private or generated artifacts must not be tracked" >&2
+            exit 1
+          fi
       - name: Scan tracked text for common credential markers
         shell: bash
         run: |
