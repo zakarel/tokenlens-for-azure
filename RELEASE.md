@@ -8,10 +8,11 @@ collection or synchronization.
 
 ## Release sequence
 
-`0.2.0a1` is the truth-model foundation prerelease. The planned sequence is
-`0.5.0b1` pricing, `0.8.0b1` insights/instrumentation, `1.0.0rc1`, then
-`1.0.0` GA. Every release requires the full test suite, wheel/package-data
-checks, privacy scans, deterministic pricing/insight fixtures, and CI matrix.
+`1.0.0rc1` is the current release candidate. Publish `1.0.0` only after the
+RC soak, approved live-canary evidence, artifact-level privacy review, and the
+full supported-platform matrix. Every release requires the full test suite,
+wheel/package-data checks, privacy scans, deterministic pricing/insight
+fixtures, and CI matrix.
 
 ## Rollback criteria
 
@@ -26,3 +27,14 @@ any of these regressions is found after publication.
 Security reports should include the product version, sanitized command, and
 reproduction fixture without prompts, responses, credentials, identifiers, or
 customer pricing. See `SECURITY.md`.
+
+## Release-candidate exit gate
+
+Before tagging `v1.0.0`, record:
+
+- all supported CI checks green on the RC commit;
+- a fresh wheel and source distribution install and run successfully;
+- synthetic privacy and repository-hygiene scans pass;
+- representative private live canaries complete without publishing telemetry;
+- no unresolved P0/P1 correctness or security issue;
+- rollback owner, support contact, and known limitations are confirmed.
