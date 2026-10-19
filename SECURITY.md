@@ -27,6 +27,8 @@ user-only permissions where supported. Contract, Marketplace, override, and
 actual-cost data remains customer-local and is never merged into public pricing
 snapshots.
 
-Generated reports are private by default. Do not upload reports derived from
+On POSIX systems, `analyze` writes report files with owner-only permissions.
+Other report-generation paths and platforms may inherit filesystem permissions.
+Do not upload reports derived from
 real telemetry to this public repository, public issue trackers, or public CI
 artifacts. Use synthetic fixtures for public bug reports and documentation.
