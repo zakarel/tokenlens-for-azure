@@ -90,9 +90,11 @@ tokenlens-azure foundry configure --assessment-mode full
 ```
 
 Operational mode uses deployment inventory, Azure Monitor, pricing, workloads,
-and PTU evidence. Optimization mode uses SDK, OpenTelemetry, Application
-Insights, or JSONL request telemetry for TL001-TL008. Full mode runs both
-tracks; aggregate telemetry alone never claims request-level optimization.
+PTU evidence, and actionable aggregate insights by default. Optimization mode
+uses SDK, OpenTelemetry, Application Insights, or JSONL request telemetry for
+TL001-TL008. Full mode runs both tracks; aggregate telemetry alone never claims
+request-level optimization, and the report explains that request telemetry is
+an optional precision upgrade rather than a prerequisite for insights.
 
 The wizard:
 

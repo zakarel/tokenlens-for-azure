@@ -434,9 +434,10 @@ def _overview_actions(findings: list[Finding], report: AnalysisReport) -> str:
         )
     if report.diagnostics.source == "aggregate" or report.diagnostics.not_evaluated:
         return (
-            '<li class="not-evaluated"><strong>Request-level optimisation not evaluated</strong>'
-            "<span>Instrument the SDK or import OpenTelemetry to analyse prompt, retry, and cache efficiency. "
-            "No request-level diagnostic ran against this telemetry.</span></li>"
+            '<li class="not-evaluated"><strong>No request-level findings were evaluated</strong>'
+            "<span>Azure Monitor aggregate buckets cannot evaluate prompt, retry, tool, retrieval, or "
+            "per-request cache behaviour. Aggregate operational insights are shown above; request telemetry "
+            "is an optional precision upgrade.</span></li>"
         )
     return '<li class="not-evaluated"><strong>No prioritized Azure actions</strong><span>Every applicable diagnostic ran and found no addressable issue.</span></li>'
 
@@ -474,7 +475,18 @@ def _diagnostic_sections(report: AnalysisReport) -> str:
         f'<li><strong>{_escape(item.rule_id)} {_escape(item.title)}</strong><span>{_escape(item.detail)}</span></li>'
         for item in no_issue
     ) or '<li class="empty">No rule completed without a finding.</li>'
-    return f"""<section class="panel analytics-section"><div class="panel-head"><div><h2>Evaluated findings</h2>
+    aggregate_insights = report.report_metadata.get("insights") or []
+    aggregate_notice = (
+        f"""<section class="panel analytics-section insight-coverage">
+        <div class="panel-head"><div><h2>Aggregate operational insights evaluated</h2>
+        <small>{len(aggregate_insights):,} insight(s) evaluated from Azure Monitor evidence</small></div></div>
+        <p class="empty">These insights cover reliability, throttling, latency availability, token footprint,
+        pricing readiness, cache evidence, workload concentration, and PTU evidence where supported.
+        Request-level diagnostics are separate and require request telemetry.</p></section>"""
+        if report.diagnostics.source == "aggregate"
+        else ""
+    )
+    return f"""{aggregate_notice}<section class="panel analytics-section"><div class="panel-head"><div><h2>Evaluated findings</h2>
       <small>{len(evaluated):,} rule(s) ran against supporting evidence and detected an addressable issue.</small></div></div>
       <div class="finding-list">{finding_cards}</div></section>
     <section class="panel analytics-section"><div class="panel-head"><div><h2>Evaluated — no issue detected</h2>
@@ -2111,7 +2123,7 @@ def report_html(report: AnalysisReport) -> str:
 {_aggregate_insights_panel(report)}{_material_findings_panel(report, overview, summary, config, hidden_count)}
 <footer>tokenlens-for-azure · created by Tzahi Ariel</footer></section>
 <section class="tab-panel usage" id="usage-panel" role="tabpanel" aria-labelledby="usage-tab">
-<p class="analytics-intro">Usage analytics retains every finding. Percentages are relative to the relevant deployment or portfolio, and absolute token or call volume is shown alongside them. Low materiality does not mean invalid; it means lower priority for the first executive decision.</p>
+<p class="analytics-intro">Usage analytics retains every finding. Aggregate operational insights are evaluated by default from Azure Monitor evidence. Request-level diagnostics are an optional precision upgrade when compatible request telemetry is available. Percentages are relative to the relevant deployment or portfolio, and absolute token or call volume is shown alongside them. Low materiality does not mean invalid; it means lower priority for the first executive decision.</p>
 <section class="chart-grid">{model_chart}
 <article class="chart-card"><h2>Token usage by deployment</h2><p>Input, output, and cached tokens are stacked; deployments remain separate. Cached input is omitted, never drawn as zero, when the metric is unavailable.</p>{column_svg}<div class="legend"><span class="legend-row"><span class="swatch" style="background:#73c7ff"></span>Input (uncached)</span><span class="legend-row"><span class="swatch" style="background:#57d68b"></span>Output</span><span class="legend-row"><span class="swatch" style="background:#ffc857"></span>Cached input</span></div>{column_table}</article></section>
 <section class="panel table-panel"><h2>Model summary</h2><div class="table-scroll">{_model_table(report)}</div></section>
