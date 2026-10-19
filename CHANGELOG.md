@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1
+
+Clarifies aggregate operational insight coverage in the Usage & Diagnostics
+view and explains request-level telemetry as an optional precision upgrade.
+
 ## 1.0.0
 
 First general-availability release. Includes the validated release-candidate
@@ -31,5 +36,4 @@ This prerelease establishes the GA-track foundation:
 - workload, task, PTU, HTML, JSON, SARIF, and CLI contract hardening;
 - offline analysis, package-data validation, privacy controls, and sanitized configuration.
 
-This is not yet the `1.0.0` GA release. Remaining release gates are validation,
-supportability, and release-operations hardening.
+Historical prerelease notes.
