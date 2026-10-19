@@ -30,12 +30,18 @@ TokenLens does not send prompts or responses to another service and never guesse
 pricing or PTU capacity.
 
 > [!IMPORTANT]
-> TokenLens **1.0.0** is the general-availability release. Pricing, insight,
+> TokenLens **1.0.1** is the current general-availability release. Pricing, insight,
 > telemetry, and report contracts remain conservative when evidence is missing.
 
 ## Quick start
 
 ## Changelog
+
+### 1.0.1
+
+Patch release: aggregate operational insights are now explicitly presented in
+Usage & Diagnostics, and request-level telemetry is described as an optional
+precision upgrade rather than a prerequisite for insights.
 
 ### 1.0.0
 
