@@ -651,6 +651,7 @@ def test_asking_for_long_context_returns_the_long_context_meters():
 # --- Snapshot ---------------------------------------------------------------
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX mode bits")
 def test_a_snapshot_carries_provenance_and_is_cached_user_only(tmp_path, monkeypatch):
     monkeypatch.setenv("TOKENLENS_CONFIG_DIR", str(tmp_path / "cfg"))
     snapshot = retail_snapshot(
@@ -682,6 +683,7 @@ def test_a_snapshot_carries_provenance_and_is_cached_user_only(tmp_path, monkeyp
     assert len(reloaded.catalog.prices) == len(snapshot.catalog.prices)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX mode bits")
 def test_a_snapshot_write_replaces_the_previous_file_atomically(tmp_path, monkeypatch):
     monkeypatch.setenv("TOKENLENS_CONFIG_DIR", str(tmp_path / "cfg"))
     snapshot = retail_snapshot(

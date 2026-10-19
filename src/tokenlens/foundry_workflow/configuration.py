@@ -96,11 +96,11 @@ def safe_display_path(path: Path | str) -> str:
     """Render a path without leaking a home directory or username."""
     candidate = Path(path)
     try:
-        return str(candidate.resolve().relative_to(Path.cwd().resolve()))
+        return Path(candidate.resolve().relative_to(Path.cwd().resolve())).as_posix()
     except (ValueError, OSError):
         pass
     try:
-        return str(Path("~") / candidate.resolve().relative_to(Path.home()))
+        return Path("~", candidate.resolve().relative_to(Path.home()).as_posix()).as_posix()
     except (ValueError, OSError, RuntimeError):
         return candidate.name
 

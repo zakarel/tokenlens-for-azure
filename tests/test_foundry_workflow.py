@@ -9,6 +9,7 @@ TTY and without ANSI parsing.
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -712,6 +713,7 @@ def test_saved_configuration_contains_no_credential_material(workspace):
     assert "services.ai.azure.com" not in text
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX mode bits")
 def test_configuration_is_written_with_user_only_permissions(workspace):
     prompter = ScriptedPrompter(first_run_answers())
     configure(prompter, services=services())

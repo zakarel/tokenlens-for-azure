@@ -234,6 +234,7 @@ def test_assert_contentless_fails_closed():
         assert_contentless({"record_type": "model_request", "messages": [{"role": "user"}]})
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX mode bits")
 def test_writer_rotates_daily_and_restricts_permissions(tmp_path):
     config = TelemetryConfig(output_dir=tmp_path / "traces", retention_days=0)
     writer = TelemetryWriter(config)
