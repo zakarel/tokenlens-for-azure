@@ -152,6 +152,12 @@ def test_retries_are_unavailable_rather_than_zero_or_bucket_count(audited_report
     assert "retries observed" not in rendered
 
 
+def test_aggregate_usage_view_explains_operational_insights_are_evaluated(audited_report):
+    rendered = report_html(audited_report)
+    assert "Aggregate operational insights evaluated" in rendered
+    assert "Request-level diagnostics are separate" in rendered
+
+
 def test_missing_request_metric_is_unavailable_not_zero():
     records = [
         bucket(index=index, input_tokens=100, output_tokens=20, status_codes=None)
