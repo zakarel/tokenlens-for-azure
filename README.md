@@ -171,35 +171,61 @@ non-interactive terminals receive a plain-text equivalent.
 
 ### Overview
 
-<a href="docs/assets/tokenlens-report-overview-20260917-v8.png">
-  <img src="docs/assets/tokenlens-report-overview-20260917-v8.png" alt="Synthetic TokenLens Overview report">
+<a href="docs/assets/tokenlens-report-overview-1.0.1.png">
+  <img src="docs/assets/tokenlens-report-overview-1.0.1.png" alt="Synthetic TokenLens Overview report">
 </a>
 
 ### Cost analysis
 
-<a href="docs/assets/tokenlens-report-cost-analysis-20260917-v8.png">
-  <img src="docs/assets/tokenlens-report-cost-analysis-20260917-v8.png" alt="Synthetic TokenLens Cost analysis report">
+<a href="docs/assets/tokenlens-report-cost-analysis-1.0.1.png">
+  <img src="docs/assets/tokenlens-report-cost-analysis-1.0.1.png" alt="Synthetic TokenLens Cost analysis report">
 </a>
 
 ### Workloads
 
-<a href="docs/assets/tokenlens-report-workloads-20260917-v8.png">
-  <img src="docs/assets/tokenlens-report-workloads-20260917-v8.png" alt="Synthetic TokenLens Workloads report">
+<a href="docs/assets/tokenlens-report-workloads-1.0.1.png">
+  <img src="docs/assets/tokenlens-report-workloads-1.0.1.png" alt="Synthetic TokenLens Workloads report">
 </a>
 
 ### Usage & diagnostics
 
-<a href="docs/assets/tokenlens-report-usage-20260917-v8.png">
-  <img src="docs/assets/tokenlens-report-usage-20260917-v8.png" alt="Synthetic TokenLens Usage and diagnostics report">
+<a href="docs/assets/tokenlens-report-usage-diagnostics-1.0.1.png">
+  <img src="docs/assets/tokenlens-report-usage-diagnostics-1.0.1.png" alt="Synthetic TokenLens Usage and diagnostics report">
 </a>
 
 ### PTU advisor
 
-<a href="docs/assets/tokenlens-report-ptu-advisor-20260917-v8.png">
-  <img src="docs/assets/tokenlens-report-ptu-advisor-20260917-v8.png" alt="Synthetic TokenLens PTU advisor report">
+<a href="docs/assets/tokenlens-report-ptu-advisor-1.0.1.png">
+  <img src="docs/assets/tokenlens-report-ptu-advisor-1.0.1.png" alt="Synthetic TokenLens PTU advisor report">
 </a>
 
 <p align="center"><em>All screenshots use deterministic synthetic data.</em></p>
+
+## Possible findings
+
+TokenLens only reports a finding when the required evidence exists. Aggregate
+Azure Monitor scans produce operational findings by default; request-level
+findings require compatible request telemetry.
+
+| Finding | Evidence | Typical recommendation |
+|---|---|---|
+| Rate-limit or failure hotspot | Aggregate status-code coverage | Investigate throttling, capacity, retry policy, or failed routes |
+| Latency degradation or missing latency | Azure latency metrics | Compare affected deployments and validate the observation window |
+| Token footprint concentration | Aggregate input/output token totals | Focus optimization on the highest-volume deployment or workload |
+| Pricing gap or incomplete cost | Exact model, unit, and usage coverage | Add a verified rate or treat the priced subtotal separately |
+| Cache evidence gap | Cached-token metric or request usage | Import request usage before making cache-efficiency conclusions |
+| PTU evidence gap or recommendation | Active-bucket, eligibility, capacity, and price evidence | Validate traffic representativeness before committing capacity |
+| Repeated system prefix (TL001) | Request messages or contentless prompt fingerprints | Reuse stable prefixes and review prompt construction |
+| Conversation-history growth (TL002) | Per-request message history | Trim or summarise unnecessary context |
+| Unused tool definitions (TL003) | Tool definitions and call sites | Send only tools applicable to the request |
+| Retrieval redundancy (TL004) | Retrieved chunks per request | Deduplicate and reduce repeated context |
+| Retry amplification (TL005) | Retry metadata, retry counts, or request evidence | Bound retries and avoid replaying oversized context |
+| Output budget over-allocation (TL006) | Output limits and observed output distribution | Set route-specific output ceilings |
+| Semantic-cache opportunity (TL007) | Request content suitable for equivalence comparison | Evaluate cache thresholds, freshness, and tenant isolation |
+| Possible model over-sizing (TL008) | Model identity plus task-shape evidence | Validate quality before considering a smaller model |
+
+“Not evaluated” means the evidence was unavailable; it is never presented as a
+clean bill of health.
 
 ## Workload cost
 
