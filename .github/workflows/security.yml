@@ -26,7 +26,7 @@ jobs:
       - name: Scan tracked text for common credential markers
         shell: bash
         run: |
-          if git grep -n -I -E 'BEGIN (RSA|EC|OPENSSH|PRIVATE) KEY|github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|AZURE_CLIENT_SECRET[[:space:]]*[:=]' -- ':!tests/fixtures/**'; then
+          if git grep -n -I -E 'BEGIN ((RSA|EC|OPENSSH) )?PRIVATE KEY|github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|AZURE_CLIENT_SECRET[[:space:]]*[:=]' -- ':!tests/fixtures/**'; then
             echo "Potential credential material found in tracked text" >&2
             exit 1
           fi
