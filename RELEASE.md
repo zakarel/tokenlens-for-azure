@@ -8,9 +8,9 @@ collection or synchronization.
 
 ## Release sequence
 
-`1.0.0rc1` is the current release candidate. Publish `1.0.0` only after the
-RC soak, approved live-canary evidence, artifact-level privacy review, and the
-full supported-platform matrix. Every release requires the full test suite,
+`1.0.0` is the current GA release. It was published after the RC soak,
+approved live-canary evidence, artifact-level privacy review, and the full
+supported-platform matrix. Every release requires the full test suite,
 wheel/package-data checks, privacy scans, deterministic pricing/insight
 fixtures, and CI matrix.
 
