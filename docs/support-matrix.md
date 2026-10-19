@@ -32,6 +32,6 @@ as limitations rather than zeroes or invented estimates.
 
 ## Release support
 
-The current supported release is `1.0.0rc1`. Security reports and sanitized
+The current supported release is `1.0.0`. Security reports and sanitized
 support diagnostics must follow `SECURITY.md`; real telemetry must not be
 attached to public issues, pull requests, or public CI artifacts.

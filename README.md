@@ -6,7 +6,7 @@
 
 ### Understand usage, cost, workloads, and PTU readiness across Microsoft Foundry
 
-[![Status](https://img.shields.io/badge/status-release--candidate-7A5AF8?style=flat-square)](#status)
+[![Status](https://img.shields.io/badge/status-GA-107C10?style=flat-square)](#status)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](#quick-start)
 [![Offline analysis](https://img.shields.io/badge/analysis-offline-107C10?style=flat-square)](#privacy)
 [![Azure](https://img.shields.io/badge/Microsoft-Foundry-0078D4?style=flat-square&logo=microsoftazure&logoColor=white)](#what-you-get)
@@ -30,14 +30,14 @@ TokenLens does not send prompts or responses to another service and never guesse
 pricing or PTU capacity.
 
 > [!IMPORTANT]
-> TokenLens is at **1.0.0rc1**, the release-candidate stage. Pricing, insight,
+> TokenLens **1.0.0** is the general-availability release. Pricing, insight,
 > telemetry, and report contracts remain conservative when evidence is missing.
 
 ## Quick start
 
 ## Changelog
 
-### 1.0.0rc1
+### 1.0.0
 
 This release candidate contains the GA-track product and release hardening:
 
@@ -55,8 +55,8 @@ This release candidate contains the GA-track product and release hardening:
   request-level usage is collected.
 - Removed the empty Not evaluated and Azure actions report panels.
 
-This remains a **release candidate**, not GA. The final `1.0.0` release is
-blocked on RC soak, approved live-canary evidence, and final artifact review.
+This is the first general-availability release. It is supported according to
+the runtime and limitation matrix in `docs/support-matrix.md`.
 
 ### 1. Install
 

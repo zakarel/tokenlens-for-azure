@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.0
+
+First general-availability release. Includes the validated release-candidate
+product, protected-main governance, cross-platform CI, private report handling,
+contentless telemetry controls, exact pricing provenance, actionable insights,
+and tested wheel/sdist publication.
+
 ## 1.0.0rc1
 
 Release candidate for the first GA release. Includes repository governance,
@@ -7,8 +14,8 @@ protected-main workflow, cross-platform CI, private report handling,
 contentless telemetry controls, exact pricing provenance, actionable insights,
 and installed-wheel validation.
 
-This is not the final `1.0.0` GA release. Final publication requires the RC
-soak, approved live-canary evidence, and artifact-level release review.
+The release candidate passed the RC soak, approved live canary, and
+artifact-level release review.
 
 ## 0.3.0a1
 
