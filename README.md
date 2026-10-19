@@ -6,7 +6,7 @@
 
 ### Understand usage, cost, workloads, and PTU readiness across Microsoft Foundry
 
-[![Status](https://img.shields.io/badge/status-GA--track-7A5AF8?style=flat-square)](#status)
+[![Status](https://img.shields.io/badge/status-release--candidate-7A5AF8?style=flat-square)](#status)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](#quick-start)
 [![Offline analysis](https://img.shields.io/badge/analysis-offline-107C10?style=flat-square)](#privacy)
 [![Azure](https://img.shields.io/badge/Microsoft-Foundry-0078D4?style=flat-square&logo=microsoftazure&logoColor=white)](#what-you-get)
@@ -30,15 +30,16 @@ TokenLens does not send prompts or responses to another service and never guesse
 pricing or PTU capacity.
 
 > [!IMPORTANT]
-> TokenLens is on the GA implementation track. Pricing, insight, telemetry,
-> and report contracts are versioned and remain conservative when evidence is
-> missing.
+> TokenLens is at **1.0.0rc1**, the release-candidate stage. Pricing, insight,
+> telemetry, and report contracts remain conservative when evidence is missing.
 
 ## Quick start
 
 ## Changelog
 
-### 0.3.0a1
+### 1.0.0rc1
+
+This release candidate contains the GA-track product and release hardening:
 
 - Added zero-touch Foundry collection with chunked long-window merging.
 - Added deterministic aggregate insights for coverage, failures, latency
@@ -54,7 +55,8 @@ pricing or PTU capacity.
   request-level usage is collected.
 - Removed the empty Not evaluated and Azure actions report panels.
 
-This remains an **alpha prerelease**, not GA.
+This remains a **release candidate**, not GA. The final `1.0.0` release is
+blocked on RC soak, approved live-canary evidence, and final artifact review.
 
 ### 1. Install
 
@@ -282,6 +284,7 @@ tenant identifiers.
 - [Contributing](CONTRIBUTING.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Security and privacy](SECURITY.md)
+- [Support matrix and limitations](docs/support-matrix.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 - Built-in help is available from the guided command
 
