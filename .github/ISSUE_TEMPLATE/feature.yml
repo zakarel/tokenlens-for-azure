@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a focused improvement to TokenLens.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and proposed outcome
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Evidence and compatibility
+      description: Describe affected CLI, report, schema, pricing, privacy, or support contracts.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I will use synthetic or sanitised examples only.
+          required: true

@@ -1,0 +1,36 @@
+name: Security and repository hygiene
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject private and generated artifacts
+        shell: bash
+        run: |
+          if git ls-files -z | grep -z -E '(^|/)(\.tokenlens\.yml|reports/|local-traces/|foundry-traces/|pricing-probe\.json|test\.py)(/|$)' >/dev/null; then
+            echo "Prohibited private or generated path tracked in repository" >&2
+            exit 1
+          fi
+          if git ls-files -z | grep -z -E '\.(pem|key|p12|pfx|env)$' >/dev/null; then
+            echo "Potential private-key or environment file tracked in repository" >&2
+            exit 1
+          fi
+      - name: Scan tracked text for common credential markers
+        shell: bash
+        run: |
+          if git grep -q -I -E 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|AZURE_CLIENT_SECRET[[:space:]]*[:=]' -- ':!tests/fixtures/**'; then
+            echo "Potential credential material found in tracked text" >&2
+            exit 1
+          fi

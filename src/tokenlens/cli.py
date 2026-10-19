@@ -1228,13 +1228,12 @@ def _guided_setup() -> None:
                 use_bundled_reference=False,
             )
         output_dir = Path("tokenlens-reports")
-        output_dir.mkdir(parents=True, exist_ok=True)
         destination = output_dir / "tokenlens-report-latest.html"
         from .reports import report_html, task_economics_html
 
-        destination.write_text(
+        write_output(
             task_economics_html(report) if isinstance(report, TaskEconomicsReport) else report_html(report),
-            encoding="utf-8",
+            str(destination),
         )
         typer.echo(f"report-path={destination.resolve()}")
         if open_report:

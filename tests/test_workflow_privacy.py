@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -215,6 +216,7 @@ def test_the_workflow_never_contacts_an_inference_endpoint(cli):
     assert all(call in {"list_accounts", "list_deployments", "get_account", "list_metric_definitions"} for call in cli["resources"].calls)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX mode bits")
 def test_local_output_directories_are_created_private(cli):
     assert runner.invoke(app, COLLECT_ARGS).exit_code == 0
     metrics_dir = Path("local-traces/foundry-metrics")

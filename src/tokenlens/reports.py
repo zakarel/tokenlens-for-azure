@@ -4,6 +4,8 @@ import base64
 import html
 import json
 import math
+import os
+import tempfile
 from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
@@ -702,7 +704,7 @@ def _analytics_deployment_sections(report: AnalysisReport) -> str:
 
 
 def _money(value: float | None, *, currency: str = "USD", precision: int = 4) -> str:
-    return money(value, currency, precision=precision, unavailable="Pricing unavailable")
+    return _escape(money(value, currency, precision=precision, unavailable="Pricing unavailable"))
 
 
 def _rate(value: float | None, *, currency: str = "USD") -> str:
@@ -2252,8 +2254,37 @@ def _model_table(report: AnalysisReport) -> str:
 def write_output(content: str, output: str | None) -> None:
     if output:
         destination = Path(output)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(content, encoding="utf-8")
+        parent = destination.parent
+        parent_was_present = parent.exists()
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not parent_was_present and os.name == "posix":
+            parent.chmod(0o700)
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=parent,
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary_name = temporary.name
+                # lgtm[py/clear-text-storage-sensitive-data] Reports are local
+                # artifacts, written to an owner-only path and never uploaded.
+                temporary.write(content)
+                temporary.flush()
+                if os.name == "posix":
+                    os.fchmod(temporary.fileno(), 0o600)
+            Path(temporary_name).replace(destination)
+            if os.name == "posix":
+                destination.chmod(0o600)
+        finally:
+            if temporary_name:
+                try:
+                    Path(temporary_name).unlink()
+                except FileNotFoundError:
+                    pass
     else:
         print(content, end="")
 

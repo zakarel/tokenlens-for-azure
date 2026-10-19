@@ -1,0 +1,7 @@
+# Sensitive paths require review from the repository owner.
+* @zakarel
+src/tokenlens/pricing.py @zakarel
+src/tokenlens/reports.py @zakarel
+src/tokenlens/telemetry/ @zakarel
+.github/ @zakarel
+SECURITY.md @zakarel

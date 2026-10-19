@@ -1,0 +1,25 @@
+name: Model or pricing coverage
+description: Report a missing or incorrect model, meter, unit, or pricing state.
+title: "[Pricing]: "
+labels: ["pricing"]
+body:
+  - type: input
+    id: model
+    attributes:
+      label: Model and deployment type
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitised evidence
+      description: Link public documentation or provide synthetic output. Do not include contracts, accounts, or identifiers.
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: This report contains no customer-specific pricing or telemetry.
+          required: true

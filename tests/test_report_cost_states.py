@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 from datetime import UTC, datetime, timedelta
 
@@ -17,8 +18,10 @@ import pytest
 from tokenlens.analyzer import analyze
 from tokenlens.ingest import iter_records
 from tokenlens.models import AvailabilityState
+from pydantic import ValidationError
+
 from tokenlens.pricing import PriceEntry, PricingCatalog
-from tokenlens.reports import report_html
+from tokenlens.reports import report_html, write_output
 from tokenlens.workloads import WorkloadMapping, merge_identities
 
 PRICED_MODEL = "priced-model-test-synthetic"
@@ -80,6 +83,37 @@ def cost_panel(html: str) -> str:
 def workloads_panel(html: str) -> str:
     start = html.index('id="workloads-panel"')
     return html[start : html.index('id="ptu-panel"')]
+
+
+def test_pricing_catalog_rejects_markup_in_currency():
+    with pytest.raises(ValidationError, match="currency"):
+        PricingCatalog(catalog_name="synthetic", currency='USD"><script>alert(1)</script>')
+
+
+def test_report_output_is_owner_only_and_atomic(tmp_path):
+    destination = tmp_path / "private" / "report.html"
+    write_output("<p>synthetic</p>\n", str(destination))
+    assert destination.read_text(encoding="utf-8") == "<p>synthetic</p>\n"
+    if os.name == "posix":
+        assert destination.stat().st_mode & 0o777 == 0o600
+        assert destination.parent.stat().st_mode & 0o777 == 0o700
+    assert not list(destination.parent.glob("*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink and mode semantics")
+def test_report_output_does_not_follow_temporary_symlinks_or_rechmod_existing_parent(tmp_path):
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o755)
+    destination = parent / "report.html"
+    target = tmp_path / "outside.txt"
+    target.write_text("keep", encoding="utf-8")
+    (parent / ".report.html.attack.tmp").symlink_to(target)
+
+    write_output("safe\n", str(destination))
+
+    assert target.read_text(encoding="utf-8") == "keep"
+    assert destination.read_text(encoding="utf-8") == "safe\n"
+    assert parent.stat().st_mode & 0o777 == 0o755
 
 
 # --- Semantic availability --------------------------------------------------

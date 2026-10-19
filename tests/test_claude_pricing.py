@@ -8,6 +8,7 @@ inferred from a related model, and the parser fails loudly on schema drift.
 
 from __future__ import annotations
 
+import os
 import re
 import stat
 from datetime import UTC, datetime
@@ -190,6 +191,7 @@ def test_the_global_default_is_labelled_and_an_exact_mode_is_not():
 # --- Snapshot cache ---------------------------------------------------------
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX mode bits")
 def test_a_claude_snapshot_is_written_and_read_back_offline(tmp_path, monkeypatch):
     monkeypatch.setenv("TOKENLENS_CONFIG_DIR", str(tmp_path / "cfg"))
     snapshot = claude_snapshot(models=[OPUS_5], transport=_transport(), now=NOW)

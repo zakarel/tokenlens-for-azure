@@ -279,6 +279,9 @@ tenant identifiers.
 ## Documentation
 
 - [Pricing methodology and provenance](docs/pricing.md)
+- [Contributing](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security and privacy](SECURITY.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 - Built-in help is available from the guided command
 
