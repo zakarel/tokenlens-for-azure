@@ -7,6 +7,7 @@ client is constructed, no credential is created, and no model call is made.
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -589,6 +590,7 @@ def test_pricing_verify_validates_local_catalogs_offline(cli):
     assert "catalogs=valid" in result.output
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX mode bits")
 def test_pricing_set_rate_writes_a_labelled_customer_override(cli):
     result = runner.invoke(
         app,
@@ -688,6 +690,7 @@ def test_a_second_currency_is_rejected_rather_than_converted(cli):
     assert "never converts currencies" in result.output
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX mode bits")
 def test_run_state_file_lives_outside_the_repository(cli):
     assert runner.invoke(app, COLLECT_ARGS).exit_code == 0
     assert run_state_path().is_file()
@@ -695,6 +698,7 @@ def test_run_state_file_lives_outside_the_repository(cli):
     assert run_state_path().stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX mode bits")
 def test_the_subscription_is_never_written_into_the_repository_config(cli):
     """Regression: a subscription is a tenant identifier and .tokenlens.yml can be tracked."""
     assert runner.invoke(app, COLLECT_ARGS).exit_code == 0

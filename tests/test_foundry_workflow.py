@@ -925,4 +925,4 @@ def test_run_state_reports_partial_and_failed_collections_honestly(workspace):
 
 
 def test_safe_display_path_never_leaks_a_home_directory(workspace):
-    assert safe_display_path(Path("reports") / "a.html") == str(Path("reports") / "a.html")
+    assert safe_display_path(Path("reports") / "a.html") == "reports/a.html"
